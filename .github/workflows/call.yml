@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      DEBUG_CALL: ${{ inputs.debug == false && '0' || '1' }}
+      DEBUG_CALL: '1'
       IN_MESSAGE: ${{ inputs.message }}
       IN_TO: ${{ inputs.to }}
     steps:
@@ -88,7 +88,7 @@ jobs:
           grep -E '^(module_path|module|audio_source|log_level|sip_listen)' ~/.baresip/config
 
       - name: Place call and play message
-        run: scripts/place_call.sh
+        run: bash scripts/place_call.sh
 
       - name: Upload call logs
         if: always()
