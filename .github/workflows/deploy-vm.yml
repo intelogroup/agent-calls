@@ -1,0 +1,83 @@
+name: Deploy voice agent to Oracle VM
+
+# Deploys server/ to the Oracle Cloud VM (129.159.189.244), provisions it,
+# writes agent.env from secrets, and (re)starts the agent service.
+# The sandbox cannot SSH out, so this workflow is the deploy path.
+#
+# Required Actions secrets (repo Settings -> Secrets and variables -> Actions):
+#   VM_SSH_KEY    private key matching the VM's authorized key
+#   SIP_USER      Linphone username the agent registers as
+#   SIP_PASSWORD  Linphone password for that account
+#
+# Trigger: Actions tab -> "Deploy voice agent to Oracle VM" -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          [ -n "${{ secrets.VM_SSH_KEY }}" ] || { echo "missing secret VM_SSH_KEY"; exit 1; }
+          [ -n "${{ secrets.SIP_USER }}" ] || { echo "missing secret SIP_USER"; exit 1; }
+          [ -n "${{ secrets.SIP_PASSWORD }}" ] || { echo "missing secret SIP_PASSWORD"; exit 1; }
+          echo "secrets OK"
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/vm_key
+          chmod 600 ~/.ssh/vm_key
+          ssh-keyscan -H 129.159.189.244 >> ~/.ssh/known_hosts
+
+      - name: Copy server files to VM
+        run: |
+          tar czf - server | ssh -i ~/.ssh/vm_key -o StrictHostKeyChecking=yes \
+            ubuntu@129.159.189.244 \
+            'sudo mkdir -p /opt/agent && sudo tar xzf - -C /opt/agent --strip-components=1 && sudo chown -R root:root /opt/agent'
+          echo "files copied"
+
+      - name: Provision VM (setup.sh)
+        run: |
+          ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 'sudo bash /opt/agent/setup.sh'
+
+      - name: Write agent.env from secrets
+        env:
+          SIP_USER: ${{ secrets.SIP_USER }}
+          SIP_PASSWORD: ${{ secrets.SIP_PASSWORD }}
+        run: |
+          python3 - <<'PYEOF' | ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 \
+            'sudo tee /opt/agent/agent.env > /dev/null && sudo chmod 600 /opt/agent/agent.env && sudo chown agent:agent /opt/agent/agent.env'
+          import os
+          vals = {
+              "AGENT_SIP_USER": os.environ["SIP_USER"],
+              "AGENT_SIP_PASS": os.environ["SIP_PASSWORD"],
+              "AGENT_SIP_DOMAIN": "sip.linphone.org",
+              "AGENT_SIP_PORT": "5060",
+              "AGENT_NAME": "Jett",
+              "AGENT_RTP_PORT": "10000",
+              "AGENT_PUBLIC_IP": "129.159.189.244",
+              "AGENT_WHISPER_MODEL": "tiny.en",
+              "AGENT_LLM_MODEL": "/opt/agent/models/llm.gguf",
+              "AGENT_TTS_ENGINE": "espeak",
+              "AGENT_THREADS": "1",
+              "AGENT_MAX_TURNS": "8",
+              "AGENT_MAX_CALL_SEC": "300",
+              "AGENT_GREETING": "Hey, it's Jett. What do you want to talk about?",
+          }
+          for k, v in vals.items():
+              print(f"{k}={v}")
+          PYEOF
+          echo "agent.env written"
+
+      - name: Restart service and show status
+        run: |
+          ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 \
+            'sudo systemctl restart agent.service || sudo systemctl start agent.service'
+          sleep 25
+          ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 \
+            'sudo systemctl is-active agent.service; echo "--- recent logs ---"; sudo journalctl -u agent.service --no-pager -n 40'
