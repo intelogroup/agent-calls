@@ -68,6 +68,26 @@ jobs:
           echo -n "message duration (s): "
           ffprobe -v error -show_entries format=duration -of csv=p=0 message-8k.wav
 
+      - name: Network diagnostics
+        run: |
+          if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
+          getent hosts sip.linphone.org || nslookup sip.linphone.org || true
+          echo "--- TCP 5060 probe ---"
+          timeout 8 bash -c 'echo > /dev/tcp/sip.linphone.org/5060' \
+            && echo "TCP_5060_OPEN" || echo "TCP_5060_FAIL"
+          echo "--- UDP 5060 probe (SIP OPTIONS, 3s wait) ---"
+          python3 - <<'EOF' || true
+          import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.settimeout(3)
+          s.sendto(b'OPTIONS sip:sip.linphone.org SIP/2.0\r\n\r\n', ('sip.linphone.org', 5060))
+          try:
+              data, _ = s.recvfrom(2048)
+              print("UDP_GOT_RESPONSE", data[:60])
+          except socket.timeout:
+              print("UDP_NO_RESPONSE")
+          EOF
+
       - name: Configure baresip
         env:
           SIP_USER: ${{ secrets.SIP_USERNAME }}
@@ -76,7 +96,7 @@ jobs:
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           mkdir -p ~/.baresip && chmod 700 ~/.baresip
           set +x  # never trace the credential line
-          printf '<sip:%s@sip.linphone.org>;auth_user=%s;auth_pass=%s;outbound="sip:sip.linphone.org";regint=600;pubint=0' \
+          printf '<sip:%s@sip.linphone.org;transport=tcp>;auth_user=%s;auth_pass=%s;outbound="sip:sip.linphone.org;transport=tcp";regint=600;pubint=0' \
             "$SIP_USER" "$SIP_USER" "$SIP_PASS" > ~/.baresip/accounts
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           chmod 600 ~/.baresip/accounts
