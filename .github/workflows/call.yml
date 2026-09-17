@@ -46,8 +46,12 @@ jobs:
       - name: Install SIP client and audio tools
         run: |
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq baresip espeak-ng ffmpeg
+          export DEBIAN_FRONTEND=noninteractive
+          for i in 1 2 3; do
+            sudo -E apt-get update -qq && break || { echo "apt update retry $i"; sleep 15; }
+          done
+          sudo -E apt-get install -y -qq baresip espeak-ng ffmpeg || \
+            sudo -E apt-get install -y baresip espeak-ng ffmpeg
           baresip -v 2>&1 | head -2 || true
 
       - name: Synthesize voice message (Kokoro TTS)
