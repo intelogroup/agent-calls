@@ -43,3 +43,10 @@ wait "$BPID" 2>/dev/null || true
 echo "=== call summary (signaling/media lines) ==="
 grep -a -E -m30 -i "call|invite|bye|cancel|audio|rtp|regist" baresip-run.log || true
 echo "=== end summary ==="
+
+if grep -a -qi "established" baresip-run.log; then
+  echo "CALL_ESTABLISHED"
+else
+  echo "CALL_FAILED: no 'established' in baresip log"
+  exit 1
+fi
