@@ -1,1 +1,1 @@
-Hello, this is Jett. Fifth test of the free calling setup, now over TCP. If you can hear this message, outbound calling is working.
+probe only
