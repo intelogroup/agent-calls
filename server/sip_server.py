@@ -38,6 +38,7 @@ RTP_PORT = int(os.environ.get("AGENT_RTP_PORT", "10000"))
 PUBLIC_IP = os.environ.get("AGENT_PUBLIC_IP", "")  # set on the server; else local IP
 WHISPER_MODEL = os.environ.get("AGENT_WHISPER_MODEL", "tiny.en")
 LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "/opt/agent/models/llm.gguf")
+AGENT_THREADS = int(os.environ.get("AGENT_THREADS", os.cpu_count() or 1))
 TTS_ENGINE = os.environ.get("AGENT_TTS_ENGINE", "kokoro")  # kokoro | espeak
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "8"))
 MAX_CALL_SEC = int(os.environ.get("AGENT_MAX_CALL_SEC", "300"))
@@ -294,7 +295,7 @@ def get_llm():
             return None
         from llama_cpp import Llama
         log("loading LLM", LLM_MODEL)
-        _llm = Llama(model_path=LLM_MODEL, n_ctx=1024, n_threads=4,
+        _llm = Llama(model_path=LLM_MODEL, n_ctx=1024, n_threads=AGENT_THREADS,
                      verbose=False)
     return _llm
 
