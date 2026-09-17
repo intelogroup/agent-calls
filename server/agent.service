@@ -1,0 +1,16 @@
+[Unit]
+Description=Jett SIP voice agent (inbound calls)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/opt/agent
+EnvironmentFile=/opt/agent/agent.env
+ExecStart=/opt/agent/venv/bin/python /opt/agent/sip_server.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
