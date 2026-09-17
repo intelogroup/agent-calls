@@ -1,0 +1,54 @@
+name: Call
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Message text (spoken in a prerecorded voice)'
+        required: true
+        default: 'Hello, this is Jett. This is a test of the free calling setup. If you can hear this message, outbound calling is working.'
+      to:
+        description: 'SIP address to call'
+        required: true
+        default: 'sip:intelogroup@sip.linphone.org'
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SIP client and audio tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq baresip espeak-ng ffmpeg
+
+      - name: Synthesize voice message (Kokoro TTS)
+        run: |
+          if python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "${{ inputs.message }}"; then
+            echo "TTS engine: kokoro"
+          else
+            echo "Kokoro unavailable, falling back to espeak-ng"
+            espeak-ng -v en-us -s 165 -w message.wav "${{ inputs.message }}"
+          fi
+          ffmpeg -y -loglevel error -i message.wav -ar 8000 -ac 1 -c:a pcm_s16le message-8k.wav
+          echo -n "message duration (s): "
+          ffprobe -v error -show_entries format=duration -of csv=p=0 message-8k.wav
+
+      - name: Configure baresip
+        env:
+          SIP_USER: ${{ secrets.SIP_USERNAME }}
+          SIP_PASS: ${{ secrets.SIP_PASSWORD }}
+        run: |
+          mkdir -p ~/.baresip && chmod 700 ~/.baresip
+          printf '<sip:%s@sip.linphone.org>;auth_user=%s;auth_pass=%s;outbound="sip:sip.linphone.org";regint=600;pubint=0' \
+            "$SIP_USER" "$SIP_USER" "$SIP_PASS" > ~/.baresip/accounts
+          chmod 600 ~/.baresip/accounts
+          MODPATH="$(dpkg -L baresip-core | grep '/stdio.so$' | xargs dirname)"
+          sed -e "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" -e "s|__MODPATH__|$MODPATH|g" \
+            config/baresip.conf > ~/.baresip/config
+          grep -c . ~/.baresip/config
+
+      - name: Place call and play message
+        run: scripts/place_call.sh "${{ inputs.to }}"
