@@ -11,26 +11,54 @@ on:
         description: 'SIP address to call'
         required: true
         default: 'sip:intelogroup@sip.linphone.org'
+      debug:
+        description: 'Verbose debug logging'
+        type: boolean
+        default: true
+  push:
+    paths:
+      - 'trigger/call.txt'
 
 jobs:
   call:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      DEBUG_CALL: ${{ inputs.debug == false && '0' || '1' }}
+      IN_MESSAGE: ${{ inputs.message }}
+      IN_TO: ${{ inputs.to }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve message and destination
+        run: |
+          if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
+          if [ -n "$IN_MESSAGE" ]; then
+            printf '%s' "$IN_MESSAGE" > /tmp/message.txt
+            printf '%s' "$IN_TO" > /tmp/dest.txt
+          else
+            cp "$GITHUB_WORKSPACE/trigger/call.txt" /tmp/message.txt
+            printf 'sip:intelogroup@sip.linphone.org' > /tmp/dest.txt
+          fi
+          echo "--- message ---"; cat /tmp/message.txt; echo
+          echo "--- dest ---"; cat /tmp/dest.txt; echo
+
       - name: Install SIP client and audio tools
         run: |
+          if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           sudo apt-get update -qq
           sudo apt-get install -y -qq baresip espeak-ng ffmpeg
+          baresip -v 2>&1 | head -2 || true
 
       - name: Synthesize voice message (Kokoro TTS)
         run: |
-          if python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "${{ inputs.message }}"; then
+          if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
+          MSG="$(cat /tmp/message.txt)"
+          if python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "$MSG"; then
             echo "TTS engine: kokoro"
           else
             echo "Kokoro unavailable, falling back to espeak-ng"
-            espeak-ng -v en-us -s 165 -w message.wav "${{ inputs.message }}"
+            espeak-ng -v en-us -s 165 -w message.wav "$MSG"
           fi
           ffmpeg -y -loglevel error -i message.wav -ar 8000 -ac 1 -c:a pcm_s16le message-8k.wav
           echo -n "message duration (s): "
@@ -41,14 +69,28 @@ jobs:
           SIP_USER: ${{ secrets.SIP_USERNAME }}
           SIP_PASS: ${{ secrets.SIP_PASSWORD }}
         run: |
+          if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           mkdir -p ~/.baresip && chmod 700 ~/.baresip
+          set +x  # never trace the credential line
           printf '<sip:%s@sip.linphone.org>;auth_user=%s;auth_pass=%s;outbound="sip:sip.linphone.org";regint=600;pubint=0' \
             "$SIP_USER" "$SIP_USER" "$SIP_PASS" > ~/.baresip/accounts
+          if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           chmod 600 ~/.baresip/accounts
           MODPATH="$(dpkg -L baresip-core | grep '/stdio.so$' | xargs dirname)"
+          echo "module path: $MODPATH"
+          ls "$MODPATH" | grep -E '^(stdio|aufile|g711|g722|opus|account)' || true
           sed -e "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" -e "s|__MODPATH__|$MODPATH|g" \
             config/baresip.conf > ~/.baresip/config
-          grep -c . ~/.baresip/config
+          grep -E '^(module_path|module|audio_source|log_level|sip_listen)' ~/.baresip/config
 
       - name: Place call and play message
-        run: scripts/place_call.sh "${{ inputs.to }}"
+        run: scripts/place_call.sh
+
+      - name: Upload call logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: call-logs
+          path: |
+            baresip-run.log
+            message-8k.wav
