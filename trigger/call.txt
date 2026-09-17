@@ -1,0 +1,1 @@
+Hello, this is Jett. This is a test of the free calling setup. If you can hear this message, outbound calling is working. This is a verbose debug test call.
