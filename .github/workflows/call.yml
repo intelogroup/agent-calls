@@ -52,7 +52,7 @@ jobs:
           done
           sudo -E apt-get install -y -qq baresip espeak-ng ffmpeg || \
             sudo -E apt-get install -y baresip espeak-ng ffmpeg
-          baresip -v 2>&1 | head -2 || true
+          command -v baresip && echo "baresip installed"
 
       - name: Synthesize voice message (Kokoro TTS)
         run: |
