@@ -1,27 +1,45 @@
 #!/bin/bash
-# Place a SIP call and play the prerecorded message, then hang up.
-# Usage: place_call.sh <sip-uri>
-set -u
+# Place a SIP call and play a prerecorded WAV as the microphone input.
+# Reads destination from /tmp/dest.txt, audio from $GITHUB_WORKSPACE/message-8k.wav
+set -euo pipefail
 
-TO="$1"
+if [ "${DEBUG_CALL:-0}" = "1" ]; then set -x; fi
+
+DEST="$(cat /tmp/dest.txt)"
 WAV="$GITHUB_WORKSPACE/message-8k.wav"
+FIFO=/tmp/sipcmd
 
-DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WAV" | cut -d. -f1)"
-[ -z "$DUR" ] && DUR=10
+echo "=== call params ==="
+echo "dest: $DEST"
+ls -l "$WAV"
+file "$WAV" || true
 
-mkfifo /tmp/sipcmd
-baresip -f ~/.baresip <> /tmp/sipcmd > /tmp/baresip.log 2>&1 &
-BARESIP_PID=$!
-exec 3<>/tmp/sipcmd
+rm -f "$FIFO"
+mkfifo "$FIFO"
 
-echo "waiting for SIP registration..."
-sleep 12
-echo "dial $TO" >&3
-echo "calling $TO - playing ~${DUR}s message"
-sleep $((DUR + 10))
+# Start baresip with the fifo as stdio, capture everything
+baresip -f "$HOME/.baresip" <> "$FIFO" > baresip-run.log 2>&1 &
+BPID=$!
+echo "baresip pid: $BPID"
+
+exec 3<>"$FIFO"
+sleep 12  # registration window
+
+echo "=== registration state ==="
+grep -a -i -m5 -E "regist" baresip-run.log || echo "(no register lines yet)"
+
+echo "dialing $DEST"
+echo "dial $DEST" >&3
+sleep 25  # ring + playback + margin
+
+echo "hanging up"
 echo "hangup" >&3
-sleep 3
-kill "$BARESIP_PID" 2>/dev/null || true
+sleep 2
+echo "quit" >&3 || true
+sleep 2
+kill "$BPID" 2>/dev/null || true
+wait "$BPID" 2>/dev/null || true
 
-echo "--- baresip log (tail) ---"
-grep -a -iE 'register|invite|established|bye|error|failed' /tmp/baresip.log | tail -20 || tail -20 /tmp/baresip.log
+echo "=== call summary (signaling/media lines) ==="
+grep -a -E -m30 -i "call|invite|bye|cancel|audio|rtp|regist" baresip-run.log || true
+echo "=== end summary ==="
