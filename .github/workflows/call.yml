@@ -115,8 +115,15 @@ jobs:
             config/baresip.conf > ~/.baresip/config
           grep -E '^(module_path|module|audio_source|log_level|sip_listen)' ~/.baresip/config
 
-      - name: Place call and play message
-        run: bash scripts/place_call.sh
+      - name: Place call and play message (python SIP client)
+        env:
+          SIP_USER: ${{ secrets.SIP_USERNAME }}
+          SIP_CALL_PASS: ${{ secrets.SIP_PASSWORD }}
+        run: |
+          set +x  # never trace credentials
+          DEST="$(cat /tmp/dest.txt)"
+          python3 scripts/sip_call.py "$SIP_USER" "$DEST" "$GITHUB_WORKSPACE/message-8k.wav" 2>&1 | tee sip-call.log
+          grep -q "CALL_ESTABLISHED" sip-call.log
 
       - name: Upload call logs
         if: always()
@@ -124,5 +131,5 @@ jobs:
         with:
           name: call-logs
           path: |
-            baresip-run.log
+            sip-call.log
             message-8k.wav
