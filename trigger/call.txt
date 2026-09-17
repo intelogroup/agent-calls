@@ -1,1 +1,1 @@
-Hello, this is Jett. This is a real test call from the new Python calling system. If you can hear this message clearly, everything is working.
+Hello, this is Jett. New test with the corrected login. If you can hear this message, the free calling setup is working.
