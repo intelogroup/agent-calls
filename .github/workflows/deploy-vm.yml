@@ -65,7 +65,7 @@ jobs:
         timeout-minutes: 5
         run: |
           tar czf - server JETT.md | ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'sudo mkdir -p /opt/agent /tmp/stage && sudo tar xzf - -C /tmp/stage && sudo cp -r /tmp/stage/server/. /opt/agent/ && sudo cp /tmp/stage/JETT.md /opt/agent/JETT.md && sudo chown -R root:root /opt/agent && rm -rf /tmp/stage'
+            'sudo mkdir -p /opt/agent /tmp/stage && sudo tar xzf - -C /tmp/stage && sudo cp -r /tmp/stage/server/. /opt/agent/ && sudo cp /tmp/stage/JETT.md /opt/agent/JETT.md && sudo chown -R root:root /opt/agent && sudo rm -rf /tmp/stage'
           echo "files copied"
 
       - name: Provision VM (setup.sh)
