@@ -1,0 +1,12 @@
+name: VM TTS find (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  find:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 2
+    steps:
+      - run: |
+          grep -n "KokoroTTS()" /opt/agent/live_agent.py
+          echo "==="
+          grep -n "warm.*kokoro\|kokoro.*warm\|KOKORO_VOICE =" /opt/agent/live_agent.py | head -8
