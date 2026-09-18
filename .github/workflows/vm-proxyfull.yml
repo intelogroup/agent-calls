@@ -1,0 +1,22 @@
+name: VM proxy full (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  logs:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 2
+    steps:
+      - run: |
+          sudo journalctl -u jett-proxy --since "30 min ago" 2>/dev/null | grep -a '"event":' | python3 -c "
+          import json,sys
+          for line in sys.stdin:
+            try:
+              # find JSON object in line
+              i = line.find('{')
+              if i >= 0:
+                d = json.loads(line[i:])
+                e = d.get('event','?')
+                if e in ('call_start','call_end','greeting','say_done','tts_error','turn_end','consult'):
+                  print(e, str(d)[:180])
+            except: pass
+          " | head -20
