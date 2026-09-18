@@ -1,0 +1,24 @@
+name: VM hotfix fast pickup (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  hotfix:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 8
+    steps:
+      - name: Deploy patched live_agent.py and restart worker
+        run: |
+          cd /tmp && rm -rf hotfix && git init -q hotfix && cd hotfix
+          git fetch -q https://github.com/intelogroup/agent-calls.git fix/fast-pickup
+          git checkout -q FETCH_HEAD -- server/live_agent.py
+          # backup current
+          sudo cp /opt/agent/live_agent.py /opt/agent/live_agent.py.bak
+          sudo cp server/live_agent.py /opt/agent/live_agent.py
+          sudo chown agent:agent /opt/agent/live_agent.py
+          echo "deployed, restarting jett-proxy..."
+          sudo systemctl restart jett-proxy
+          sleep 20
+          echo "=== service ==="
+          systemctl is-active jett-proxy
+          echo "=== warm log lines ==="
+          sudo journalctl -u jett-proxy --since "2 minutes ago" --no-pager -o short 2>/dev/null | grep -a -iE "warming|warm done|ready" | tail -8
