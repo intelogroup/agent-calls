@@ -6,4 +6,4 @@ jobs:
     runs-on: [self-hosted, oracle]
     timeout-minutes: 2
     steps:
-      - run: cat /opt/agent/sip.yaml
+      - run: sudo cat /opt/agent/sip.yaml
