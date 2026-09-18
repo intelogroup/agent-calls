@@ -59,7 +59,7 @@ jobs:
           sudo chown actions-runner:actions-runner /opt/actions-runner
           cd /opt/actions-runner
           for i in 1 2 3; do
-            sudo -u actions-runner curl -sSL --fail --retry 3 --retry-all-errors -o runner.tar.gz "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-linux-x64-v$RUNNER_VERSION.tar.gz" \
+            sudo -u actions-runner curl -sSL --fail --retry 3 --retry-all-errors -o runner.tar.gz "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-linux-x64-$RUNNER_VERSION.tar.gz" \
               && gzip -t runner.tar.gz && break || { echo "download attempt $i failed"; sleep 10; }
           done
           gzip -t runner.tar.gz || { echo "runner tarball download failed after retries"; exit 1; }
