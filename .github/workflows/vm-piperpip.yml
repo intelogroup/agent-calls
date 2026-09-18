@@ -1,0 +1,14 @@
+name: VM piper pip debug (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "=== trying piper-tts install (verbose) ==="
+          /opt/agent/venv/bin/pip install piper-tts 2>&1 | tail -30
+          echo ""
+          echo "=== check if available ==="
+          /opt/agent/venv/bin/python -c "from piper import PiperVoice; print('OK')" 2>&1 | head -5
