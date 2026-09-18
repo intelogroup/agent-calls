@@ -71,11 +71,22 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 META_API_KEY = os.environ.get("META_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Default: OpenRouter's free-models router. It picks a (random) free model
-# per request — verified working with tool-calling — so per-turn latency
-# varies; the metrics log below is how we watch it. Swap any time via env,
-# no code change needed (e.g. JETT_BRAIN_MODEL="meta/muse-spark-1.3").
-JETT_BRAIN_MODEL = os.environ.get("JETT_BRAIN_MODEL", "openrouter/free")
+# Brain model fallback chain (OpenRouter route:"fallback" tries them in order).
+# Vetted free models first — the random "openrouter/free" router served tiny /
+# code models that blanked or burned the token budget in reasoning. Random
+# router stays as last resort. Override with JETT_BRAIN_MODELS (comma-sep);
+# the legacy singular JETT_BRAIN_MODEL still works as a one-model chain.
+_DEFAULT_BRAIN_MODELS = (
+    "dots-studio/dots-3-note-preview:free,"
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,"
+    "openrouter/free"
+)
+if os.environ.get("JETT_BRAIN_MODELS"):
+    JETT_BRAIN_MODELS = [m.strip() for m in os.environ["JETT_BRAIN_MODELS"].split(",") if m.strip()]
+elif os.environ.get("JETT_BRAIN_MODEL"):
+    JETT_BRAIN_MODELS = [os.environ["JETT_BRAIN_MODEL"].strip()]
+else:
+    JETT_BRAIN_MODELS = [m.strip() for m in _DEFAULT_BRAIN_MODELS.split(",") if m.strip()]
 # OpenRouter's recommended attribution headers (their docs ask for these).
 OPENROUTER_REFERER = os.environ.get(
     "OPENROUTER_REFERER", "https://github.com/intelogroup/agent-calls")
@@ -143,6 +154,10 @@ Contract (follow it exactly):
   Jett ("Let me check with Jett on that, one sec…") and keep them company
   naturally. Jett's reply will be handed to you; relay it faithfully —
   you may say "Jett says…" then his words, unchanged.
+- Relay Jett's facts and numbers EXACTLY as he stated them. Never reinterpret,
+  round, or merge them: an account suffix like …1792 is NOT a balance, a date
+  is a date. When condensing for voice, keep every number and key fact; when
+  in doubt, quote him nearly word-for-word.
 - Be honest about what comes from you versus from Jett. If you don't know,
   say so and offer to check with Jett.
 - The caller is Jim. Warm, direct, peer-to-peer. Skip performative
@@ -170,6 +185,7 @@ class Brain(NamedTuple):
     api_key: str
     model: str
     extra_headers: dict
+    extra_body: dict
 
 
 def resolve_brain() -> Brain | None:
@@ -179,11 +195,12 @@ def resolve_brain() -> Brain | None:
             label="openrouter",
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
-            model=JETT_BRAIN_MODEL,
+            model=JETT_BRAIN_MODELS[0],
             extra_headers={
                 "HTTP-Referer": OPENROUTER_REFERER,
                 "X-Title": OPENROUTER_TITLE,
             },
+            extra_body={"models": JETT_BRAIN_MODELS, "route": "fallback"},
         )
     if META_API_KEY:
         return Brain(
@@ -192,6 +209,7 @@ def resolve_brain() -> Brain | None:
             api_key=META_API_KEY,
             model=_discover_meta_model(),
             extra_headers={},
+            extra_body={},
         )
     return None
 
@@ -649,7 +667,7 @@ async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
     global _CURRENT_BUS
     _CURRENT_BUS = bus
 
-    log.info("call brain: %s model=%s", brain.label, brain.model)
+    log.info("call brain: %s models=%s", brain.label, brain.extra_body.get("models", brain.model))
     stt_engine = WhisperSTT()
     stt_stream = stt.StreamAdapter(
         stt=stt_engine, vad=silero.VAD.load())
@@ -660,6 +678,7 @@ async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
         api_key=brain.api_key,
         base_url=brain.base_url,
         extra_headers=brain.extra_headers if brain.extra_headers else NOT_GIVEN,
+        extra_body=brain.extra_body if brain.extra_body else NOT_GIVEN,
     )
 
     brief = load_brief()
