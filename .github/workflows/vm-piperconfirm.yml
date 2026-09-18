@@ -1,0 +1,15 @@
+name: VM confirm Piper (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          sleep 10
+          echo "=== jett-proxy TTS logs (last 2 min) ==="
+          sudo journalctl -u jett-proxy --since "2 minutes ago" 2>&1 | grep -i -E "tts ready|piper|espeak" | head -5
+          echo ""
+          echo "=== service status ==="
+          sudo systemctl is-active jett-proxy
