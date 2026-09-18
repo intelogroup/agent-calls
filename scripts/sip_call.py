@@ -256,6 +256,11 @@ sdp = ("\r\n".join([
     ""]) + "\r\n")
 
 print("== INVITE ==", flush=True)
+print("SDP_OFFER:", flush=True)
+for ln in sdp.split("\r\n"):
+    print(f"  sdp> {ln}", flush=True)
+print(f"RTP_SOCK_BOUND: {rtp_sock.getsockname()}", flush=True)
+t0 = time.time()
 cseq = request("INVITE", DEST, body=sdp)
 # wait for final response, tolerating 100/180 provisionals
 final = None
@@ -293,6 +298,9 @@ rport = re.search(r"m=audio (\d+)", sdp_answer)
 rtp_ip = rip.group(1) if rip else None
 rtp_port_peer = int(rport.group(1)) if rport else 0
 print(f"peer rtp: {rtp_ip}:{rtp_port_peer}", flush=True)
+print("SDP_ANSWER:", flush=True)
+for ln in (sdp_answer or "").split("\r\n"):
+    print(f"  sdp> {ln}", flush=True)
 
 # ACK (no auth needed in-dialog for flexisip usually)
 stack.send(f"ACK {peer_uri} SIP/2.0\r\n"
@@ -302,6 +310,38 @@ stack.send(f"ACK {peer_uri} SIP/2.0\r\n"
            f"Call-ID: {request.call_id}\r\n"
            f"CSeq: {stack.cseq} ACK\r\n"
            f"Content-Length: 0\r\n\r\n")
+t_ack = time.time()
+
+# Our SSRC, shared by the sender and the inbound telemetry listener below.
+our_ssrc = random.randint(0, 2**32 - 1)
+
+# ---------------------------------------------------------------- telemetry: inbound RTP/RTCP listener
+inbound = {"rtp": 0, "rtcp": 0, "first_at": None, "first_from": None, "rr_for_us": 0}
+stop_listen = threading.Event()
+
+def rtp_listener():
+    rtp_sock.settimeout(0.5)
+    while not stop_listen.is_set():
+        try:
+            data, addr = rtp_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        now = time.time()
+        pt = data[1] if len(data) > 1 else -1
+        is_rtcp = 200 <= pt <= 204
+        if inbound["first_at"] is None:
+            inbound["first_at"] = now
+            inbound["first_from"] = addr
+            print(f"INBOUND_FIRST kind={'RTCP' if is_rtcp else 'RTP'} from={addr[0]}:{addr[1]} size={len(data)} t_ack+{now - t_ack:.2f}s", flush=True)
+        if is_rtcp:
+            inbound["rtcp"] += 1
+            if our_ssrc.to_bytes(4, "big") in data:
+                inbound["rr_for_us"] += 1
+                print(f"INBOUND_RTCP_RR_FOR_US from={addr[0]}:{addr[1]} size={len(data)}", flush=True)
+        else:
+            inbound["rtp"] += 1
 
 # ---------------------------------------------------------------- 3. RTP playback
 def pcm_to_ulaw(pcm_bytes):
@@ -335,7 +375,7 @@ def rtp_sender():
         print("WAV_ERROR", e, flush=True)
         return
     payload = pcm_to_ulaw(frames)
-    seq, ts, ssrc = random.randint(0, 65535), random.randint(0, 2**32 - 1), random.randint(0, 2**32 - 1)
+    seq, ts, ssrc = random.randint(0, 65535), random.randint(0, 2**32 - 1), our_ssrc
     n = 0
     # Play twice: a push-woken phone often misses the first second while its
     # audio session comes up.
@@ -358,17 +398,29 @@ def rtp_sender():
             print("RTP_REPEAT", flush=True)
             time.sleep(0.5)  # gap between plays
     print(f"RTP_DONE packets={n}", flush=True)
+    t_n.append(n)
 
 
+t_n = []
 if rtp_ip and rtp_port_peer:
     # Give a push-woken callee a moment to bring its audio path up before
     # the message starts.
     print("waiting 2s for callee audio to settle...", flush=True)
     time.sleep(2)
+    lt = threading.Thread(target=rtp_listener, daemon=True)
+    lt.start()
     t = threading.Thread(target=rtp_sender, daemon=True)
     t.start()
     t.join(timeout=60)
     time.sleep(2)  # let tail audio play out
+    stop_listen.set()
+    lt.join(timeout=3)
+    n_sent = t_n[0] if t_n else 0
+    if inbound["first_at"] is not None:
+        first = f"{inbound['first_from'][0]}:{inbound['first_from'][1]} @t_ack+{inbound['first_at'] - t_ack:.2f}s"
+    else:
+        first = "none"
+    print(f"TELEMETRY sent={n_sent} inbound_rtp={inbound['rtp']} inbound_rtcp={inbound['rtcp']} rr_for_our_ssrc={inbound['rr_for_us']} first_inbound={first}", flush=True)
 else:
     print("NO_RTP_TARGET", flush=True)
     time.sleep(5)
