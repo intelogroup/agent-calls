@@ -1,0 +1,41 @@
+name: VM kokoro warm test (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  warmtest:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          from kokoro_onnx import Kokoro
+          import numpy as np, time
+          
+          # Warmup: load model (measure separately)
+          print("=== warming (loading model) ===", flush=True)
+          t0 = time.time()
+          k = Kokoro("/opt/agent/models/kokoro-v1.0.int8.onnx",
+                     "/opt/agent/models/voices-v1.0.bin")
+          load_dt = time.time() - t0
+          print(f"model load: {load_dt:.1f}s", flush=True)
+          
+          # Warmed inference: 3 consecutive turns
+          sentences = [
+              "Hey, it's Jett's line. Can you hear me now?",
+              "The meeting is at three PM tomorrow, don't be late.",
+              "Your account balance is one thousand two hundred thirty-four dollars and fifty-six cents.",
+          ]
+          
+          print("\n=== warmed per-turn inference ===", flush=True)
+          for i, sent in enumerate(sentences, 1):
+              t0 = time.time()
+              samples, sr = k.create(sent, voice="af_heart", speed=1.0, lang="en-us")
+              dt = time.time() - t0
+              rms = np.sqrt((samples**2).mean())
+              dur = len(samples) / sr
+              print(f"turn {i}: {dt:.1f}s for {dur:.1f}s audio ({len(sent)} chars), RMS={rms:.4f}", flush=True)
+          
+          print("\n=== summary ===", flush=True)
+          print(f"cold load: {load_dt:.1f}s (one-time)", flush=True)
+          print("warmed per-turn: see above (this is the live-conversation cost)", flush=True)
+          PYEOF
