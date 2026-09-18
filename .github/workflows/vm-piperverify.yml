@@ -1,0 +1,17 @@
+name: VM verify Piper (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== checking jett-proxy logs for Piper ==="
+          sudo journalctl -u jett-proxy --since "5 minutes ago" 2>&1 | grep -i -E "piper|tts ready" | head -5
+          echo ""
+          echo "=== verifying PiperTTS class exists ==="
+          grep -c "class PiperTTS" /opt/agent/live_agent.py
+          echo ""
+          echo "=== verifying factory returns Piper ==="
+          grep "return PiperTTS" /opt/agent/live_agent.py | head -2
