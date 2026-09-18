@@ -1,0 +1,74 @@
+name: VM piper3 and kokoro stream (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 20
+    steps:
+      - run: |
+          set -e
+          echo "=== PIPER: install ==="
+          sudo mkdir -p /opt/agent/piper /opt/agent/models/piper
+          sudo chown -R $USER:$USER /opt/agent/piper /opt/agent/models/piper
+          cd /opt/agent/piper
+          # Use 2023.11.14-2 which has piper_linux_x86_64.tar.gz (v1.2.0 uses different naming)
+          curl -sSL --fail --retry 3 -o piper.tar.gz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+          tar xzf piper.tar.gz
+          PIPER_BIN=$(find /opt/agent/piper -name "piper" -type f | head -1)
+          chmod +x $PIPER_BIN
+          echo "PIPER_BIN=$PIPER_BIN"
+          $PIPER_BIN --version
+          echo ""
+          echo "=== PIPER: download voices ==="
+          cd /opt/agent/models/piper
+          for v in "en_US-lessac-medium" "en_US-ryan-medium"; do
+            voice="${v#en_US-}"
+            base="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${voice}/medium/${v}"
+            curl -sSL --fail --retry 3 -o "${v}.onnx" "${base}.onnx" &
+            curl -sSL --fail --retry 3 -o "${v}.onnx.json" "${base}.onnx.json" &
+          done
+          wait
+          ls -lh *.onnx
+          echo ""
+          echo "=== PIPER: speed test ==="
+          TEST_TEXT="Hello Jim, this is Jett's assistant. I'm testing a new voice that should sound more natural than the default."
+          time echo "$TEST_TEXT" | $PIPER_BIN --model /opt/agent/models/piper/en_US-lessac-medium.onnx --output_file /tmp/piper-female.wav
+          time echo "$TEST_TEXT" | $PIPER_BIN --model /opt/agent/models/piper/en_US-ryan-medium.onnx --output_file /tmp/piper-male.wav
+          python3 -c "
+          import wave, numpy as np
+          for f in ['/tmp/piper-female.wav', '/tmp/piper-male.wav']:
+              w = wave.open(f)
+              d = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+              dur = w.getnframes() / w.getframerate()
+              rtf = dur / 1.0  # placeholder
+              print(f'{f}: {dur:.1f}s audio, RMS={np.sqrt(np.mean(d.astype(float)**2)):.0f}')
+          "
+          echo ""
+          echo "=== KOKORO STREAMING: warmed sentence-by-sentence ==="
+          python3 << 'PYEOF'
+          import time, re
+          from kokoro_onnx import Kokoro
+
+          t0 = time.time()
+          k = Kokoro("/opt/agent/models/kokoro-v1.0.int8.onnx", "/opt/agent/models/voices-v1.0.bin")
+          print(f"Model load: {time.time()-t0:.1f}s")
+          k.create("Hello.", voice="af_heart", speed=1.0, lang="en-us")
+          print("Warmed.")
+
+          text = "Hello Jim, this is Jett's assistant. I'm testing Kokoro streaming to see how fast each sentence generates. This is the third sentence to measure the gaps."
+          sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+          print(f"\nStreaming {len(sentences)} sentences:")
+          total_audio = 0
+          for i, sent in enumerate(sentences):
+              t0 = time.time()
+              samples, sr = k.create(sent, voice="af_heart", speed=1.0, lang="en-us")
+              gen_time = time.time() - t0
+              audio_dur = len(samples) / sr
+              total_audio += audio_dur
+              print(f"  Sentence {i+1}: gen={gen_time:.1f}s, audio={audio_dur:.1f}s, ratio={gen_time/audio_dur:.1f}x")
+              if i == 0:
+                  print(f"  >>> TIME-TO-FIRST-AUDIO: {gen_time:.1f}s <<<")
+          print(f"\nTotal audio: {total_audio:.1f}s")
+          print("Streaming helps only if gen_time <= audio_dur (else gaps between sentences).")
+          PYEOF
