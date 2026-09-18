@@ -1,0 +1,77 @@
+name: Probe SIP reachability
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: sip-probe
+  cancel-in-progress: true
+
+env:
+  VM_HOST: 129.159.189.244
+  VM_USER: ubuntu
+  SSH_OPTS: -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: SIP probes from the internet (UDP + TCP)
+        run: |
+          python3 - <<'EOF'
+          import socket
+
+          def build_options(proto):
+              return (
+                  "OPTIONS sip:jett@129.159.189.244 SIP/2.0\r\n"
+                  "Via: SIP/2.0/%s 1.2.3.4:5060;branch=z9hG4bKprobe1\r\n"
+                  "From: <sip:probe@1.2.3.4>;tag=abc123\r\n"
+                  "To: <sip:jett@129.159.189.244>\r\n"
+                  "Call-ID: probe1@1.2.3.4\r\n"
+                  "CSeq: 1 OPTIONS\r\n"
+                  "Max-Forwards: 70\r\n"
+                  "Content-Length: 0\r\n\r\n" % proto
+              ).encode()
+
+          # UDP probe
+          try:
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.settimeout(5)
+              s.sendto(build_options("UDP"), ("129.159.189.244", 5060))
+              data, _ = s.recvfrom(4096)
+              print("UDP 5060: RESPONSE:", data[:60].decode(errors="replace").split("\r\n")[0])
+          except socket.timeout:
+              print("UDP 5060: TIMEOUT (no SIP response — likely firewall-blocked)")
+          except Exception as e:
+              print("UDP 5060: ERROR:", e)
+          finally:
+              s.close()
+
+          # TCP probe
+          try:
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.settimeout(6)
+              s.connect(("129.159.189.244", 5060))
+              s.sendall(build_options("TCP"))
+              data = s.recv(4096)
+              print("TCP 5060: RESPONSE:", data[:60].decode(errors="replace").split("\r\n")[0] if data else "<connected, empty>")
+          except Exception as e:
+              print("TCP 5060: ERROR:", e)
+          finally:
+              s.close()
+          EOF
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/vm_key
+          chmod 600 ~/.ssh/vm_key
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+      - name: Check SIP listener on the VM
+        run: |
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
+            'echo "--- UDP listeners (5060) ---"; sudo ss -ulnp | grep 5060 || echo "NOTHING on UDP 5060";
+             echo "--- TCP listeners (5060) ---"; sudo ss -tlnp | grep 5060 || echo "NOTHING on TCP 5060";
+             echo "--- livekit-sip status ---"; sudo systemctl is-active livekit-sip;
+             echo "--- jett-proxy status ---"; sudo systemctl is-active jett-proxy'
