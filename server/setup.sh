@@ -33,7 +33,7 @@ echo "== system packages =="
 apt-get update -qq
 apt-get install -y -qq python3-venv python3-dev ffmpeg espeak-ng \
     build-essential cmake curl git redis-server openssl \
-    pkg-config libopus-dev > /dev/null
+    pkg-config libopus-dev libopusfile-dev libsoxr-dev > /dev/null
 # redis: local bus only
 sed -i 's/^supervised .*/supervised systemd/' /etc/redis/redis.conf 2>/dev/null || true
 systemctl enable --now redis-server
@@ -60,19 +60,27 @@ fi
 $AGENT_DIR/bin/livekit-server --version 2>&1 | head -1 || true
 echo OK
 
-echo "== livekit-sip binary =="
+echo "== livekit-sip (build from source; no release binaries published) =="
 if [ ! -x $AGENT_DIR/bin/livekit-sip ]; then
-  SIP_TAG=$(curl -fsSL https://api.github.com/repos/livekit/sip/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
-  echo "livekit-sip tag: $SIP_TAG"
-  ASSET_URL=$(curl -fsSL "https://api.github.com/repos/livekit/sip/releases/tags/$SIP_TAG" | grep -o '"browser_download_url": *"[^"]*linux_amd64[^"]*"' | head -1 | cut -d'"' -f4)
-  curl -fsSL --retry 3 "$ASSET_URL" -o /tmp/sip.tgz
-  # asset may be a tarball containing the sip binary, or the raw binary
-  if tar tzf /tmp/sip.tgz >/dev/null 2>&1; then
-    tar xzf /tmp/sip.tgz -C /tmp sip 2>/dev/null || tar xzf /tmp/sip.tgz -C $AGENT_DIR/bin
-    [ -f /tmp/sip ] && mv /tmp/sip $AGENT_DIR/bin/livekit-sip
-  else
-    mv /tmp/sip.tgz $AGENT_DIR/bin/livekit-sip
+  mkdir -p $AGENT_DIR/bin
+  if ! command -v go >/dev/null 2>&1; then
+    echo "-- installing go toolchain --"
+    GO_TAR=$(curl -fsSL https://go.dev/dl/?mode=json | grep -o '"filename": *"go[0-9.]*\.linux-amd64\.tar\.gz"' | head -1 | cut -d'"' -f4)
+    echo "go tarball: $GO_TAR"
+    curl -fsSL --retry 3 "https://go.dev/dl/$GO_TAR" -o /tmp/go.tgz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz
+    rm -f /tmp/go.tgz
   fi
+  export PATH=$PATH:/usr/local/go/bin
+  go version
+  echo "-- cloning livekit/sip --"
+  rm -rf /tmp/sip-src
+  git clone --depth 1 https://github.com/livekit/sip.git /tmp/sip-src
+  echo "-- building (CGO, low parallelism for 1GB box) --"
+  cd /tmp/sip-src
+  CGO_ENABLED=1 GOFLAGS=-p=2 GOMAXPROCS=1 go build -trimpath -o $AGENT_DIR/bin/livekit-sip ./cmd/livekit-sip
+  cd /
+  rm -rf /tmp/sip-src
   chmod +x $AGENT_DIR/bin/livekit-sip
 fi
 $AGENT_DIR/bin/livekit-sip --help 2>&1 | head -2 || true
