@@ -31,6 +31,16 @@ fi
 echo OK
 
 echo "== system packages =="
+# Wait out any concurrent apt holder (unattended-upgrades, or a duplicate
+# deploy racing us) instead of dying on the lock.
+for i in $(seq 1 30); do
+  if ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+     && ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+    break
+  fi
+  echo "apt lock held, waiting ${i}/30..."
+  sleep 10
+done
 apt-get update -qq
 apt-get install -y -qq python3-venv python3-dev ffmpeg espeak-ng \
     build-essential cmake curl git redis-server openssl \
