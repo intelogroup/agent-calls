@@ -1,5 +1,12 @@
 name: Deploy voice agent to Oracle VM
 
+# One deploy at a time: a second dispatch cancels the earlier run.
+# (The dispatch client can fire duplicates; concurrent setup.sh runs
+# race on the VM's apt lock and kill each other.)
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: true
+
 # Deploys server/ to the Oracle Cloud VM (129.159.189.244), provisions the
 # LiveKit inbound voice stack, writes agent.env from secrets, creates the SIP
 # trunk + dispatch rule, and (re)starts all services.
