@@ -1,0 +1,9 @@
+name: VM sip conf (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  conf:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 2
+    steps:
+      - run: cat /opt/agent/sip.yaml
