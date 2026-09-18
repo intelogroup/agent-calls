@@ -1,0 +1,50 @@
+name: Net test
+
+# One-off network diagnostics on the Oracle self-hosted runner.
+# Trigger: Actions tab -> "Net test" -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: UDP egress + reflexive address (STUN)
+        run: |
+          python3 - <<'EOF'
+          import socket, struct, random
+          tid = bytes(random.getrandbits(8) for _ in range(12))
+          req = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, tid)
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.settimeout(5)
+          s.bind(("0.0.0.0", 0))
+          print("local socket:", s.getsockname(), flush=True)
+          for host in ("stun.l.google.com", "stun1.l.google.com"):
+              try:
+                  s.sendto(req, (host, 19302))
+                  data, addr = s.recvfrom(2048)
+                  print(host, "-> got", len(data), "bytes from", addr, flush=True)
+                  if len(data) >= 20 and struct.unpack(">H", data[0:2])[0] == 0x0101:
+                      off = 20
+                      while off + 4 <= len(data):
+                          t, l = struct.unpack(">HH", data[off:off+4])
+                          v = data[off+4:off+4+l]
+                          if t == 0x0020 and len(v) >= 8:
+                              port = struct.unpack(">H", v[2:4])[0] ^ 0x2112
+                              ip = bytes(b ^ c for b, c in zip(v[4:8], struct.pack(">I", 0x2112A442)))
+                              print("STUN_REFLEXIVE:", ".".join(map(str, ip)) + ":" + str(port), flush=True)
+                          off += 4 + l
+                  print("UDP_EGRESS_OK", flush=True)
+                  break
+              except Exception as e:
+                  print(host, "FAILED:", repr(e), flush=True)
+          else:
+              print("UDP_EGRESS_FAIL", flush=True)
+          EOF
+
+      - name: TCP sanity (SIP signaling path)
+        run: |
+          timeout 8 bash -c 'echo > /dev/tcp/sip.linphone.org/5060' \
+            && echo "TCP_5060_OK" || echo "TCP_5060_FAIL"
