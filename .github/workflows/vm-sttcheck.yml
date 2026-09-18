@@ -1,0 +1,14 @@
+name: VM check STT (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== STT/transcript/user speech events (last 5 min) ==="
+          sudo journalctl -u jett-proxy --since "5 minutes ago" 2>&1 | grep -i -E "transcript|user.*said|stt.*result|speech.*text|input.*text" | head -15
+          echo ""
+          echo "=== VAD speech detection ==="
+          sudo journalctl -u jett-proxy --since "5 minutes ago" 2>&1 | grep -i -E "speech_start|speech_end|vad.*speech" | head -10
