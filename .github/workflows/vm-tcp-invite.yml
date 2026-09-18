@@ -1,0 +1,47 @@
+name: VM TCP INVITE test (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  tcptest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send SIP INVITE over TCP, report responses
+        run: |
+          python3 - <<'EOF'
+          import socket, time, random
+          VM = "129.159.189.244"
+          branch = "z9hG4bKtC%x" % random.randint(0, 1<<30)
+          callid = "tcpinv%x@runner" % random.randint(0, 1<<30)
+          tag = "tt%x" % random.randint(0, 1<<30)
+          sdp = b"v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=t\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+          invite = (
+              "INVITE sip:jett@%s SIP/2.0\r\n"
+              "Via: SIP/2.0/TCP 10.0.0.1:5060;branch=%s\r\n"
+              "From: <sip:tcptest@runner>;tag=%s\r\n"
+              "To: <sip:jett@%s>\r\n"
+              "Call-ID: %s\r\n"
+              "CSeq: 1 INVITE\r\n"
+              "Contact: <sip:tcptest@10.0.0.1:5060;transport=tcp>\r\n"
+              "Max-Forwards: 70\r\n"
+              "Content-Type: application/sdp\r\n"
+              "Content-Length: %d\r\n\r\n"
+          ) % (VM, branch, tag, VM, callid, len(sdp))
+          s = socket.create_connection((VM, 5060), timeout=10)
+          print("TCP connected")
+          s.sendall(invite.encode() + sdp)
+          s.settimeout(8)
+          got = []
+          try:
+              while True:
+                  data = s.recv(4096)
+                  if not data: break
+                  first = data[:60].decode(errors="replace").split("\r\n")[0]
+                  print("RECV:", first)
+                  got.append(first)
+                  if first.startswith("SIP/2.0 200"): break
+          except socket.timeout:
+              pass
+          print("SUMMARY:", " | ".join(got) if got else "NO RESPONSE")
+          s.close()
+          EOF
