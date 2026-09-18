@@ -1,0 +1,19 @@
+name: VM TTS test (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  tts:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - run: |
+          # Test if Kokoro can generate the greeting and if it has audio energy
+          python3 -c "
+          import sys
+          sys.path.insert(0, '/opt/agent')
+          # Find the proxy module and test TTS
+          import importlib.util
+          spec = importlib.util.spec_from_file_location('proxy', '/opt/agent/jett_proxy.py')
+          " 2>&1 | head -5 || echo "direct import failed, trying another way"
+          # List proxy files
+          ls /opt/agent/*.py 2>/dev/null | head -10
