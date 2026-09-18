@@ -6,13 +6,9 @@ jobs:
     runs-on: [self-hosted, oracle]
     timeout-minutes: 5
     steps:
-      - name: Check for SIP traffic
+      - name: Check dispatch and agent pickup
         run: |
-          echo "=== any 'invite' (last 20 min) ==="
-          sudo journalctl -u livekit-sip --since "20 minutes ago" -o cat 2>&1 | grep -ci "invite" || true
-          echo "=== INVITE context lines ==="
-          sudo journalctl -u livekit-sip --since "20 minutes ago" -o cat 2>&1 | grep -i "invite" | tail -10
-          echo "=== non-OPTIONS SIP requests ==="
-          sudo journalctl -u livekit-sip --since "20 minutes ago" -o cat 2>&1 | grep -iE "from.*sip:|to:.*jett" | grep -viE "options" | tail -10
-          echo "=== dispatch rule detail ==="
-          redis-cli hgetall sip_dispatch_rule 2>/dev/null | head -20 || redis-cli get sip_dispatch_rule 2>/dev/null | head -5
+          echo "=== livekit-sip around test INVITE (18:57:25-18:58:10) ==="
+          sudo journalctl -u livekit-sip --since "18:57:25" --until "18:58:10" -o cat 2>&1 | grep -aviE "options" | tail -30
+          echo "=== jett-proxy job activity (18:57:25-18:58:30) ==="
+          sudo journalctl -u jett-proxy --since "18:57:25" --until "18:58:30" -o cat 2>&1 | grep -aiE "job|dispatch|invite|room|participant|error" | tail -25
