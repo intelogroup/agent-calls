@@ -1,0 +1,17 @@
+name: VM agent check (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - name: Check agent and dispatch
+        run: |
+          echo "=== jett-proxy service ==="
+          systemctl is-active jett-proxy 2>/dev/null || echo "no systemd unit"
+          ps aux | grep -a "[j]ett" | head -5
+          echo "=== jett-proxy last 5 min ==="
+          sudo journalctl -u jett-proxy --since "5 minutes ago" --no-pager -o short 2>/dev/null | tail -15
+          echo "=== livekit-sip last 3 min (invites/dispatch) ==="
+          sudo journalctl -u livekit-sip --since "3 minutes ago" --no-pager -o short 2>/dev/null | grep -a -iE "invite|dispatch|room|agent|answer|200" | tail -12
