@@ -1,0 +1,18 @@
+name: VM SIP logs (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  logs:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Check INVITE handling and trunk config
+        run: |
+          echo "=== livekit-sip 19:03:55-19:05:00, all levels, filtered ==="
+          sudo journalctl -u livekit-sip --since "19:03:55" --until "19:05:00" -o cat 2>&1 | grep -aiE "172.56.192|invite|drop|unauthor|not allowed|reject|denied" | head -30
+          echo "=== count of all livekit-sip lines in window ==="
+          sudo journalctl -u livekit-sip --since "19:03:55" --until "19:05:00" -o cat 2>&1 | wc -l
+          echo "=== inbound trunk config ==="
+          redis-cli --raw hgetall sip_inbound_trunk 2>/dev/null | head -40
+          echo "=== iptables INPUT chain ==="
+          sudo iptables -L INPUT -n --line-numbers 2>&1 | head -15
