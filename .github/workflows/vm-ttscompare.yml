@@ -1,0 +1,26 @@
+name: VM TTS compare (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  compare:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 6
+    steps:
+      - run: |
+          echo "=== PATH A: Kokoro voice check ==="
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import os
+          # List voices in the .bin file (it's a torch/pt file with voice tensors)
+          vp = "/opt/agent/models/voices-v1.0.bin"
+          print(f"voices file size: {os.path.getsize(vp)//1024//1024}MB")
+          try:
+            import torch
+            d = torch.load(vp, map_location="cpu", weights_only=True)
+            keys = list(d.keys()) if isinstance(d, dict) else ["NOT_A_DICT"]
+            print(f"voice keys ({len(keys)}): {keys[:12]}")
+          except Exception as e:
+            print(f"torch load failed: {e}")
+          PYEOF
+          echo ""
+          echo "=== PATH B: espeak-ng check ==="
+          which espeak-ng && espeak-ng --version 2>&1 | head -2 || echo "espeak-ng NOT installed"
