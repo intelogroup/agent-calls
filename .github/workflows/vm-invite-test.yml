@@ -1,0 +1,69 @@
+name: VM INVITE test (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  invitetest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send real SIP INVITE with SDP, report responses
+        run: |
+          python3 - <<'EOF'
+          import socket, time, random
+          VM = "129.159.189.244"
+          branch = "z9hG4bKtest%x" % random.randint(0, 1<<30)
+          callid = "invitetest%x@runner" % random.randint(0, 1<<30)
+          tag = "tag%x" % random.randint(0, 1<<30)
+          sdp = (
+              "v=0\r\n"
+              "o=- 1 1 IN IP4 10.0.0.1\r\n"
+              "s=test\r\n"
+              "c=IN IP4 10.0.0.1\r\n"
+              "t=0 0\r\n"
+              "m=audio 4000 RTP/AVP 0\r\n"
+              "a=rtpmap:0 PCMU/8000\r\n"
+          ).encode()
+          invite = (
+              "INVITE sip:jett@%s SIP/2.0\r\n"
+              "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=%s;rport\r\n"
+              "From: <sip:test@runner>;tag=%s\r\n"
+              "To: <sip:jett@%s>\r\n"
+              "Call-ID: %s\r\n"
+              "CSeq: 1 INVITE\r\n"
+              "Contact: <sip:test@10.0.0.1:5060>\r\n"
+              "Max-Forwards: 70\r\n"
+              "Content-Type: application/sdp\r\n"
+              "Content-Length: %d\r\n\r\n"
+          ) % (VM, branch, tag, VM, callid, len(sdp))
+          msg = invite.encode() + sdp
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.settimeout(1.0)
+          s.sendto(msg, (VM, 5060))
+          print("INVITE sent, listening 12s...")
+          end = time.time() + 12
+          got = []
+          while time.time() < end:
+              try:
+                  data, _ = s.recvfrom(65535)
+                  first = data[:80].decode(errors="replace").split("\r\n")[0]
+                  print("RECV:", first)
+                  got.append(first)
+                  if first.startswith("SIP/2.0 200"):
+                      break
+              except socket.timeout:
+                  pass
+          # CANCEL the call attempt
+          cancel = (
+              "CANCEL sip:jett@%s SIP/2.0\r\n"
+              "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=%s;rport\r\n"
+              "From: <sip:test@runner>;tag=%s\r\n"
+              "To: <sip:jett@%s>\r\n"
+              "Call-ID: %s\r\n"
+              "CSeq: 1 CANCEL\r\n"
+              "Max-Forwards: 70\r\n"
+              "Content-Length: 0\r\n\r\n"
+          ) % (VM, branch, tag, VM, callid)
+          s.sendto(cancel.encode(), (VM, 5060))
+          print("CANCEL sent")
+          print("SUMMARY:", " | ".join(got) if got else "NO RESPONSE — INVITE blackholed")
+          EOF
