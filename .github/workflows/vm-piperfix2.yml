@@ -1,0 +1,36 @@
+name: VM switch to Piper (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== switching _tts() to PiperTTS ==="
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          with open('/opt/agent/live_agent.py', 'r') as f:
+              content = f.read()
+          # Replace EspeakTTS() with PiperTTS() in the _tts() factory
+          old = "return _TTS_ENGINE if _TTS_ENGINE is not None else EspeakTTS()"
+          new = "return _TTS_ENGINE if _TTS_ENGINE is not None else PiperTTS()"
+          if old in content:
+              content = content.replace(old, new)
+              print("Switched factory to PiperTTS", flush=True)
+          else:
+              print("ERROR: factory pattern not found", flush=True)
+              exit(1)
+          with open('/opt/agent/live_agent.py', 'w') as f:
+              f.write(content)
+          PYEOF
+          echo ""
+          echo "=== syntax check ==="
+          sudo /opt/agent/venv/bin/python -m py_compile /opt/agent/live_agent.py && echo "syntax OK"
+          echo ""
+          echo "=== restarting jett-proxy ==="
+          sudo systemctl restart jett-proxy
+          sleep 5
+          sudo systemctl is-active jett-proxy
+          echo ""
+          echo "=== checking logs for Piper ==="
+          sudo journalctl -u jett-proxy --since "30 seconds ago" 2>&1 | grep -i "piper.*ready" | head -3
