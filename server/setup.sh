@@ -221,7 +221,11 @@ echo "== facts sync cron (every 5 min, quiet when bus not cloned) =="
 # same bus repo the consult queue lives in. Silently no-ops until the
 # deploy key is added and the bus is cloned.
 CRON_LINE='*/5 * * * * [ -d /opt/agent/bus/.git ] && cd /opt/agent/bus && /usr/bin/git pull --ff-only -q >/dev/null 2>&1'
-( sudo -u $SERVICE_USER crontab -l 2>/dev/null | grep -v "agent-call-bus" ; echo "$CRON_LINE # agent-call-bus facts pull" ) \
+# NOTE: `grep -v` exits 1 on empty input (no crontab yet); with
+# `set -euo pipefail` that would kill setup.sh before the echo runs.
+# The `|| true` keeps the benign empty case from being fatal.
+( sudo -u $SERVICE_USER crontab -l 2>/dev/null | grep -v "agent-call-bus" || true
+  echo "$CRON_LINE # agent-call-bus facts pull" ) \
   | sudo -u $SERVICE_USER crontab -
 echo OK
 
