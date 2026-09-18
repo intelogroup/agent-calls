@@ -1,0 +1,45 @@
+name: VM piper install (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  piper:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 15
+    steps:
+      - run: |
+          set -e
+          mkdir -p /opt/agent/piper /opt/agent/models/piper
+          cd /opt/agent/piper
+          echo "=== downloading piper binary ==="
+          curl -sSL --fail --retry 3 -o piper.tar.gz https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_linux_x86_64.tar.gz
+          tar xzf piper.tar.gz
+          ./piper --version || ./piper/piper --version
+          echo ""
+          echo "=== downloading voices (medium quality) ==="
+          cd /opt/agent/models/piper
+          # Female: lessac-medium, Male: ryan-medium
+          for v in "en_US-lessac-medium" "en_US-ryan-medium"; do
+            base="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${v#en_US-}/medium/${v}"
+            curl -sSL --fail --retry 3 -o "${v}.onnx" "${base}.onnx" &
+            curl -sSL --fail --retry 3 -o "${v}.onnx.json" "${base}.onnx.json" &
+          done
+          wait
+          ls -lh
+          echo ""
+          echo "=== speed test: lessac-medium ==="
+          PIPER_BIN=$(ls /opt/agent/piper/piper 2>/dev/null || ls /opt/agent/piper/piper/piper)
+          echo "PIPER_BIN=$PIPER_BIN"
+          time echo "Hello Jim, this is Jett's assistant. I'm testing a new voice that should sound more natural than the default." | $PIPER_BIN --model /opt/agent/models/piper/en_US-lessac-medium.onnx --output_file /tmp/piper-female.wav
+          echo ""
+          echo "=== speed test: ryan-medium ==="
+          time echo "Hello Jim, this is Jett's assistant. I'm testing a new voice that should sound more natural than the default." | $PIPER_BIN --model /opt/agent/models/piper/en_US-ryan-medium.onnx --output_file /tmp/piper-male.wav
+          echo ""
+          echo "=== audio stats ==="
+          python3 -c "
+          import wave, numpy as np
+          for f in ['/tmp/piper-female.wav', '/tmp/piper-male.wav']:
+              w = wave.open(f)
+              d = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+              dur = w.getnframes() / w.getframerate()
+              print(f'{f}: {dur:.1f}s audio, RMS={np.sqrt(np.mean(d.astype(float)**2)):.0f}, max={np.abs(d).max()}')
+          "
