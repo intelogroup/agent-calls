@@ -1,0 +1,14 @@
+name: VM watch for Jim call (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  watch:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 6
+    steps:
+      - name: Watch for packets from Jim
+        run: |
+          echo "Watching 4 min for any SIP from Jim's carrier..."
+          sudo timeout 240 tcpdump -i any -n "port 5060 and src net 172.56.0.0/16" -c 8 2>&1 | tail -10
+          echo "=== livekit-sip during window ==="
+          sudo journalctl -u livekit-sip --since "5 minutes ago" --no-pager -o short 2>/dev/null | grep -a -iE "inbound|invite|call" | grep -a -v "Mitel" | tail -8
