@@ -1,0 +1,14 @@
+name: VM pyenv (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  env:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 2
+    steps:
+      - run: |
+          # Find which python the jett-proxy service uses
+          sudo systemctl show jett-proxy -p ExecStart 2>/dev/null | head -3
+          echo "==="
+          # Check for venvs
+          ls -d /opt/agent/venv* /opt/agent/.venv* 2>/dev/null; ls /opt/agent/ | head -15
