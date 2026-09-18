@@ -1,30 +1,14 @@
-name: VM inbound check (temporary)
+name: VM debug inbound (temporary)
 on:
   workflow_dispatch:
 jobs:
-  inbound:
+  test:
     runs-on: [self-hosted, oracle]
-    timeout-minutes: 2
+    timeout-minutes: 5
     steps:
       - run: |
-          echo "=== livekit-sip: inbound packets (last 2 min) ==="
-          sudo journalctl -u livekit-sip --since "2 min ago" 2>/dev/null | grep -a "call statistics" | tail -1 | python3 -c "
-          import json,sys
-          line = sys.stdin.read()
-          i = line.find('{')
-          if i >= 0:
-            try:
-              d = json.loads(line[i:])
-              s = d.get('stats', {})
-              port = s.get('port', {})
-              room = s.get('room', {})
-              print(f\"port packets_input: {port.get('packets_input')}\")
-              print(f\"port audio_in_frames: {port.get('audio_in_frames')}\")
-              print(f\"room input_packets: {room.get('input_packets')}\")
-              print(f\"room published_frames: {room.get('published_frames')}\")
-            except Exception as e:
-              print(f'parse failed: {e}')
-          " 2>&1 | head -8
+          echo "=== VAD/STT/transcript events in last 5 min ==="
+          sudo journalctl -u jett-proxy --since "5 minutes ago" 2>&1 | grep -i -E "vad|stt|transcript|user_turn|speech|audio_frame|track|participant" | head -25
           echo ""
-          echo "=== jett-proxy: VAD/STT/turn events (last 3 min) ==="
-          sudo journalctl -u jett-proxy --since "3 min ago" 2>/dev/null | grep -a -E "vad|stt|transcript|turn|user_speech|listening" -i | head -10 | cut -c1-160
+          echo "=== any errors? ==="
+          sudo journalctl -u jett-proxy --since "5 minutes ago" 2>&1 | grep -i -E "error|exception|traceback|failed" | head -10
