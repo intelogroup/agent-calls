@@ -1,0 +1,14 @@
+name: VM inspect TTS (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== EspeakTTS adapter in live_agent.py ==="
+          grep -n -A 30 "class EspeakTTS" /opt/agent/live_agent.py | head -50
+          echo ""
+          echo "=== how tts_engine is instantiated ==="
+          grep -n "tts_engine\s*=" /opt/agent/live_agent.py | head -5
