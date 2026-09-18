@@ -1,0 +1,12 @@
+name: VM espeak emission (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== _EspeakChunkedStream full _run method ==="
+          # Get lines from "class _EspeakChunkedStream" to "class PiperTTS"
+          awk '/^class _EspeakChunkedStream/,/^class PiperTTS/' /opt/agent/live_agent.py | head -50
