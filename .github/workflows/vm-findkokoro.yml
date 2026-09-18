@@ -1,0 +1,21 @@
+name: VM find kokoro env (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  find:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - run: |
+          echo "=== searching for kokoro_onnx ==="
+          find /opt /home -name "kokoro_onnx" -type d 2>/dev/null | head -5
+          echo ""
+          echo "=== checking common venvs ==="
+          for p in /opt/agent/venv /opt/agent/.venv /home/actions-runner/venv; do
+            if [ -f "$p/bin/python" ]; then
+              echo "$p: $($p/bin/python -c 'import kokoro_onnx; print("kokoro_onnx OK")' 2>&1 | head -1)"
+            fi
+          done
+          echo ""
+          echo "=== pip list ==="
+          pip3 list 2>/dev/null | grep -i kokoro || echo "not in pip3"
