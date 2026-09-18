@@ -42,6 +42,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -147,6 +148,43 @@ def _utcnow() -> str:
 def _utcnow_z() -> str:
     # bus protocol wants trailing Z, e.g. 2026-09-18T16:40:00Z
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --------------------------------------- structured event logging ---
+# Bottleneck instrumentation for the voice line. One JSON object per line
+# on stderr (journald picks it up via the service unit). NEVER log secrets,
+# keys, tokens, or message content — only ids, counts, lengths, latencies,
+# and outcomes. Hot-path overhead is a single json.dumps per event; events
+# fire at stage boundaries (boot, call start/end, per brain attempt,
+# consult lifecycle), never per audio frame.
+_SECRET_FIELD_RE = re.compile(
+    r"(key|token|secret|password|credential|cookie|auth)", re.I)
+_CONTENT_FIELD_RE = re.compile(
+    r"^(question|answer|text|transcript|content|summary)$", re.I)
+
+
+def _redact_value(v):
+    if isinstance(v, str) and len(v) > 96:
+        return v[:12] + "\u2026[truncated]"
+    return v
+
+
+def log_event(event: str, **fields) -> None:
+    """Emit one structured JSON log line to stderr. Never raises."""
+    try:
+        clean: dict = {}
+        for k, v in fields.items():
+            if _SECRET_FIELD_RE.search(k):
+                clean[k] = "[redacted]"
+            elif _CONTENT_FIELD_RE.match(k):
+                clean[k + "_len"] = len(v) if v is not None else 0
+            else:
+                clean[k] = _redact_value(v)
+        rec = {"ts": _utcnow(), "event": event}
+        rec.update(clean)
+        print(json.dumps(rec, default=str), file=sys.stderr, flush=True)
+    except Exception:
+        pass  # logging must never break a call
 
 
 # ------------------------------------------- relay hardening (pure) ---
@@ -590,24 +628,40 @@ class ResilientLLM(llm.LLM):
                 dt = time.monotonic() - t0
                 if _is_rate_limit(e):
                     delay = compute_backoff(i)
+                    log_event("brain_attempt", model=model,
+                              latency_s=round(dt, 2), outcome="rate_limited",
+                              backoff_s=round(delay, 1),
+                              fallback_to=models[i + 1] if i + 1 < len(models) else None)
                     log.warning("brain chat: model=%s rate-limited "
                                 "(%.1fs); backing off %.1fs then next model",
                                 model, dt, delay)
                     await asyncio.sleep(delay)
                 else:
+                    log_event("brain_attempt", model=model,
+                              latency_s=round(dt, 2), outcome="error",
+                              error=str(e)[:120],
+                              fallback_to=models[i + 1] if i + 1 < len(models) else None)
                     log.warning("brain chat: model=%s errored (%.1fs): %.150s",
                                 model, dt, e)
                 empty_retries += 1
                 continue
             dt = time.monotonic() - t0
             if text.strip() or has_tools:
+                log_event("brain_attempt", model=model,
+                          latency_s=round(dt, 2), outcome="ok",
+                          empty_retries=empty_retries)
                 log.info("brain chat: model=%s latency=%.1fs empty_retry=%s",
                          model, dt, empty_retries > 0)
                 return self._postprocess(ctx, chunks, text, has_tools)
             empty_retries += 1
+            log_event("brain_attempt", model=model,
+                      latency_s=round(dt, 2), outcome="empty",
+                      fallback_to=models[i + 1] if i + 1 < len(models) else None)
             log.warning("brain chat: model=%s empty content (%.1fs); "
                         "trying next model", model, dt)
         # every model empty/failed — guaranteed spoken fallback, never silence
+        log_event("brain_exhausted", models=len(models),
+                  fallback_spoken=True)
         log.warning("brain chat: ALL %d models empty/failed; speaking fallback",
                     len(models))
         return [llm.ChatChunk(
@@ -693,16 +747,24 @@ class WhisperSTT(stt.STT):
         if buffer.num_channels > 1:
             audio = audio.reshape(-1, buffer.num_channels).mean(axis=1)
         sr = buffer.sample_rate
-        if sr != 16000:
-            # cheap linear resample to 16 kHz
-            dur = len(audio) / sr
-            n = int(dur * 16000)
-            audio = np.interp(
-                np.linspace(0, len(audio), n, endpoint=False),
-                np.arange(len(audio)), audio).astype(np.float32)
-        segments, _ = self._model.transcribe(audio, language="en",
-                                             beam_size=1, vad_filter=True)
-        return " ".join(s.text.strip() for s in segments).strip()
+        dur_s = round(len(audio) / max(1, sr), 2)
+        if audio.size == 0 or float(np.abs(audio).max(initial=0.0)) < 1e-4:
+            log_event("stt_empty_audio", duration_s=dur_s)
+            return ""
+        try:
+            if sr != 16000:
+                # cheap linear resample to 16 kHz
+                dur = len(audio) / sr
+                n = int(dur * 16000)
+                audio = np.interp(
+                    np.linspace(0, len(audio), n, endpoint=False),
+                    np.arange(len(audio)), audio).astype(np.float32)
+            segments, _ = self._model.transcribe(audio, language="en",
+                                                 beam_size=1, vad_filter=True)
+            return " ".join(s.text.strip() for s in segments).strip()
+        except Exception as e:
+            log_event("stt_error", error=str(e)[:150], duration_s=dur_s)
+            return ""  # treat as silence rather than killing the turn
 
 
 # ----------------------------------------------------------------- TTS ---
@@ -776,8 +838,16 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             stream=False,
         )
         for sent in split_sentences(self._input_text):
-            samples, _sr = await loop.run_in_executor(
-                None, self._tts._synth, sent)
+            try:
+                samples, _sr = await loop.run_in_executor(
+                    None, self._tts._synth, sent)
+            except Exception as e:
+                log_event("tts_error", sentence_len=len(sent),
+                          error=str(e)[:150])
+                continue
+            if samples is None or len(samples) == 0:
+                log_event("tts_empty_synth", sentence_len=len(sent))
+                continue
             pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(
                 np.int16).tobytes()
             # push in ~20 ms frames to keep the pipeline flowing
@@ -815,18 +885,24 @@ async def _bus_ensure() -> bool:
     instead of crashing the call.
     """
     if os.path.isdir(os.path.join(BUS_DIR, ".git")):
+        log_event("bus_status", available=True, action="cached")
         return True
     try:
         os.makedirs(BUS_DIR, exist_ok=True)
         rc, out = await _git(["clone", BUS_REPO_SSH, BUS_DIR], cwd="/tmp")
         if rc != 0:
+            log_event("bus_status", available=False, reason="clone_failed",
+                      detail=out[-150:])
             log.warning("bus clone failed: %s", out[-300:])
             return False
         await _git(["config", "user.email", "jett-proxy@129.159.189.244"])
         await _git(["config", "user.name", "jett-proxy"])
+        log_event("bus_status", available=True, action="cloned")
         log.info("bus repo cloned")
         return True
     except Exception as e:
+        log_event("bus_status", available=False, reason="exception",
+                  error=str(e)[:120])
         log.warning("bus ensure failed: %s", e)
         return False
 
@@ -850,9 +926,15 @@ async def _bus_write_push(relpath: str, obj: dict, msg: str) -> bool:
             await _git(["pull", "--rebase", "--autostash"])
             rc, out = await _git(["push", "origin", "HEAD"])
         if rc != 0:
+            log_event("bus_push", relpath=relpath, ok=False,
+                      error=out[-150:])
             log.warning("bus push failed: %s", out[-300:])
+        else:
+            log_event("bus_push", relpath=relpath, ok=True)
         return rc == 0
     except OSError as e:
+        log_event("bus_push", relpath=relpath, ok=False,
+                  error=str(e)[:120])
         log.warning("bus write failed: %s", e)
         return False
 
@@ -865,7 +947,8 @@ async def _bus_poll_response(req_id: str,
     deliveries/ are written by Jett's side only — we never write them.
     """
     path = os.path.join(BUS_DIR, "responses", f"{req_id}.json")
-    deadline = time.monotonic() + max(0, timeout_sec)
+    t0 = time.monotonic()
+    deadline = t0 + max(0, timeout_sec)
     while time.monotonic() < deadline:
         await _git(["pull", "--ff-only", "-q"])
         try:
@@ -880,10 +963,14 @@ async def _bus_poll_response(req_id: str,
                     log.warning("consult %s answered_by=%r (expected "
                                 "'jett-runtime')", req_id[:8],
                                 obj.get("answered_by"))
+                log_event("consult_answered", id=req_id[:8],
+                          latency_s=round(time.monotonic() - t0, 1),
+                          answer_len=len(answer))
                 log.info("consult %s answered live (%d chars)",
                          req_id[:8], len(answer))
                 return answer
         await asyncio.sleep(5)
+    log_event("consult_timeout", id=req_id[:8], waited_s=timeout_sec)
     return None
 
 
@@ -899,6 +986,7 @@ async def file_consult_request(question: str,
     is delivered afterward (voice callback / WhatsApp).
     """
     if not await _bus_ensure():
+        log_event("consult_unreachable", reason="bus_ensure_failed")
         return ("unreachable",
                 {"error": "bus repo unreachable (deploy key not added?)"})
     req_id = str(uuid.uuid4())
@@ -912,10 +1000,17 @@ async def file_consult_request(question: str,
                     "and facts snapshot couldn't answer it."),
         "priority": priority if priority in ("normal", "urgent") else "normal",
     }
+    log_event("consult_request", id=req_id[:8],
+              question_len=len(question),
+              priority=req["priority"],
+              call_id=req["call_id"])
     ok = await _bus_write_push(f"requests/{req_id}.json", req,
                                f"consult {req_id[:8]}")
     if not ok:
+        log_event("consult_unreachable", reason="bus_push_failed",
+                  id=req_id[:8])
         return ("unreachable", {"error": "bus push failed"})
+    log_event("consult_filed", id=req_id[:8], priority=req["priority"])
     log.info("consult %s filed (priority=%s)", req_id[:8], req["priority"])
     return ("filed", {"request": req})
 
@@ -1015,14 +1110,18 @@ async def local_facts(query: str) -> str:
     then use consult_jett instead of guessing."""
     data, age = load_facts()
     if data is None:
+        log_event("facts_unavailable")
         return ("FACTS_UNAVAILABLE: no synced facts snapshot found. Tell the "
                 "caller honestly you don't have Jett's latest facts — offer "
                 "to check with Jett via consult_jett instead of guessing.")
     if age is None or age > FACTS_STALE_SEC:
+        log_event("facts_stale", age_s=round(age) if age else None)
         stale = freshness_str(age) if age else "unknown age"
         return (f"FACTS_STALE: snapshot is {stale} (stale). Tell the caller "
                 "honestly the facts may be out of date — offer consult_jett "
                 "instead of guessing.")
+    log_event("facts_used", age_s=round(age) if age else None,
+              query_len=len(query or ""))
     fresh = freshness_str(age)
     return f"Jett's synced facts (as of {fresh}):\n{_facts_slice(data, query)}"
 
@@ -1060,6 +1159,7 @@ async def _speak_raw(room: rtc.Room, wav_pcm: bytes, sample_rate: int = 24000):
 async def _run_no_brain(ctx: JobContext):
     """No brain key: connect, play a spoken notice, hang up gracefully."""
     await ctx.connect()
+    log_event("no_brain_notice")
     log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
     tts_engine = KokoroTTS()
     samples, _ = await asyncio.get_running_loop().run_in_executor(
@@ -1071,7 +1171,7 @@ async def _run_no_brain(ctx: JobContext):
     await ctx.room.disconnect()
 
 
-async def _run_call(ctx: JobContext, brain: Brain):
+async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
     global _CURRENT_CALL_ID
 
     log.info("call brain: %s models=%s max_tokens=%s", brain.label,
@@ -1101,6 +1201,7 @@ async def _run_call(ctx: JobContext, brain: Brain):
     # plus usage metrics forwarded through it. Inner "error" events are
     # absorbed by the wrapper's retry/backoff/fallback by design.
     def _on_llm_metrics(metrics) -> None:
+        stats["turns"] += 1
         log.info("brain usage: model=%s duration=%.2fs ttft=%.2fs "
                  "tokens prompt=%d completion=%d",
                  brain.model, metrics.duration, metrics.ttft,
@@ -1153,6 +1254,7 @@ async def entrypoint(ctx: JobContext):
 
     with _CALL_LOCK:
         if _ACTIVE_CALL is not None:
+            log_event("call_rejected_busy", room=ctx.room.name)
             log.info("busy; rejecting second call %s", ctx.room.name)
             await ctx.connect()
             engine = KokoroTTS()
@@ -1167,6 +1269,7 @@ async def entrypoint(ctx: JobContext):
         _ACTIVE_CALL = call_id
     _CURRENT_CALL_ID = call_id
 
+    stats = {"t0": time.monotonic(), "turns": 0, "errors": []}
     try:
         await ctx.connect()  # ensure room handle before reading participants
         # the SIP leg may still be joining; wait briefly for the caller
@@ -1176,24 +1279,42 @@ async def entrypoint(ctx: JobContext):
             if caller != "unknown":
                 break
             await asyncio.sleep(0.5)
+        log_event("call_start", call_id=call_id, room=ctx.room.name,
+                  caller=caller)
         log.info("inbound call %s from %s", call_id, caller)
         brain = resolve_brain()
         if brain is not None:
-            await _run_call(ctx, brain)
+            log_event("brain_resolved", label=brain.label,
+                      model=brain.model, chain_len=len(JETT_BRAIN_MODELS))
+            await _run_call(ctx, brain, stats)
         else:
+            log_event("brain_missing")
             await _run_no_brain(ctx)
     except Exception as e:
+        stats["errors"].append(type(e).__name__)
+        log_event("call_error", call_id=call_id,
+                  error=f"{type(e).__name__}: {str(e)[:150]}")
         log.exception("call %s failed: %s", call_id, e)
     finally:
         with _CALL_LOCK:
             _ACTIVE_CALL = None
         _CURRENT_CALL_ID = None
+        log_event("call_end", call_id=call_id,
+                  duration_s=round(time.monotonic() - stats["t0"], 1),
+                  turns=stats["turns"], errors=stats["errors"])
         log.info("call %s done", call_id)
 
 
 if __name__ == "__main__":
     if not (LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise SystemExit("LIVEKIT_API_KEY / LIVEKIT_API_SECRET are required")
+    log_event("boot_config", agent=AGENT_NAME, livekit_url=LIVEKIT_URL,
+              brain_models=len(JETT_BRAIN_MODELS),
+              brain_max_tokens=BRAIN_MAX_TOKENS,
+              consult_timeout_s=CONSULT_TIMEOUT_SEC,
+              max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
+              bus_dir=BUS_DIR,
+              bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,
