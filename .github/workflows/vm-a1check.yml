@@ -1,0 +1,21 @@
+name: VM A1 check (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== OCI CLI available? ==="
+          which oci || echo "OCI CLI NOT installed"
+          echo ""
+          echo "=== OCI config exists? ==="
+          ls -lh ~/.oci/config 2>/dev/null || echo "No OCI config"
+          echo ""
+          if which oci >/dev/null 2>&1 && [ -f ~/.oci/config ]; then
+            echo "=== trying to list availability domains ==="
+            oci iam availability-domain list --compartment-id $(oci iam compartment list --query "data[0].id" --raw-output 2>/dev/null) 2>&1 | head -20
+          else
+            echo "Cannot proceed: OCI CLI not configured on VM"
+          fi
