@@ -1,0 +1,21 @@
+name: VM kill rogue SIP (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  kill:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - name: Stop old sip_server.py
+        run: |
+          echo "=== looking for sip_server.py ==="
+          ps aux | grep -a "[s]ip_server.py" | head -3
+          echo "=== systemd units ==="
+          systemctl list-units --all 2>/dev/null | grep -a -iE "agent\.service|sip" | head -5
+          sudo systemctl stop agent.service 2>/dev/null && echo "stopped agent.service" || echo "no agent.service"
+          sudo systemctl disable agent.service 2>/dev/null || true
+          sudo pkill -f "sip_server.py" && echo "killed sip_server.py" || echo "nothing to kill"
+          sleep 2
+          ps aux | grep -a "[s]ip_server.py" | head -3 || echo "confirmed gone"
+          echo "=== livekit-sip and jett-proxy still up? ==="
+          systemctl is-active livekit-sip jett-proxy
