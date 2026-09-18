@@ -1,0 +1,38 @@
+name: VM TTS race (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  race:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 6
+    steps:
+      - run: |
+          echo "=== Kokoro with af_bella ==="
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import math, time, numpy as np
+          from kokoro_onnx import Kokoro
+          k = Kokoro("/opt/agent/models/kokoro-v1.0.int8.onnx", "/opt/agent/models/voices-v1.0.bin")
+          for voice in ["af_bella", "af_heart"]:
+            t0 = time.time()
+            try:
+              samples, sr = k.create("Hey, it's Jett's line.", voice=voice, speed=1.0)
+              dt = time.time() - t0
+              arr = np.array(samples, dtype=float)
+              rms = math.sqrt((arr*arr).mean()) if len(arr) > 0 else 0
+              print(f"{voice}: {len(samples)} samples, {dt:.1f}s, RMS={rms:.1f}")
+            except Exception as e:
+              print(f"{voice}: FAILED {e}")
+          PYEOF
+          echo ""
+          echo "=== espeak-ng ==="
+          time espeak-ng -v en-us -s 175 "Hey, it's Jett's line. How can I help?" -w /tmp/espeak_test.wav 2>&1 | tail -3
+          python3 -c "
+          import wave, math, struct
+          w = wave.open('/tmp/espeak_test.wav')
+          n = w.getnframes()
+          data = w.readframes(n)
+          fmt = '<' + 'h'*(len(data)//2)
+          samples = struct.unpack(fmt, data)
+          rms = math.sqrt(sum(s*s for s in samples)/len(samples)) if samples else 0
+          print(f'espeak: {n} frames, {w.getframerate()}Hz, RMS={rms:.1f}')
+          "
