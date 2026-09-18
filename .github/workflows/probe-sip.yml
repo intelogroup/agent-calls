@@ -1,6 +1,21 @@
+# Probe SIP reachability for Jett's voice line.
+#
+# Runs every 30 minutes (plus manually). ANY probe failure makes the run
+# fail loudly (nonzero exit) so a dead line is visible as a failed Actions
+# run — the existing voice-call alert infra (service-uptime-call-watch and
+# friends) can pick up failed runs and page Jim.
+#
+# Checks, from the public internet AND from inside the VM:
+#   1. UDP 5060 answers a SIP OPTIONS (Linphone dials UDP by default —
+#      this is the exact "no ring" bottleneck hit 2026-09-18)
+#   2. TCP 5060 answers a SIP OPTIONS
+#   3. livekit-sip is actually bound on UDP+TCP 5060 on the VM (ss)
+#   4. livekit-sip + jett-proxy services are active
 name: Probe SIP reachability
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
 
 concurrency:
   group: sip-probe
@@ -19,7 +34,9 @@ jobs:
       - name: SIP probes from the internet (UDP + TCP)
         run: |
           python3 - <<'EOF'
-          import socket
+          import socket, sys
+
+          failures = []
 
           def build_options(proto):
               return (
@@ -33,17 +50,24 @@ jobs:
                   "Content-Length: 0\r\n\r\n" % proto
               ).encode()
 
-          # UDP probe
+          # UDP probe (Linphone's default transport — the "no ring" path)
           try:
               s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
               s.settimeout(5)
               s.sendto(build_options("UDP"), ("129.159.189.244", 5060))
               data, _ = s.recvfrom(4096)
-              print("UDP 5060: RESPONSE:", data[:60].decode(errors="replace").split("\r\n")[0])
+              first = data[:60].decode(errors="replace").split("\r\n")[0]
+              print("UDP 5060: RESPONSE:", first)
+              if not first.startswith("SIP/2.0"):
+                  failures.append("UDP 5060 answered but not with SIP: " + first)
           except socket.timeout:
-              print("UDP 5060: TIMEOUT (no SIP response — likely firewall-blocked)")
+              msg = "UDP 5060: TIMEOUT — no SIP response (firewall or service down)"
+              print(msg)
+              failures.append(msg)
           except Exception as e:
-              print("UDP 5060: ERROR:", e)
+              msg = "UDP 5060: ERROR: %s" % e
+              print(msg)
+              failures.append(msg)
           finally:
               s.close()
 
@@ -54,11 +78,23 @@ jobs:
               s.connect(("129.159.189.244", 5060))
               s.sendall(build_options("TCP"))
               data = s.recv(4096)
-              print("TCP 5060: RESPONSE:", data[:60].decode(errors="replace").split("\r\n")[0] if data else "<connected, empty>")
+              first = data[:60].decode(errors="replace").split("\r\n")[0] if data else "<connected, empty>"
+              print("TCP 5060: RESPONSE:", first)
+              if data and not first.startswith("SIP/2.0"):
+                  failures.append("TCP 5060 answered but not with SIP: " + first)
           except Exception as e:
-              print("TCP 5060: ERROR:", e)
+              msg = "TCP 5060: ERROR: %s" % e
+              print(msg)
+              failures.append(msg)
           finally:
               s.close()
+
+          if failures:
+              print("INTERNET PROBE: FAIL")
+              for f in failures:
+                  print("  -", f)
+              sys.exit(1)
+          print("INTERNET PROBE: PASS")
           EOF
 
       - name: Set up SSH
@@ -68,10 +104,13 @@ jobs:
           chmod 600 ~/.ssh/vm_key
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
 
-      - name: Check SIP listener on the VM
+      - name: Check SIP listener + services on the VM (fails loudly)
         run: |
           ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'echo "--- UDP listeners (5060) ---"; sudo ss -ulnp | grep 5060 || echo "NOTHING on UDP 5060";
-             echo "--- TCP listeners (5060) ---"; sudo ss -tlnp | grep 5060 || echo "NOTHING on TCP 5060";
-             echo "--- livekit-sip status ---"; sudo systemctl is-active livekit-sip;
-             echo "--- jett-proxy status ---"; sudo systemctl is-active jett-proxy'
+            'fail=0
+             sudo ss -uln | grep -q ":5060 " || { echo "FAIL: nothing bound on UDP 5060"; fail=1; }
+             sudo ss -tln | grep -q ":5060 " || { echo "FAIL: nothing bound on TCP 5060"; fail=1; }
+             [ "$(sudo systemctl is-active livekit-sip 2>/dev/null)" = "active" ] || { echo "FAIL: livekit-sip not active"; fail=1; }
+             [ "$(sudo systemctl is-active jett-proxy 2>/dev/null)" = "active" ] || { echo "FAIL: jett-proxy not active"; fail=1; }
+             if [ "$fail" = 0 ]; then echo "VM LISTENER CHECKS: PASS"; else echo "VM LISTENER CHECKS: FAIL"; fi
+             exit $fail'
