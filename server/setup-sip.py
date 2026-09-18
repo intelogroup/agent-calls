@@ -23,7 +23,7 @@ from livekit.protocol import sip as S  # noqa: E402
 from livekit.protocol import room as R  # noqa: E402
 from livekit.protocol.agent_dispatch import RoomAgentDispatch  # noqa: E402
 
-LIVEKIT_ENV = "/opt/agent/agent.env"
+LIVEKIT_ENV = "/opt/agent/livekit.env"
 TRUNK_NAME = "jett"
 RULE_NAME = "jett"
 ROOM_PREFIX = "jett-"
@@ -101,7 +101,7 @@ async def main() -> int:
     key = env.get("LIVEKIT_API_KEY", "")
     secret = env.get("LIVEKIT_API_SECRET", "")
     if not (key and secret):
-        print("LIVEKIT_API_KEY/SECRET missing from agent.env", flush=True)
+        print("LIVEKIT_API_KEY/SECRET missing from livekit.env", flush=True)
         return 1
 
     api = LiveKitAPI(url=url, api_key=key, api_secret=secret)

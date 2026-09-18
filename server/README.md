@@ -2,7 +2,8 @@
 
 One SIP line, one worker. Dial `sip:jett@129.159.189.244` and talk to
 Jett's voice proxy: real-time voice (LiveKit handles VAD / barge-in /
-turn-taking), a Muse Spark brain briefed on Jett's notes (`JETT.md`), and a
+turn-taking), a free OpenRouter brain (`openrouter/free` router, switchable via `JETT_BRAIN_MODEL`)
+briefed on Jett's notes (`JETT.md`), and a
 warm Kokoro voice.
 
 The proxy answers from its brief when confident — and for anything needing
@@ -37,8 +38,10 @@ which drops the question into the private `intelogroup/agent-call-bus` repo
 
 | Var | Meaning |
 |---|---|
-| `META_API_KEY` | Meta Model API key (live brain). Worker idles gracefully without it. |
-| `META_MODEL` | model name, default `muse-spark-1.3` (auto-discovery via `/v1/models`) |
+| `OPENROUTER_API_KEY` | OpenRouter key (live brain). Worker idles gracefully without it. |
+| `JETT_BRAIN_MODEL` | default `openrouter/free` (free-models router; per-request model varies, latency logged per turn) |
+| `META_API_KEY` | Meta direct key — optional fallback if no OpenRouter key. |
+| `META_MODEL` | Meta-direct model name, default `muse-spark-1.3` (auto-discovery via `/v1/models`) |
 | `LIVEKIT_URL` | `ws://localhost:7880` |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | generated server-side into `livekit.env` |
 | `BUS_DIR` / `BUS_REPO_SSH` | agent-call-bus checkout for `consult_jett` |
@@ -63,8 +66,10 @@ SIP-only setup.
    '{"title":"jett-proxy-bus","key":"ssh-ed25519 AAAA…","read_only":false}'`
    (manual fallback: repo Settings → Deploy keys). Without it, `consult_jett`
    degrades honestly ("can't reach Jett").
-2. **Brain key**: store `META_API_KEY` as a GitHub Actions secret, re-run
-   deploy (writes `agent.env`, restarts worker). Until then the worker
+2. **Brain key**: store `OPENROUTER_API_KEY` as a GitHub Actions secret, re-run
+   deploy (writes `agent.env`, restarts worker, runs `verify-brain.sh`:
+   resolves the brain from the worker module and does a free
+   `GET /v1/models` auth check — no tokens burned). Until then the worker
    answers calls with a spoken "brain not connected" notice — never silence.
 3. **Verify**: `systemctl is-active` on redis/livekit-server/livekit-sip/
    jett-proxy; place a test call to `sip:jett@129.159.189.244` from Linphone

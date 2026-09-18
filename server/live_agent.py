@@ -15,8 +15,9 @@ calls/live/<call-id>/in.jsonl in the private agent-call-bus repo, a
 background task polls out.jsonl for Jett's reply, and the reply is spoken
 back to the caller when it lands.
 
-Without META_API_KEY the worker still registers, but any inbound call gets
-a graceful "brain not connected" message instead of silence.
+Without OPENROUTER_API_KEY (or the META_API_KEY fallback) the worker
+still registers, but any inbound call gets a graceful "brain not
+connected" message instead of silence.
 
 Usage: python live_agent.py start
 """
@@ -33,6 +34,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 import numpy as np
 
@@ -67,7 +69,19 @@ LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "ws://localhost:7880")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 META_API_KEY = os.environ.get("META_API_KEY", "")
-META_MODEL_PREFERRED = os.environ.get("META_MODEL", "muse-spark-1.3")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Default: OpenRouter's free-models router. It picks a (random) free model
+# per request — verified working with tool-calling — so per-turn latency
+# varies; the metrics log below is how we watch it. Swap any time via env,
+# no code change needed (e.g. JETT_BRAIN_MODEL="meta/muse-spark-1.3").
+JETT_BRAIN_MODEL = os.environ.get("JETT_BRAIN_MODEL", "openrouter/free")
+# OpenRouter's recommended attribution headers (their docs ask for these).
+OPENROUTER_REFERER = os.environ.get(
+    "OPENROUTER_REFERER", "https://github.com/intelogroup/agent-calls")
+OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "jett-proxy voice agent")
+# Optional fallback: Meta's direct Model API (unverified endpoint).
+META_MODEL = os.environ.get("META_MODEL", "muse-spark-1.3")
 META_BASE_URL = "https://api.ai.meta.com/v1"
 JETT_MD = os.path.join(AGENT_DIR, "JETT.md")
 GREETING = os.environ.get(
@@ -139,12 +153,51 @@ Jett's brief:
 """
 
 
-# ------------------------------------------------------- Meta model ---
+def _is_rate_limit(err: Exception) -> bool:
+    """True if this looks like an HTTP 429 / rate-limit error, any shape."""
+    if getattr(err, "status_code", None) == 429:
+        return True
+    low = str(err).lower()
+    return "429" in low or "rate limit" in low or "too many requests" in low
 
-def discover_meta_model() -> str:
-    """Pick the best muse-spark model from /v1/models; fall back gracefully."""
-    if not META_API_KEY:
-        return ""
+
+# ------------------------------------------------------------------ brain ---
+
+class Brain(NamedTuple):
+    """Resolved LLM backend for one call: OpenRouter, or Meta direct."""
+    label: str          # "openrouter" | "meta-direct"
+    base_url: str
+    api_key: str
+    model: str
+    extra_headers: dict
+
+
+def resolve_brain() -> Brain | None:
+    """Pick the LLM backend: OpenRouter first, Meta direct as fallback."""
+    if OPENROUTER_API_KEY:
+        return Brain(
+            label="openrouter",
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            model=JETT_BRAIN_MODEL,
+            extra_headers={
+                "HTTP-Referer": OPENROUTER_REFERER,
+                "X-Title": OPENROUTER_TITLE,
+            },
+        )
+    if META_API_KEY:
+        return Brain(
+            label="meta-direct",
+            base_url=META_BASE_URL,
+            api_key=META_API_KEY,
+            model=_discover_meta_model(),
+            extra_headers={},
+        )
+    return None
+
+
+def _discover_meta_model() -> str:
+    """Pick the best muse-spark model from Meta's /v1/models; fall back."""
     try:
         import httpx
 
@@ -155,19 +208,18 @@ def discover_meta_model() -> str:
         )
         r.raise_for_status()
         ids = [m.get("id", "") for m in r.json().get("data", [])]
-        if META_MODEL_PREFERRED in ids:
-            return META_MODEL_PREFERRED
+        if META_MODEL in ids:
+            return META_MODEL
         sparks = sorted([i for i in ids if "muse-spark" in i], reverse=True)
         if sparks:
             log.info("using Meta model %s (preferred %s not listed)",
-                     sparks[0], META_MODEL_PREFERRED)
+                     sparks[0], META_MODEL)
             return sparks[0]
         log.warning("/v1/models listed no muse-spark model; using %s",
-                    META_MODEL_PREFERRED)
+                    META_MODEL)
     except Exception as e:
-        log.warning("model discovery failed (%s); using %s", e,
-                    META_MODEL_PREFERRED)
-    return META_MODEL_PREFERRED
+        log.warning("model discovery failed (%s); using %s", e, META_MODEL)
+    return META_MODEL
 
 
 # ----------------------------------------------------------------- STT ---
@@ -578,10 +630,10 @@ async def _speak_raw(room: rtc.Room, wav_pcm: bytes, sample_rate: int = 24000):
         await room.local_participant.unpublish_track(track.sid)
 
 
-async def _run_no_key(ctx: JobContext, bus: BusCall):
-    """No META_API_KEY: connect, play a spoken notice, hang up gracefully."""
+async def _run_no_brain(ctx: JobContext, bus: BusCall):
+    """No brain key: connect, play a spoken notice, hang up gracefully."""
     await ctx.connect()
-    log.warning("META_API_KEY missing — playing no-key notice")
+    log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
     tts_engine = KokoroTTS()
     samples, _ = await asyncio.get_running_loop().run_in_executor(
         None, tts_engine._synth,
@@ -589,22 +641,26 @@ async def _run_no_key(ctx: JobContext, bus: BusCall):
         "yet. He hasn't given me a key to think with. Try again later.")
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
     await _speak_raw(ctx.room, pcm)
-    await bus.set_status("ended", end_reason="no_meta_key")
+    await bus.set_status("ended", end_reason="no_brain_key")
     await ctx.room.disconnect()
 
 
-async def _run_call(ctx: JobContext, bus: BusCall):
+async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
     global _CURRENT_BUS
     _CURRENT_BUS = bus
 
-    model = discover_meta_model()
+    log.info("call brain: %s model=%s", brain.label, brain.model)
     stt_engine = WhisperSTT()
     stt_stream = stt.StreamAdapter(
         stt=stt_engine, vad=silero.VAD.load())
     tts_engine = KokoroTTS()
 
     agent_llm = openai_plugin.LLM(
-        model=model, api_key=META_API_KEY, base_url=META_BASE_URL)
+        model=brain.model,
+        api_key=brain.api_key,
+        base_url=brain.base_url,
+        extra_headers=brain.extra_headers if brain.extra_headers else NOT_GIVEN,
+    )
 
     brief = load_brief()
     agent = Agent(
@@ -619,6 +675,51 @@ async def _run_call(ctx: JobContext, bus: BusCall):
         max_tool_steps=10,
     )
     bus.session = session
+
+    # --- brain resilience: per-turn latency log + graceful rate-limit ---
+    # Free OpenRouter endpoints can be slower/flakier than paid ones.
+    # - "metrics_collected" gives per-turn duration/ttft for visibility.
+    # - "error" fires per failed attempt (the stream's built-in retry loop
+    #   already backs off); on 429s we tell the caller once (debounced)
+    #   instead of leaving silence, and the call never crashes here.
+    _last_limit_notice = 0.0  # monotonic ts of last spoken rate-limit notice
+
+    async def _say_brain_note(text: str) -> None:
+        try:
+            await session.say(text)
+        except Exception as e:
+            log.warning("brain notice speech failed: %s", e)
+
+    def _on_llm_metrics(metrics) -> None:
+        log.info("brain turn: model=%s duration=%.2fs ttft=%.2fs "
+                 "tokens prompt=%d completion=%d",
+                 brain.model, metrics.duration, metrics.ttft,
+                 metrics.prompt_tokens, metrics.completion_tokens)
+
+    def _on_llm_error(llm_error) -> None:
+        nonlocal _last_limit_notice
+        err = llm_error.error
+        is_limit = _is_rate_limit(err)
+        log.warning("brain error (recoverable=%s rate_limit=%s): %.200s",
+                    llm_error.recoverable, is_limit, err)
+        loop = asyncio.get_running_loop()
+        if is_limit:
+            now = time.monotonic()
+            if now - _last_limit_notice > 30:
+                _last_limit_notice = now
+                loop.create_task(_say_brain_note(
+                    "I'm hitting my rate limits \u2014 give me a few seconds "
+                    "and I'll be right with you."))
+        if not llm_error.recoverable:
+            note = ("I'm having trouble reaching my brain right now \u2014 "
+                    "could you say that once more?"
+                    if is_limit else
+                    "Sorry, I lost my train of thought \u2014 "
+                    "could you repeat that?")
+            loop.create_task(_say_brain_note(note))
+
+    agent_llm.on("metrics_collected", _on_llm_metrics)
+    agent_llm.on("error", _on_llm_error)
 
     await ctx.connect()
     await bus.set_status("active")
@@ -700,10 +801,11 @@ async def entrypoint(ctx: JobContext):
         log.info("inbound call %s from %s", call_id, caller)
         bus = BusCall(call_id, caller)
         bus_ok = await bus.open()
-        if META_API_KEY:
-            await _run_call(ctx, bus)
+        brain = resolve_brain()
+        if brain is not None:
+            await _run_call(ctx, bus, brain)
         else:
-            await _run_no_key(ctx, bus)
+            await _run_no_brain(ctx, bus)
         if not bus_ok:
             log.warning("bus unavailable; call proceeded without consult")
     except Exception as e:

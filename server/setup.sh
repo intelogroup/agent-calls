@@ -10,8 +10,9 @@
 #                kokoro-onnx (no torch — onnxruntime only)
 #   systemd units: livekit-server, livekit-sip, jett-proxy (the voice worker)
 #
-# No local LLM anywhere: the brain is the Meta Model API (key arrives later
-# as META_API_KEY). 1 GB RAM budget.
+# No local LLM anywhere: the brain is OpenRouter (model meta/muse-spark-1.3;
+# key arrives later as OPENROUTER_API_KEY, Meta direct as optional fallback).
+# 1 GB RAM budget.
 set -euo pipefail
 
 AGENT_DIR=/opt/agent

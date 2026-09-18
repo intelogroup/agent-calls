@@ -56,9 +56,33 @@ with tempfile.TemporaryDirectory() as td:
     check("reply line keys", set(robj) == {"ts", "in_seq", "text"}, repr(robj))
     check("seq/in_seq correlate", obj["seq"] == robj["in_seq"])
 
-# 3. missing-key behavior ---------------------------------------------
+# 3. brain resolution ---------------------------------------------------
+la.OPENROUTER_API_KEY = ""
 la.META_API_KEY = ""
-check("discover with no key", la.discover_meta_model() == "")
+check("no keys -> no brain", la.resolve_brain() is None)
+la.OPENROUTER_API_KEY = "sk-or-test"
+b = la.resolve_brain()
+check("openrouter preferred", b is not None and b.label == "openrouter")
+check("openrouter model default (free router)",
+      b.model == "openrouter/free")
+la.JETT_BRAIN_MODEL = "meta/muse-spark-1.3"
+check("model switchable via env",
+      la.resolve_brain().model == "meta/muse-spark-1.3")
+la.JETT_BRAIN_MODEL = "openrouter/free"
+check("openrouter base", b.base_url == "https://openrouter.ai/api/v1")
+check("openrouter headers",
+      b.extra_headers.get("HTTP-Referer") == "https://github.com/intelogroup/agent-calls"
+      and b.extra_headers.get("X-Title") == "jett-proxy voice agent")
+la.OPENROUTER_API_KEY = ""
+check("still no brain after clearing", la.resolve_brain() is None)
+class _E429(Exception):
+    status_code = 429
+check("429 by status_code", la._is_rate_limit(_E429("slow down")))
+check("429 in message", la._is_rate_limit(Exception("Error 429: quota exceeded")))
+check("rate limit words", la._is_rate_limit(Exception("Rate limit reached for model")))
+check("too many requests", la._is_rate_limit(Exception("Too Many Requests")))
+check("non-limit error", not la._is_rate_limit(ValueError("bad input")))
+check("500 not a limit", not la._is_rate_limit(Exception("500 internal error")))
 
 # 4. brief fallback ----------------------------------------------------
 la.JETT_MD = "/nonexistent/JETT.md"
