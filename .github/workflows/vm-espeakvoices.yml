@@ -1,0 +1,24 @@
+name: VM espeak voices (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  voices:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - run: |
+          echo "=== espeak-ng voices (en) ==="
+          espeak-ng --voices=en 2>&1 | head -20
+          echo ""
+          echo "=== mbrola installed? ==="
+          which mbrola || echo "mbrola NOT installed"
+          ls /usr/share/mbrola/ 2>/dev/null || echo "no mbrola voices"
+          echo ""
+          echo "=== testing 3 voice options ==="
+          # Generate 3 samples with different settings
+          espeak-ng -v en-us -s 175 -p 50 --stdout "Hey, it's Jett's line. Can you hear me now?" > /tmp/espeak-default.wav 2>&1
+          espeak-ng -v en-us -s 160 -p 60 -a 100 --stdout "Hey, it's Jett's line. Can you hear me now?" > /tmp/espeak-tuned.wav 2>&1
+          echo "default: $(du -h /tmp/espeak-default.wav | cut -f1)"
+          echo "tuned (slower, higher pitch): $(du -h /tmp/espeak-tuned.wav | cut -f1)"
+          # Check if mbrola us voices work
+          espeak-ng -v mb-us1 -s 160 --stdout "Hey, it's Jett's line." > /tmp/espeak-mbrola.wav 2>&1 && echo "mbrola us1: works" || echo "mbrola us1: not available"
