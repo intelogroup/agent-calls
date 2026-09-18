@@ -1,0 +1,30 @@
+name: VM restore espeak NOW (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== reinstalling espeak-ng ==="
+          sudo apt-get update -qq 2>&1 | tail -1
+          sudo apt-get install -y -qq espeak-ng 2>&1 | tail -2
+          which espeak-ng && echo "espeak-ng restored"
+          echo ""
+          echo "=== switching back to EspeakTTS ==="
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          with open('/opt/agent/live_agent.py', 'r') as f:
+              c = f.read()
+          c = c.replace("_TTS_ENGINE = PiperTTS()", "_TTS_ENGINE = EspeakTTS()")
+          c = c.replace("return _TTS_ENGINE if _TTS_ENGINE is not None else PiperTTS()",
+                        "return _TTS_ENGINE if _TTS_ENGINE is not None else EspeakTTS()")
+          with open('/opt/agent/live_agent.py', 'w') as f:
+              f.write(c)
+          print("Switched back to EspeakTTS", flush=True)
+          PYEOF
+          sudo /opt/agent/venv/bin/python -m py_compile /opt/agent/live_agent.py && echo "syntax OK"
+          sudo systemctl restart jett-proxy
+          sleep 8
+          sudo systemctl is-active jett-proxy
+          sudo journalctl -u jett-proxy --since "30 seconds ago" 2>&1 | grep -i "tts ready" | head -2
