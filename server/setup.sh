@@ -60,9 +60,11 @@ chmod 700 $SERVICE_HOME/.ssh
 echo "== livekit-server binary =="
 if [ ! -x $AGENT_DIR/bin/livekit-server ]; then
   mkdir -p $AGENT_DIR/bin
-  LK_TAG=$(curl -fsSL https://api.github.com/repos/livekit/livekit/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+  LK_TAG=$(curl -fsSL https://api.github.com/repos/livekit/livekit/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) || true
+  [ -n "$LK_TAG" ] || { echo "ERROR: could not resolve livekit release tag (network/GitHub API?)"; exit 1; }
   echo "livekit-server tag: $LK_TAG"
-  ASSET_URL=$(curl -fsSL "https://api.github.com/repos/livekit/livekit/releases/tags/$LK_TAG" | grep -o '"browser_download_url": *"[^"]*linux_amd64\.tar\.gz"' | head -1 | cut -d'"' -f4)
+  ASSET_URL=$(curl -fsSL "https://api.github.com/repos/livekit/livekit/releases/tags/$LK_TAG" | grep -o '"browser_download_url": *"[^"]*linux_amd64\.tar\.gz"' | head -1 | cut -d'"' -f4) || true
+  [ -n "$ASSET_URL" ] || { echo "ERROR: could not resolve livekit-server asset URL for tag $LK_TAG"; exit 1; }
   curl -fsSL --retry 3 "$ASSET_URL" -o /tmp/lk.tgz
   tar xzf /tmp/lk.tgz -C $AGENT_DIR/bin livekit-server
   chmod +x $AGENT_DIR/bin/livekit-server
@@ -76,7 +78,8 @@ if [ ! -x $AGENT_DIR/bin/livekit-sip ]; then
   mkdir -p $AGENT_DIR/bin
   if ! command -v go >/dev/null 2>&1; then
     echo "-- installing go toolchain --"
-    GO_TAR=$(curl -fsSL https://go.dev/dl/?mode=json | grep -o '"filename": *"go[0-9.]*\.linux-amd64\.tar\.gz"' | head -1 | cut -d'"' -f4)
+    GO_TAR=$(curl -fsSL https://go.dev/dl/?mode=json | grep -o '"filename": *"go[0-9.]*\.linux-amd64\.tar\.gz"' | head -1 | cut -d'"' -f4) || true
+    [ -n "$GO_TAR" ] || { echo "ERROR: could not resolve go toolchain tarball (network?)"; exit 1; }
     echo "go tarball: $GO_TAR"
     curl -fsSL --retry 3 "https://go.dev/dl/$GO_TAR" -o /tmp/go.tgz
     rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz
@@ -131,8 +134,10 @@ logging:
   level: info
 EOF
 # inject key/secret without ever printing them
-LK_KEY_V=$(grep ^LIVEKIT_API_KEY= $LK_ENV | cut -d= -f2)
-LK_SECRET_V=$(grep ^LIVEKIT_API_SECRET= $LK_ENV | cut -d= -f2)
+LK_KEY_V=$(grep ^LIVEKIT_API_KEY= $LK_ENV | cut -d= -f2) || true
+LK_SECRET_V=$(grep ^LIVEKIT_API_SECRET= $LK_ENV | cut -d= -f2) || true
+[ -n "$LK_KEY_V" ] && [ -n "$LK_SECRET_V" ] \
+  || { echo "ERROR: LIVEKIT_API_KEY/SECRET missing from $LK_ENV"; exit 1; }
 sed -i "s/__LK_KEY__/$LK_KEY_V/; s/__LK_SECRET__/$LK_SECRET_V/" $AGENT_DIR/livekit.yaml
 chmod 600 $AGENT_DIR/livekit.yaml
 chown $SERVICE_USER:$SERVICE_USER $AGENT_DIR/livekit.yaml
@@ -178,7 +183,8 @@ sudo -u $SERVICE_USER mkdir -p /opt/agent/models
 for f in kokoro-v1.0.int8.onnx voices-v1.0.bin; do
   if [ -s /opt/agent/models/$f ]; then echo "$f cached"; continue; fi
   sudo -u $SERVICE_USER curl -fL --retry 3 -o /opt/agent/models/$f \
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/$f"
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/$f" \
+    || { echo "ERROR: kokoro model download failed: $f"; exit 1; }
 done
 sudo -u $SERVICE_USER $AGENT_DIR/venv/bin/python -c "
 from kokoro_onnx import Kokoro
@@ -192,7 +198,8 @@ echo OK
 echo "== bus repo deploy key (for agent-call-bus, generated once) =="
 KEY=$SERVICE_HOME/.ssh/bus_key
 if [ ! -f $KEY ]; then
-  sudo -u $SERVICE_USER ssh-keygen -t ed25519 -N '' -f $KEY -C "jett-proxy-bus-key" -q
+  sudo -u $SERVICE_USER ssh-keygen -t ed25519 -N '' -f $KEY -C "jett-proxy-bus-key" -q \
+    || { echo "ERROR: bus deploy key generation failed ($KEY)"; exit 1; }
   echo "generated new deploy key"
 else
   echo "exists, kept"
@@ -218,15 +225,24 @@ echo OK
 
 echo "== facts sync cron (every 5 min, quiet when bus not cloned) =="
 # The facts snapshot (facts/facts.json) is kept fresh by a git pull on the
-# same bus repo the consult queue lives in. Silently no-ops until the
-# deploy key is added and the bus is cloned.
-CRON_LINE='*/5 * * * * [ -d /opt/agent/bus/.git ] && cd /opt/agent/bus && /usr/bin/git pull --ff-only -q >/dev/null 2>&1'
+# same bus repo the consult queue lives in. Quiet on success; on failure
+# appends "ts + error" to /opt/agent/facts-pull.log (the log line lives in
+# the cron command itself).
+# Cron %-trap: % is special in crontabs (means newline), so the date format
+# below uses \% escapes — a bare % would silently corrupt the command.
 # NOTE: `grep -v` exits 1 on empty input (no crontab yet); with
 # `set -euo pipefail` that would kill setup.sh before the echo runs.
 # The `|| true` keeps the benign empty case from being fatal.
+CRON_LINE='*/5 * * * * { if [ -d /opt/agent/bus/.git ]; then cd /opt/agent/bus && /usr/bin/git pull --ff-only -q >/dev/null 2>&1 || echo "$(date -u +\%Y-\%m-\%dT\%H:\%M:\%SZ) facts-pull FAILED rc=$?" >> /opt/agent/facts-pull.log; fi; } # agent-call-bus facts pull'
 ( sudo -u $SERVICE_USER crontab -l 2>/dev/null | grep -v "agent-call-bus" || true
-  echo "$CRON_LINE # agent-call-bus facts pull" ) \
-  | sudo -u $SERVICE_USER crontab -
+  echo "$CRON_LINE" ) \
+  | sudo -u $SERVICE_USER crontab - \
+  || { echo "ERROR: facts cron install failed for $SERVICE_USER"; exit 1; }
+echo OK
+
+echo "== line-health check script =="
+chmod +x $AGENT_DIR/line-health.sh 2>/dev/null \
+  || echo "WARNING: line-health.sh missing (older server/ copy?)"
 echo OK
 
 echo "== systemd units =="
