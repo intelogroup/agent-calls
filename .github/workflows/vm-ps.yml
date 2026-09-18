@@ -1,0 +1,16 @@
+name: VM process check (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  ps:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - name: Find SIP processes
+        run: |
+          echo "=== python processes ==="
+          ps aux | grep -a -iE "python|sip" | grep -a -v grep | head -15
+          echo "=== listening sockets ==="
+          sudo ss -tlnp 2>/dev/null | grep -a -E "5060|5061" | head -8
+          echo "=== TCP to sip.linphone.org ==="
+          sudo ss -tnp 2>/dev/null | grep -a "176.31.149.179" | head -5
