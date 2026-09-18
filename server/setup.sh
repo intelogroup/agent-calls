@@ -16,6 +16,7 @@ set -euo pipefail
 
 AGENT_DIR=/opt/agent
 SERVICE_USER=agent
+SERVICE_HOME=/home/agent
 PUBLIC_IP=129.159.189.244
 
 echo "== swap (2G, small box insurance) =="
@@ -42,8 +43,8 @@ id -u $SERVICE_USER >/dev/null 2>&1 || useradd -m -s /bin/bash $SERVICE_USER
 mkdir -p $AGENT_DIR
 chown -R $SERVICE_USER:$SERVICE_USER $AGENT_DIR
 # agent's ssh dir (bus repo deploy key lives here)
-sudo -u $SERVICE_USER mkdir -p ~$SERVICE_USER/.ssh
-chmod 700 ~$SERVICE_USER/.ssh
+sudo -u $SERVICE_USER mkdir -p $SERVICE_HOME/.ssh
+chmod 700 $SERVICE_HOME/.ssh
 
 echo "== livekit-server binary =="
 if [ ! -x $AGENT_DIR/bin/livekit-server ]; then
@@ -170,7 +171,7 @@ print('kokoro warmup OK', len(samples), 'samples @', sr)"
 echo OK
 
 echo "== bus repo deploy key (for agent-call-bus, generated once) =="
-KEY=~$SERVICE_USER/.ssh/bus_key
+KEY=$SERVICE_HOME/.ssh/bus_key
 if [ ! -f $KEY ]; then
   sudo -u $SERVICE_USER ssh-keygen -t ed25519 -N '' -f $KEY -C "jett-proxy-bus-key" -q
   echo "generated new deploy key"
