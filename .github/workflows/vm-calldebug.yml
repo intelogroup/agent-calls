@@ -1,0 +1,14 @@
+name: VM debug live call (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== jett-proxy logs (last 3 min) - TTS/audio errors ==="
+          sudo journalctl -u jett-proxy --since "3 minutes ago" 2>&1 | grep -i -E "tts_error|piper|error|exception|traceback|failed" | head -20
+          echo ""
+          echo "=== full recent logs (last 30 lines) ==="
+          sudo journalctl -u jett-proxy --since "3 minutes ago" 2>&1 | tail -30
