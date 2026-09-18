@@ -78,17 +78,21 @@ async def ensure_rule(sip, trunk_id: str):
                     sip_dispatch_rule_id=rule.sip_dispatch_rule_id))
             print(f"old rule '{RULE_NAME}' deleted", flush=True)
 
+    # NOTE: current livekit-protocol expects CreateSIPDispatchRuleRequest
+    # .dispatch_rule to be a SIPDispatchRuleInfo (not a bare SIPDispatchRule).
     rule = await sip.create_dispatch_rule(
         S.CreateSIPDispatchRuleRequest(
-            dispatch_rule=S.SIPDispatchRule(
-                dispatch_rule_individual=S.SIPDispatchRuleIndividual(
-                    room_prefix=ROOM_PREFIX)),
-            trunk_ids=[trunk_id],
-            name=RULE_NAME,
-            room_config=R.RoomConfiguration(
-                empty_timeout=300,
-                max_participants=10,
-                agents=[RoomAgentDispatch(agent_name=AGENT_NAME)],
+            dispatch_rule=S.SIPDispatchRuleInfo(
+                name=RULE_NAME,
+                rule=S.SIPDispatchRule(
+                    dispatch_rule_individual=S.SIPDispatchRuleIndividual(
+                        room_prefix=ROOM_PREFIX)),
+                trunk_ids=[trunk_id],
+                room_config=R.RoomConfiguration(
+                    empty_timeout=300,
+                    max_participants=10,
+                    agents=[RoomAgentDispatch(agent_name=AGENT_NAME)],
+                ),
             ),
         ))
     print(f"rule '{RULE_NAME}' created -> room prefix '{ROOM_PREFIX}', "
