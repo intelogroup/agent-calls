@@ -43,7 +43,7 @@ for i in $(seq 1 30); do
 done
 apt-get update -qq
 apt-get install -y -qq python3-venv python3-dev ffmpeg espeak-ng \
-    build-essential cmake curl git redis-server openssl \
+    build-essential cmake curl git redis-server openssl cron \
     pkg-config libopus-dev libopusfile-dev libsoxr-dev > /dev/null
 # redis: local bus only
 sed -i 's/^supervised .*/supervised systemd/' /etc/redis/redis.conf 2>/dev/null || true
@@ -210,6 +210,19 @@ echo OK
 echo "== git identity for bus commits =="
 sudo -u $SERVICE_USER git config --global user.email "jett-proxy@129.159.189.244" 2>/dev/null || true
 sudo -u $SERVICE_USER git config --global user.name "jett-proxy" 2>/dev/null || true
+# fallback SSH command for all bus git operations (defense in depth; the
+# worker also sets GIT_SSH_COMMAND per invocation)
+sudo -u $SERVICE_USER git config --global core.sshCommand \
+  "ssh -i $SERVICE_HOME/.ssh/bus_key -o StrictHostKeyChecking=no" 2>/dev/null || true
+echo OK
+
+echo "== facts sync cron (every 5 min, quiet when bus not cloned) =="
+# The facts snapshot (facts/facts.json) is kept fresh by a git pull on the
+# same bus repo the consult queue lives in. Silently no-ops until the
+# deploy key is added and the bus is cloned.
+CRON_LINE='*/5 * * * * [ -d /opt/agent/bus/.git ] && cd /opt/agent/bus && /usr/bin/git pull --ff-only -q >/dev/null 2>&1'
+( sudo -u $SERVICE_USER crontab -l 2>/dev/null | grep -v "agent-call-bus" ; echo "$CRON_LINE # agent-call-bus facts pull" ) \
+  | sudo -u $SERVICE_USER crontab -
 echo OK
 
 echo "== systemd units =="

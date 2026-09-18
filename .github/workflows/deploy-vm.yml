@@ -145,6 +145,13 @@ jobs:
           # NB: runs AFTER the restart above — setup-sip.py needs livekit-server on :7880.
           echo "sip routing configured"
 
+      - name: Run deterministic regression tests
+        timeout-minutes: 5
+        run: |
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
+            'sudo -u agent /opt/agent/venv/bin/python /opt/agent/test_proxy.py && sudo -u agent /opt/agent/venv/bin/python /opt/agent/tests/test_relay.py'
+          echo "regression tests passed"
+
       - name: Verify brain wiring + OpenRouter reachability
         timeout-minutes: 5
         run: |

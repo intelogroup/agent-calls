@@ -2,6 +2,10 @@
 Description=Jett voice proxy (LiveKit agent worker)
 After=network.target livekit-server.service livekit-sip.service
 Wants=livekit-server.service livekit-sip.service
+# keep the worker from hammering the box if the brain key is missing
+# (StartLimit* belong in [Unit], not [Service])
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 User=agent
@@ -11,9 +15,6 @@ EnvironmentFile=/opt/agent/livekit.env
 ExecStart=/opt/agent/venv/bin/python /opt/agent/live_agent.py start
 Restart=always
 RestartSec=10
-# keep the worker from hammering the box if the brain key is missing
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target

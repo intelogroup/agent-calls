@@ -5,15 +5,27 @@ One SIP line (sip:jett@129.159.189.244) -> LiveKit room (prefix jett-) ->
 this worker. Real-time voice pipeline:
 
     faster-whisper tiny.en (local STT, via StreamAdapter + silero VAD)
-      -> Muse Spark (LLM, OpenAI-compatible API)
+      -> ResilientLLM (OpenRouter free-model chain, empty-output retry)
       -> kokoro-onnx (local warm-voice TTS)
 
-The worker answers from its JETT.md brief when confident. For anything
-needing the real Jett's live memory, tools, or judgment it calls the
-consult_jett() function tool: the question is appended to
-calls/live/<call-id>/in.jsonl in the private agent-call-bus repo, a
-background task polls out.jsonl for Jett's reply, and the reply is spoken
-back to the caller when it lands.
+The worker answers from its JETT.md brief + Jett's synced facts snapshot
+when confident. For anything needing the real Jett's live memory, tools, or
+judgment it calls the consult_jett() function tool: the question is written
+to requests/<uuid>.json in the private agent-call-bus repo (async protocol,
+see server/BUS_PROTOCOL.md), pushed immediately, and Jett's side answers via
+responses/<uuid>.json. If Jett answers within CONSULT_TIMEOUT_SEC the reply
+is relayed live ("Jett says …", numbers validated); otherwise the request
+stays filed and Jett's answer is delivered afterward (voice callback /
+WhatsApp) — the caller is told honestly which happened.
+
+Relay guarantees (enforced in CODE, not just the prompt):
+  - every brain turn requests max_tokens >= 300 (floor, not a suggestion);
+  - empty model output retries with the next model in JETT_BRAIN_MODELS;
+    if all are empty, a guaranteed fallback line is spoken — dead air never;
+  - anything sourced from consult_jett or local_facts is spoken prefixed
+    with "Jett says", with numbers/dates validated against the source;
+  - rate limits back off exponentially between models; every turn logs
+    model used, latency, and whether empty-retry/fallback fired.
 
 Without OPENROUTER_API_KEY (or the META_API_KEY fallback) the worker
 still registers, but any inbound call gets a graceful "brain not
@@ -44,6 +56,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobExecutorType,
+    RunContext,
     WorkerOptions,
     cli,
     function_tool,
@@ -87,6 +100,14 @@ elif os.environ.get("JETT_BRAIN_MODEL"):
     JETT_BRAIN_MODELS = [os.environ["JETT_BRAIN_MODEL"].strip()]
 else:
     JETT_BRAIN_MODELS = [m.strip() for m in _DEFAULT_BRAIN_MODELS.split(",") if m.strip()]
+# max_tokens floor: free models blanked on tiny budgets in testing. This is a
+# floor, not a suggestion — resolve_brain() enforces >= 300 on every turn.
+BRAIN_MAX_TOKENS = max(300, int(os.environ.get("BRAIN_MAX_TOKENS", "300")))
+# Spoken when every model returns empty output. Dead air is never acceptable.
+FALLBACK_LINE = (
+    "Sorry — my brain came back empty just now. "
+    "Could you say that once more?"
+)
 # OpenRouter's recommended attribution headers (their docs ask for these).
 OPENROUTER_REFERER = os.environ.get(
     "OPENROUTER_REFERER", "https://github.com/intelogroup/agent-calls")
@@ -105,6 +126,8 @@ BUS_REPO_SSH = os.environ.get(
 BUS_KEY = os.path.expanduser("~/.ssh/bus_key")
 CONSULT_TIMEOUT_SEC = int(os.environ.get("CONSULT_TIMEOUT_SEC", "180"))
 MAX_CALL_SEC = int(os.environ.get("AGENT_MAX_CALL_SEC", "600"))
+# Synced facts snapshot (published by Track B into the bus repo).
+FACTS_STALE_SEC = int(os.environ.get("FACTS_STALE_SEC", "3600"))
 KOKORO_MODEL = os.path.join(AGENT_DIR, "models", "kokoro-v1.0.int8.onnx")
 KOKORO_VOICES = os.path.join(AGENT_DIR, "models", "voices-v1.0.bin")
 KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
@@ -113,11 +136,159 @@ AGENT_NAME = "jett-proxy"
 # one call at a time; a second caller gets a polite busy message
 _CALL_LOCK = threading.Lock()
 _ACTIVE_CALL: str | None = None
+# call id of the call currently being served (for consult context)
+_CURRENT_CALL_ID: str | None = None
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+
+def _utcnow_z() -> str:
+    # bus protocol wants trailing Z, e.g. 2026-09-18T16:40:00Z
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ------------------------------------------- relay hardening (pure) ---
+
+ATTRIBUTION_PREFIX = "Jett says"
+
+_NUM_TOKEN_RE = re.compile(r"""
+    (?:\.\.\.|…)?          # account-suffix ellipsis, e.g. …1792
+    \$?                    # optional currency sign
+    \d[\d,]*               # digits, keeping thousand separators
+    (?:\.\d+)?             # optional decimals
+    |
+    \b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b   # numeric dates 09/19, 2026-09-19
+""", re.VERBOSE)
+
+
+def _norm_num(tok: str) -> str:
+    """Normalize a number token for comparison. Keeps thousand separators
+    (so 1,792 != 1792) and decimals, drops $, whitespace, …/.... Trailing
+    commas are sentence punctuation, not part of the number."""
+    t = tok.strip().lower().replace("…", "").replace("$", "").replace(" ", "")
+    if t.startswith("..."):
+        t = t[3:]
+    return t.rstrip(",")
+
+
+def extract_num_tokens(text: str) -> set[str]:
+    """All number/date tokens in text, normalized. Used to catch relay
+    corruption like the …1792 suffix -> $1,792 balance bug."""
+    out = set()
+    for m in _NUM_TOKEN_RE.finditer(text or ""):
+        n = _norm_num(m.group(0))
+        if n:
+            out.add(n)
+    return out
+
+
+def validate_numbers(spoken: str, source: str,
+                     require_all_source: bool = True) -> bool:
+    """Check number/date fidelity between a spoken relay and its source.
+
+    require_all_source=True (consult replies): every number in the SOURCE
+        must survive into the spoken text — nothing dropped, nothing merged.
+    require_all_source=False (facts slices): every number in the SPOKEN text
+        must exist in the source — nothing invented or corrupted.
+    """
+    src = extract_num_tokens(source)
+    got = extract_num_tokens(spoken)
+    if require_all_source:
+        return src <= got
+    return got <= src
+
+
+def enforce_attribution(spoken: str) -> str:
+    """Code-enforced 'Jett says' prefix for anything sourced from Jett."""
+    s = (spoken or "").strip()
+    if not s:
+        return s
+    if s.lower().startswith("jett says"):
+        return s
+    return f"{ATTRIBUTION_PREFIX}: {s}"
+
+
+def relay_consult_reply(answer: str, draft: str) -> str:
+    """Build the spoken relay of a consult_jett answer.
+
+    answer: Jett's exact words (responses/<uuid>.json). draft: the model's
+    relay text. Numbers are validated; on ANY mismatch we read Jett
+    literally rather than risk corruption. Attribution is enforced.
+    """
+    answer = (answer or "").strip()
+    draft = (draft or "").strip()
+    if not answer:
+        return (f"{ATTRIBUTION_PREFIX}: I didn't get a clear answer from "
+                "Jett — I'll ask him again.")
+    if not draft or not validate_numbers(draft, answer,
+                                         require_all_source=True):
+        if draft and draft != answer:
+            log.warning("consult relay numbers mismatch; reading Jett literally")
+        return enforce_attribution(answer)
+    return enforce_attribution(draft)
+
+
+def relay_facts_reply(tool_output: str, draft: str) -> str:
+    """Build the spoken relay of a local_facts tool result.
+
+    The draft may be a slice, so we check the spoken numbers all exist in
+    the source (no invented/corrupted numbers) and that the freshness stamp
+    survives into speech.
+    """
+    tool_output = (tool_output or "").strip()
+    draft = (draft or "").strip()
+    if not draft:
+        return enforce_attribution(tool_output)
+    if not validate_numbers(draft, tool_output, require_all_source=False):
+        log.warning("facts relay numbers mismatch; reading facts literally")
+        return enforce_attribution(tool_output)
+    out = enforce_attribution(draft)
+    m = re.search(r"\(as of ([^)]+)\)", tool_output)
+    if m and "as of" not in out.lower():
+        out = out.rstrip().rstrip(".") + f" (as of {m.group(1)})."
+    return out
+
+
+def compute_backoff(attempt: int, base: float = 1.0,
+                    cap: float = 30.0) -> float:
+    """Deterministic exponential backoff (seconds) for rate-limit retries."""
+    return min(cap, base * (2 ** max(0, attempt)))
+
+
+def freshness_str(age_sec: float) -> str:
+    if age_sec < 60:
+        return "just now"
+    mins = int(age_sec // 60)
+    if mins < 60:
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    hrs = int(mins // 60)
+    return f"{hrs} hour{'s' if hrs != 1 else ''} ago"
+
+
+def _facts_path() -> str:
+    return os.path.join(BUS_DIR, "facts", "facts.json")
+
+
+def load_facts() -> tuple[dict | None, float | None]:
+    """Load the synced facts snapshot. Returns (data, age_seconds);
+    (None, None) when missing/unreadable."""
+    try:
+        with open(_facts_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        log.debug("facts snapshot unreadable: %s", e)
+        return None, None
+    gen = data.get("generated_at")
+    age = None
+    if gen:
+        try:
+            gen_dt = datetime.fromisoformat(str(gen).replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - gen_dt).total_seconds()
+        except ValueError:
+            age = None
+    return data, age
 
 # ------------------------------------------------------- JETT.md brief ---
 
@@ -146,14 +317,21 @@ Contract (follow it exactly):
 - Answer from the brief when you are confident. Keep answers SHORT: this is
   a phone call, one or two sentences when possible. No bullet lists, no
   essays, no markdown.
-- If the caller asks anything that needs the REAL Jett's live memory,
-  current information, tools, or real judgment, call consult_jett with a
-  clear, self-contained question. NEVER invent Jett's answers. NEVER guess
-  at things only Jett would know (his schedule, money, messages, accounts).
-- After calling consult_jett, tell the caller plainly you're checking with
-  Jett ("Let me check with Jett on that, one sec…") and keep them company
-  naturally. Jett's reply will be handed to you; relay it faithfully —
-  you may say "Jett says…" then his words, unchanged.
+- For FACTUAL questions (schedule, money, balances, bills, inbox, anything
+  with numbers or dates): FIRST call local_facts — it reads Jett's synced
+  snapshot. Relay it starting with "Jett says" and include its freshness
+  ("as of 12 minutes ago"). If the snapshot is missing or stale, say so
+  honestly and use consult_jett instead of guessing.
+- If the caller asks anything else that needs the REAL Jett's live memory,
+  current information, or real judgment, call consult_jett with a clear,
+  self-contained question. It tells the caller you're checking, then waits
+  for Jett: his answer may arrive live — relay it as "Jett says" with his
+  numbers EXACTLY as stated — or be delivered to him afterward, in which
+  case tell the caller honestly you've passed it to Jett. NEVER invent
+  Jett's answers. NEVER guess at things only Jett would know (his schedule,
+  money, messages, accounts).
+- Vague follow-ups ("what about the other one?") → ask what they mean or
+  consult_jett. Never guess which "other one" they mean.
 - Relay Jett's facts and numbers EXACTLY as he stated them. Never reinterpret,
   round, or merge them: an account suffix like …1792 is NOT a balance, a date
   is a date. When condensing for voice, keep every number and key fact; when
@@ -189,7 +367,11 @@ class Brain(NamedTuple):
 
 
 def resolve_brain() -> Brain | None:
-    """Pick the LLM backend: OpenRouter first, Meta direct as fallback."""
+    """Pick the LLM backend: OpenRouter first, Meta direct as fallback.
+
+    Every OpenRouter turn carries max_tokens >= BRAIN_MAX_TOKENS (>= 300)
+    in extra_body — the floor is enforced here, not hoped for.
+    """
     if OPENROUTER_API_KEY:
         return Brain(
             label="openrouter",
@@ -200,7 +382,11 @@ def resolve_brain() -> Brain | None:
                 "HTTP-Referer": OPENROUTER_REFERER,
                 "X-Title": OPENROUTER_TITLE,
             },
-            extra_body={"models": JETT_BRAIN_MODELS, "route": "fallback"},
+            extra_body={
+                "models": JETT_BRAIN_MODELS,
+                "route": "fallback",
+                "max_tokens": BRAIN_MAX_TOKENS,
+            },
         )
     if META_API_KEY:
         return Brain(
@@ -239,6 +425,233 @@ def _discover_meta_model() -> str:
         log.warning("model discovery failed (%s); using %s", e, META_MODEL)
     return META_MODEL
 
+
+# ------------------------------------- resilient LLM (retry wrapper) ---
+
+async def _drain(stream: llm.LLMStream) -> tuple[list, str, bool]:
+    """Drain a stream fully. Returns (chunks, text, has_tool_calls)."""
+    chunks: list = []
+    texts: list[str] = []
+    has_tools = False
+    async for chunk in stream:
+        chunks.append(chunk)
+        delta = chunk.delta
+        if delta is None:
+            continue
+        if delta.content:
+            texts.append(delta.content)
+        if delta.tool_calls:
+            has_tools = True
+    try:
+        await stream.aclose()
+    except Exception:
+        pass
+    return chunks, "".join(texts), has_tools
+
+
+def _last_tool_output(chat_ctx: llm.ChatContext,
+                      names: tuple[str, ...]) -> llm.FunctionCallOutput | None:
+    """The most recent FunctionCallOutput for one of `names`, provided no
+    user message came after it (i.e. this turn is the relay turn)."""
+    last = None
+    for item in getattr(chat_ctx, "items", []) or []:
+        if getattr(item, "type", None) == "function_call_output" \
+                and getattr(item, "name", None) in names:
+            last = item
+        elif getattr(item, "type", None) == "message" \
+                and getattr(item, "role", None) == "user":
+            last = None
+    return last
+
+
+def _maybe_relay(chat_ctx: llm.ChatContext, text: str) -> str:
+    """Post-process a finished turn: if it relays a consult_jett /
+    local_facts tool result, enforce attribution + number fidelity in code."""
+    out = _last_tool_output(chat_ctx, ("consult_jett", "local_facts"))
+    if out is None:
+        return text
+    name, output = out.name, (out.output or "")
+    if name == "consult_jett":
+        if output.startswith(("ERROR_CANT_REACH_JETT", "FILED_ASYNC")):
+            return text  # honest proxy message, not Jett's words
+        return relay_consult_reply(output, text)
+    if name == "local_facts":
+        if output.startswith(("FACTS_UNAVAILABLE", "FACTS_STALE")):
+            return text  # honest proxy message, not Jett's words
+        return relay_facts_reply(output, text)
+    return text
+
+
+class _ReplayStream(llm.LLMStream):
+    """Replays pre-drained (and possibly rewritten) chunks to the session."""
+
+    def __init__(self, resilient: "ResilientLLM", *, chat_ctx, tools,
+                 conn_options, chunks: list) -> None:
+        super().__init__(resilient, chat_ctx=chat_ctx, tools=tools,
+                         conn_options=conn_options)
+        self._chunks = chunks
+
+    async def _run(self) -> None:
+        for chunk in self._chunks:
+            self._event_ch.send_nowait(chunk)
+
+
+class ResilientLLM(llm.LLM):
+    """llm.LLM with per-model empty-output retry and relay post-processing.
+
+    chat() returns a stream whose _run() drains each model in
+    JETT_BRAIN_MODELS in order: on empty content (or error) it advances to
+    the next model, backing off exponentially on rate limits. When the turn
+    relays a consult_jett/local_facts tool result, the finished text is
+    rewritten through the relay guards (attribution + number validation).
+    If every model comes back empty, a guaranteed fallback line is spoken —
+    dead air is never acceptable.
+
+    metrics_collected events from the inner LLMs are re-emitted so usage
+    telemetry keeps working. Per-turn: model used, latency, empty-retry and
+    fallback flags are logged.
+    """
+
+    def __init__(self, brain: Brain, _llm_factory=None) -> None:
+        super().__init__()
+        self._brain = brain
+        self._factory = _llm_factory or self._default_factory
+
+    @property
+    def model(self) -> str:
+        return self._brain.model
+
+    @property
+    def provider(self) -> str:
+        return "openrouter-resilient"
+
+    def _models(self) -> list[str]:
+        if self._brain.label == "openrouter":
+            return list(JETT_BRAIN_MODELS)
+        return [self._brain.model]
+
+    def _default_factory(self, model: str, remaining: list[str]):
+        inner = openai_plugin.LLM(
+            model=model,
+            api_key=self._brain.api_key,
+            base_url=self._brain.base_url,
+            extra_headers=self._brain.extra_headers
+            if self._brain.extra_headers else NOT_GIVEN,
+            extra_body={
+                **(self._brain.extra_body or {}),
+                "models": remaining,
+                "route": "fallback",
+                "max_tokens": BRAIN_MAX_TOKENS,
+            },
+        )
+        # usage telemetry keeps working through the wrapper
+        inner.on("metrics_collected",
+                 lambda m: self.emit("metrics_collected", m))
+        # inner "error" events are NOT forwarded: the wrapper absorbs
+        # failed attempts (retry / backoff / fallback) by design.
+        return inner
+
+    def chat(self, *, chat_ctx: llm.ChatContext,
+             tools: list | None = None,
+             conn_options=DEFAULT_API_CONNECT_OPTIONS,
+             parallel_tool_calls=NOT_GIVEN,
+             tool_choice=NOT_GIVEN,
+             extra_kwargs=NOT_GIVEN,
+             **kwargs) -> llm.LLMStream:
+        return _ResilientStream(
+            self,
+            chat_ctx=chat_ctx,
+            tools=tools or [],
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+            extra_kw=kwargs,
+        )
+
+    async def _attempt(self, ctx: "_ResilientStream") -> list:
+        models = self._models()
+        empty_retries = 0
+        for i, model in enumerate(models):
+            t0 = time.monotonic()
+            try:
+                inner = self._factory(model, models[i:])
+                stream = inner.chat(
+                    chat_ctx=ctx._chat_ctx,
+                    tools=ctx._tools or None,
+                    conn_options=ctx._conn_options,
+                    parallel_tool_calls=ctx._parallel_tool_calls,
+                    tool_choice=ctx._tool_choice,
+                    extra_kwargs=ctx._extra_kwargs,
+                    **ctx._extra_kw,
+                )
+                chunks, text, has_tools = await _drain(stream)
+            except Exception as e:
+                dt = time.monotonic() - t0
+                if _is_rate_limit(e):
+                    delay = compute_backoff(i)
+                    log.warning("brain chat: model=%s rate-limited "
+                                "(%.1fs); backing off %.1fs then next model",
+                                model, dt, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    log.warning("brain chat: model=%s errored (%.1fs): %.150s",
+                                model, dt, e)
+                empty_retries += 1
+                continue
+            dt = time.monotonic() - t0
+            if text.strip() or has_tools:
+                log.info("brain chat: model=%s latency=%.1fs empty_retry=%s",
+                         model, dt, empty_retries > 0)
+                return self._postprocess(ctx, chunks, text, has_tools)
+            empty_retries += 1
+            log.warning("brain chat: model=%s empty content (%.1fs); "
+                        "trying next model", model, dt)
+        # every model empty/failed — guaranteed spoken fallback, never silence
+        log.warning("brain chat: ALL %d models empty/failed; speaking fallback",
+                    len(models))
+        return [llm.ChatChunk(
+            id=f"fallback-{uuid.uuid4().hex[:8]}",
+            delta=llm.ChoiceDelta(content=FALLBACK_LINE, role="assistant"),
+        )]
+
+    def _postprocess(self, ctx, chunks: list, text: str,
+                     has_tools: bool) -> list:
+        if has_tools or not text.strip():
+            return chunks
+        fixed = _maybe_relay(ctx._chat_ctx, text)
+        if fixed == text:
+            return chunks
+        log.info("brain chat: relay post-processed "
+                 "(attribution/numbers enforced)")
+        return [llm.ChatChunk(
+            id=f"relay-{uuid.uuid4().hex[:8]}",
+            delta=llm.ChoiceDelta(content=fixed, role="assistant"),
+        )]
+
+
+class _ResilientStream(llm.LLMStream):
+    """The stream AgentSession consumes; _run() does drain→retry→replay."""
+
+    def __init__(self, resilient: ResilientLLM, *, chat_ctx,
+                 tools: list,
+                 conn_options,
+                 parallel_tool_calls,
+                 tool_choice,
+                 extra_kwargs,
+                 extra_kw: dict) -> None:
+        super().__init__(resilient, chat_ctx=chat_ctx, tools=tools,
+                         conn_options=conn_options)
+        self._resilient = resilient
+        self._parallel_tool_calls = parallel_tool_calls
+        self._tool_choice = tool_choice
+        self._extra_kwargs = extra_kwargs
+        self._extra_kw = extra_kw
+
+    async def _run(self) -> None:
+        chunks = await self._resilient._attempt(self)
+        for chunk in chunks:
+            self._event_ch.send_nowait(chunk)
 
 # ----------------------------------------------------------------- STT ---
 
@@ -373,7 +786,6 @@ class _KokoroChunkedStream(tts.ChunkedStream):
                 output_emitter.push(pcm[i:i + frame_bytes])
         output_emitter.flush()
 
-
 # ------------------------------------------------- agent-call-bus ---
 
 def _git_env() -> dict:
@@ -396,7 +808,12 @@ async def _git(args: list[str], cwd: str = BUS_DIR) -> tuple[int, str]:
 
 
 async def _bus_ensure() -> bool:
-    """Clone the bus repo if missing. Returns True if usable."""
+    """Clone the bus repo if missing. Returns True if usable.
+
+    Graceful when the VM deploy key hasn't been added to
+    intelogroup/agent-call-bus yet — consults then report unreachable
+    instead of crashing the call.
+    """
     if os.path.isdir(os.path.join(BUS_DIR, ".git")):
         return True
     try:
@@ -414,208 +831,200 @@ async def _bus_ensure() -> bool:
         return False
 
 
-async def _bus_push_with_retry(commit_msg: str) -> bool:
-    for attempt in range(3):
-        rc, _ = await _git(["pull", "--rebase", "--autostash"])
-        if rc != 0:
-            await asyncio.sleep(2)
-            continue
-        rc, _ = await _git(["add", "-A"])
-        rc, _ = await _git(["commit", "-m", commit_msg, "--allow-empty"])
-        rc, out = await _git(["push", "origin", "HEAD"])
-        if rc == 0:
-            return True
-        log.warning("bus push attempt %d failed: %s", attempt + 1,
-                    out[-300:])
-        await asyncio.sleep(2)
-    return False
-
-
-class BusCall:
-    """Per-call bus state: meta.json, in/out.jsonl, consult matching."""
-
-    def __init__(self, call_id: str, caller: str):
-        self.call_id = call_id
-        self.dir = os.path.join(BUS_DIR, "calls", "live", call_id)
-        self.in_path = os.path.join(self.dir, "in.jsonl")
-        self.out_path = os.path.join(self.dir, "out.jsonl")
-        self.meta_path = os.path.join(self.dir, "meta.json")
-        self.hb_path = os.path.join(self.dir, "hb.json")
-        self.caller = caller
-        self.seq = 0
-        self.spoken_out = 0          # highest out.jsonl line spoken/consumed
-        self.pending: dict[int, asyncio.Event] = {}
-        self.replies: dict[int, str] = {}
-        self.delivered: set[int] = set()
-        self.timed_out: set[int] = set()
-        self.session: AgentSession | None = None
-        self.active = True
-
-    async def open(self) -> bool:
-        if not await _bus_ensure():
+async def _bus_write_push(relpath: str, obj: dict, msg: str) -> bool:
+    """Write one JSON file into the bus repo and push immediately
+    (protocol: commit + push, batch window <= 3 s)."""
+    try:
+        full = os.path.join(BUS_DIR, relpath)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        if (await _git(["add", relpath]))[0] != 0:
             return False
-        os.makedirs(self.dir, exist_ok=True)
-        for p in (self.in_path, self.out_path):
-            if not os.path.exists(p):
-                open(p, "a").close()
-        meta = {
-            "call_id": self.call_id,
-            "mode": "jett-proxy",
-            "started_at": _utcnow(),
-            "ended_at": None,
-            "status": "ringing",
-            "caller": self.caller,
-            "end_reason": None,
-        }
-        with open(self.meta_path, "w") as f:
-            json.dump(meta, f)
-        ok = await _bus_push_with_retry(f"call {self.call_id} started")
-        log.info("bus call dir ready: %s (push %s)", self.dir,
-                 "ok" if ok else "FAILED")
-        return True
-
-    async def set_status(self, status: str, end_reason: str | None = None):
-        try:
-            with open(self.meta_path) as f:
-                meta = json.load(f)
-        except OSError:
-            return
-        meta["status"] = status
-        if status == "ended":
-            meta["ended_at"] = _utcnow()
-            meta["end_reason"] = end_reason
-        with open(self.meta_path, "w") as f:
-            json.dump(meta, f)
-        await _bus_push_with_retry(f"call {self.call_id} {status}")
-
-    async def consult(self, question: str) -> int | None:
-        """Append a consult question; returns seq or None on failure."""
-        self.seq += 1
-        line = json.dumps({"ts": _utcnow(), "seq": self.seq,
-                           "text": question}, ensure_ascii=False)
-        try:
-            with open(self.in_path, "a") as f:
-                f.write(line + "\n")
-        except OSError as e:
-            log.warning("in.jsonl append failed: %s", e)
-            return None
-        self.pending[self.seq] = asyncio.Event()
-        ok = await _bus_push_with_retry(
-            f"consult #{self.seq} on {self.call_id}")
-        if not ok:
-            log.warning("consult push failed; Jett may never see it")
-        return self.seq
-
-    async def poll_once(self):
-        """Pull and match any new replies in out.jsonl."""
-        rc, _ = await _git(["pull", "--rebase", "--autostash"])
+        if (await _git(["commit", "-m", msg, "--allow-empty"]))[0] != 0:
+            return False
+        rc, out = await _git(["push", "origin", "HEAD"])
         if rc != 0:
-            return
+            # someone (Jett's side) pushed first — rebase once and retry
+            log.info("bus push raced; rebasing once")
+            await _git(["pull", "--rebase", "--autostash"])
+            rc, out = await _git(["push", "origin", "HEAD"])
+        if rc != 0:
+            log.warning("bus push failed: %s", out[-300:])
+        return rc == 0
+    except OSError as e:
+        log.warning("bus write failed: %s", e)
+        return False
+
+
+async def _bus_poll_response(req_id: str,
+                             timeout_sec: int) -> str | None:
+    """Poll responses/<req_id>.json until Jett answers or timeout.
+
+    Returns Jett's answer text, or None on timeout. responses/ and
+    deliveries/ are written by Jett's side only — we never write them.
+    """
+    path = os.path.join(BUS_DIR, "responses", f"{req_id}.json")
+    deadline = time.monotonic() + max(0, timeout_sec)
+    while time.monotonic() < deadline:
+        await _git(["pull", "--ff-only", "-q"])
         try:
-            with open(self.out_path) as f:
-                lines = f.read().splitlines()
-        except OSError:
-            return
-        for line in lines[self.spoken_out:]:
-            self.spoken_out += 1
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            in_seq = obj.get("in_seq", 0)
-            text = (obj.get("text") or "").strip()
-            if not text:
-                continue
-            if in_seq in self.pending and in_seq not in self.replies:
-                self.replies[in_seq] = text
-                self.pending[in_seq].set()
-                log.info("consult #%d answered (%d chars)", in_seq,
-                         len(text))
-
-    async def bus_loop(self):
-        """Background task: poll replies, heartbeat, speak answers."""
-        hb_every = 12  # ~60 s at 5 s poll interval
-        n = 0
-        while self.active:
-            await asyncio.sleep(5)
-            if not self.active:
-                break
-            n += 1
-            try:
-                await self.poll_once()
-                # deliver fresh replies proactively
-                for seq, text in list(self.replies.items()):
-                    self.replies.pop(seq, None)
-                    self.pending.pop(seq, None)
-                    if seq in self.timed_out or seq in self.delivered:
-                        continue
-                    # deliver fresh replies proactively
-                    if self.session is not None:
-                        log.info("delivering Jett's reply to consult #%d",
-                                 seq)
-                        self.session.say(
-                            f"Jett says: {text}",
-                            allow_interruptions=True,
-                        )
-                    self.delivered.add(seq)
-                if n % hb_every == 0:
-                    hb = {"ts": _utcnow(),
-                          "last_in_seq": self.seq,
-                          "last_out_seq": self.spoken_out}
-                    with open(self.hb_path, "w") as f:
-                        json.dump(hb, f)
-                    await _bus_push_with_retry(
-                        f"hb {self.call_id}")
-            except Exception as e:
-                log.warning("bus_loop error: %s", e)
-
-    async def wait_reply(self, seq: int) -> str | None:
-        """Wait up to CONSULT_TIMEOUT_SEC for Jett's reply."""
-        ev = self.pending.get(seq)
-        if ev is None:
-            return None
-        try:
-            await asyncio.wait_for(ev.wait(), timeout=CONSULT_TIMEOUT_SEC)
-            return self.replies.get(seq)
-        except asyncio.TimeoutError:
-            self.timed_out.add(seq)
-            self.pending.pop(seq, None)
-            return None
+            with open(path, encoding="utf-8") as f:
+                obj = json.load(f)
+        except (OSError, ValueError):
+            obj = None
+        if obj and obj.get("id") == req_id:
+            answer = (obj.get("answer") or "").strip()
+            if answer:
+                if obj.get("answered_by") != "jett-runtime":
+                    log.warning("consult %s answered_by=%r (expected "
+                                "'jett-runtime')", req_id[:8],
+                                obj.get("answered_by"))
+                log.info("consult %s answered live (%d chars)",
+                         req_id[:8], len(answer))
+                return answer
+        await asyncio.sleep(5)
+    return None
 
 
-# the call currently being served (set in entrypoint); tools close over it
-_CURRENT_BUS: BusCall | None = None
+async def file_consult_request(question: str,
+                               priority: str = "normal") -> tuple[str, dict]:
+    """File a consult to Jett's async judgment queue.
+
+    Returns (status, payload):
+      "unreachable" — bus repo unusable; payload {"error": ...}
+      "filed"       — request pushed; payload {"request": req_obj}
+    The caller (consult_jett tool) then polls for a live answer; on timeout
+    the filed request is picked up by Jett's 5-minute watcher and the answer
+    is delivered afterward (voice callback / WhatsApp).
+    """
+    if not await _bus_ensure():
+        return ("unreachable",
+                {"error": "bus repo unreachable (deploy key not added?)"})
+    req_id = str(uuid.uuid4())
+    req = {
+        "id": req_id,
+        "ts": _utcnow_z(),
+        "call_id": _CURRENT_CALL_ID or "unknown",
+        "question": question.strip(),
+        "context": ("Live voice call with Jim on Jett's line "
+                    "(sip:jett@129.159.189.244). Asked mid-call; the brief "
+                    "and facts snapshot couldn't answer it."),
+        "priority": priority if priority in ("normal", "urgent") else "normal",
+    }
+    ok = await _bus_write_push(f"requests/{req_id}.json", req,
+                               f"consult {req_id[:8]}")
+    if not ok:
+        return ("unreachable", {"error": "bus push failed"})
+    log.info("consult %s filed (priority=%s)", req_id[:8], req["priority"])
+    return ("filed", {"request": req})
+
+
+# ------------------------------------------------------------ tools ---
+
+@function_tool
+async def consult_jett(question: str, context: RunContext,
+                       priority: str = "normal") -> str:
+    """Ask the real Jett something only he would know — his live memory,
+    current information, messages, accounts, or real judgment. The question
+    is filed to Jett's async judgment queue and pushed immediately. If Jett
+    answers within a few minutes his reply is spoken live; otherwise his
+    answer is delivered to the caller afterward (voice callback / WhatsApp)
+    — tell the caller honestly which happened. NEVER invent Jett's answer.
+
+    priority: "normal", or "urgent" for time-sensitive matters (money
+    emergencies, same-day deadlines).
+    """
+    try:
+        await context.session.say(
+            "Let me check with Jett on that — one moment…",
+            allow_interruptions=True,
+        )
+    except Exception as e:
+        log.debug("holding line failed: %s", e)
+
+    status, payload = await file_consult_request(question, priority)
+    if status == "unreachable":
+        return ("ERROR_CANT_REACH_JETT: couldn't file the question to Jett "
+                f"({payload.get('error')}). Tell the caller honestly: "
+                "I can't reach Jett right now — offer to try again later.")
+
+    req = payload["request"]
+    answer = await _bus_poll_response(req["id"], CONSULT_TIMEOUT_SEC)
+    if answer is not None:
+        return answer  # relayed with "Jett says" + number checks by wrapper
+    return (f"FILED_ASYNC: filed as consult {req['id'][:8]}. Jett answers "
+            "asynchronously — his answer will be delivered to the caller "
+            "afterward (voice callback / WhatsApp). Tell the caller "
+            "honestly: I've passed your question to Jett, he'll get back "
+            "to you shortly. Do NOT invent an answer.")
+
+
+def _facts_slice(data: dict, query: str) -> str:
+    """Compact, query-relevant slice of the facts snapshot."""
+    q = (query or "").lower()
+    lines: list[str] = []
+
+    def _want(*keys: str) -> bool:
+        return not q or any(k in q for k in keys)
+
+    cal = data.get("calendar_today") or []
+    if cal and _want("schedul", "calendar", "today", "appointment", "meeting",
+                     "booking", "plan"):
+        lines.append("Today:")
+        for e in cal[:8]:
+            lines.append(f"  - {e.get('title', '?')} at {e.get('time', '?')}")
+    accts = data.get("accounts") or []
+    if accts and _want("account", "balance", "bank", "checking", "money",
+                       "dollar"):
+        lines.append("Accounts:")
+        for a in accts[:6]:
+            lines.append(
+                f"  - {a.get('label', '?')} …{a.get('suffix', '?')}: "
+                f"balance ${a.get('balance', '?')} "
+                f"(available ${a.get('available', '?')})")
+    bills = data.get("bills") or []
+    if bills and _want("bill", "due", "payment", "pay", "owe", "money",
+                       "dollar"):
+        lines.append("Bills:")
+        for b in bills[:8]:
+            lines.append(
+                f"  - {b.get('payee', '?')}: ${b.get('amount', '?')} "
+                f"due {b.get('due', '?')} [{b.get('status', '?')}]")
+    inbox = data.get("inbox") or []
+    if inbox and _want("email", "inbox", "mail", "message", "subject"):
+        lines.append("Inbox:")
+        for m in inbox[:6]:
+            lines.append(f"  - {m.get('subject', '?')} "
+                         f"({m.get('date', '?')}): {m.get('summary', '')}"[:120])
+    notes = (data.get("notes") or "").strip()
+    if notes and (not lines or _want("note")):
+        lines.append(f"Notes: {notes[:400]}")
+    if not lines:
+        # nothing matched the query — give the compact whole
+        return _facts_slice(data, "")
+    return "\n".join(lines)
 
 
 @function_tool
-async def consult_jett(question: str) -> str:
-    """Ask the real Jett something only he would know — his live memory,
-    current info, messages, accounts, or real judgment. Use when the caller's
-    question goes beyond your brief. Jett's reply arrives in a minute or two
-    and is spoken to the caller automatically; keep the caller company
-    meanwhile. NEVER invent Jett's answer."""
-    bus = _CURRENT_BUS
-    if bus is None or not bus.active:
-        return "ERROR: no active call bus — tell the caller you can't reach Jett right now."
-    seq = await bus.consult(question)
-    if seq is None:
-        return ("ERROR: failed to send the question to Jett — tell the "
-                "caller honestly that you couldn't reach him.")
-    # background waiter: speak the reply (or a timeout note) when it lands
-    async def _waiter():
-        reply = await bus.wait_reply(seq)
-        if seq in bus.delivered or seq in bus.replies:
-            return  # delivered (or about to be) by bus_loop
-        if bus.session is not None and bus.active:
-            bus.session.say(
-                "I haven't heard back from Jett yet — he's probably tied up. "
-                "I'll make sure he gets your question.",
-                allow_interruptions=True,
-            )
-    asyncio.create_task(_waiter())
-    return (f"Question sent to Jett as consult #{seq}. His reply will arrive "
-            f"in a minute or two and will be spoken automatically. Tell the "
-            f"caller you're checking with Jett and keep them company.")
+async def local_facts(query: str) -> str:
+    """Look up Jett's synced facts snapshot: today's calendar, account
+    balances, upcoming bills, recent inbox items. The snapshot refreshes
+    every few minutes. ALWAYS prefer this over guessing for factual
+    questions. If the snapshot is missing or stale it says so honestly —
+    then use consult_jett instead of guessing."""
+    data, age = load_facts()
+    if data is None:
+        return ("FACTS_UNAVAILABLE: no synced facts snapshot found. Tell the "
+                "caller honestly you don't have Jett's latest facts — offer "
+                "to check with Jett via consult_jett instead of guessing.")
+    if age is None or age > FACTS_STALE_SEC:
+        stale = freshness_str(age) if age else "unknown age"
+        return (f"FACTS_STALE: snapshot is {stale} (stale). Tell the caller "
+                "honestly the facts may be out of date — offer consult_jett "
+                "instead of guessing.")
+    fresh = freshness_str(age)
+    return f"Jett's synced facts (as of {fresh}):\n{_facts_slice(data, query)}"
 
 
 # ------------------------------------------- entrypoint & call flow ---
@@ -648,7 +1057,7 @@ async def _speak_raw(room: rtc.Room, wav_pcm: bytes, sample_rate: int = 24000):
         await room.local_participant.unpublish_track(track.sid)
 
 
-async def _run_no_brain(ctx: JobContext, bus: BusCall):
+async def _run_no_brain(ctx: JobContext):
     """No brain key: connect, play a spoken notice, hang up gracefully."""
     await ctx.connect()
     log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
@@ -659,32 +1068,26 @@ async def _run_no_brain(ctx: JobContext, bus: BusCall):
         "yet. He hasn't given me a key to think with. Try again later.")
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
     await _speak_raw(ctx.room, pcm)
-    await bus.set_status("ended", end_reason="no_brain_key")
     await ctx.room.disconnect()
 
 
-async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
-    global _CURRENT_BUS
-    _CURRENT_BUS = bus
+async def _run_call(ctx: JobContext, brain: Brain):
+    global _CURRENT_CALL_ID
 
-    log.info("call brain: %s models=%s", brain.label, brain.extra_body.get("models", brain.model))
+    log.info("call brain: %s models=%s max_tokens=%s", brain.label,
+             brain.extra_body.get("models", brain.model),
+             brain.extra_body.get("max_tokens", "?"))
     stt_engine = WhisperSTT()
     stt_stream = stt.StreamAdapter(
         stt=stt_engine, vad=silero.VAD.load())
     tts_engine = KokoroTTS()
 
-    agent_llm = openai_plugin.LLM(
-        model=brain.model,
-        api_key=brain.api_key,
-        base_url=brain.base_url,
-        extra_headers=brain.extra_headers if brain.extra_headers else NOT_GIVEN,
-        extra_body=brain.extra_body if brain.extra_body else NOT_GIVEN,
-    )
+    agent_llm = ResilientLLM(brain)
 
     brief = load_brief()
     agent = Agent(
         instructions=SYSTEM_PROMPT.format(brief=brief),
-        tools=[consult_jett],
+        tools=[consult_jett, local_facts],
     )
     session = AgentSession(
         stt=stt_stream,
@@ -693,60 +1096,22 @@ async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
         tts=tts_engine,
         max_tool_steps=10,
     )
-    bus.session = session
 
-    # --- brain resilience: per-turn latency log + graceful rate-limit ---
-    # Free OpenRouter endpoints can be slower/flakier than paid ones.
-    # - "metrics_collected" gives per-turn duration/ttft for visibility.
-    # - "error" fires per failed attempt (the stream's built-in retry loop
-    #   already backs off); on 429s we tell the caller once (debounced)
-    #   instead of leaving silence, and the call never crashes here.
-    _last_limit_notice = 0.0  # monotonic ts of last spoken rate-limit notice
-
-    async def _say_brain_note(text: str) -> None:
-        try:
-            await session.say(text)
-        except Exception as e:
-            log.warning("brain notice speech failed: %s", e)
-
+    # --- brain telemetry: per-turn model/latency via the wrapper's logs,
+    # plus usage metrics forwarded through it. Inner "error" events are
+    # absorbed by the wrapper's retry/backoff/fallback by design.
     def _on_llm_metrics(metrics) -> None:
-        log.info("brain turn: model=%s duration=%.2fs ttft=%.2fs "
+        log.info("brain usage: model=%s duration=%.2fs ttft=%.2fs "
                  "tokens prompt=%d completion=%d",
                  brain.model, metrics.duration, metrics.ttft,
                  metrics.prompt_tokens, metrics.completion_tokens)
 
-    def _on_llm_error(llm_error) -> None:
-        nonlocal _last_limit_notice
-        err = llm_error.error
-        is_limit = _is_rate_limit(err)
-        log.warning("brain error (recoverable=%s rate_limit=%s): %.200s",
-                    llm_error.recoverable, is_limit, err)
-        loop = asyncio.get_running_loop()
-        if is_limit:
-            now = time.monotonic()
-            if now - _last_limit_notice > 30:
-                _last_limit_notice = now
-                loop.create_task(_say_brain_note(
-                    "I'm hitting my rate limits \u2014 give me a few seconds "
-                    "and I'll be right with you."))
-        if not llm_error.recoverable:
-            note = ("I'm having trouble reaching my brain right now \u2014 "
-                    "could you say that once more?"
-                    if is_limit else
-                    "Sorry, I lost my train of thought \u2014 "
-                    "could you repeat that?")
-            loop.create_task(_say_brain_note(note))
-
     agent_llm.on("metrics_collected", _on_llm_metrics)
-    agent_llm.on("error", _on_llm_error)
 
     await ctx.connect()
-    await bus.set_status("active")
     await session.start(agent, room=ctx.room)
     log.info("session started in room %s", ctx.room.name)
 
-    # background tasks
-    bus_task = asyncio.create_task(bus.bus_loop())
     ended = asyncio.Event()
 
     def _on_participant_left(p: rtc.RemoteParticipant):
@@ -758,14 +1123,13 @@ async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
 
     async def _watchdog():
         await asyncio.sleep(MAX_CALL_SEC)
-        if bus.active:
-            log.info("max call duration reached; wrapping up")
-            try:
-                session.say("I have to run — talk soon.")
-            except Exception:
-                pass
-            await asyncio.sleep(8)
-            ended.set()
+        log.info("max call duration reached; wrapping up")
+        try:
+            session.say("I have to run — talk soon.")
+        except Exception:
+            pass
+        await asyncio.sleep(8)
+        ended.set()
 
     wd_task = asyncio.create_task(_watchdog())
 
@@ -775,14 +1139,8 @@ async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
                          f"say hello in one short sentence like: {GREETING}")
         await ended.wait()
     finally:
-        bus.active = False
-        _CURRENT_BUS = None
-        for t in (bus_task, wd_task):
-            t.cancel()
-        try:
-            await bus.set_status("ended", end_reason="call_finished")
-        except Exception as e:
-            log.warning("final meta update failed: %s", e)
+        _CURRENT_CALL_ID = None
+        wd_task.cancel()
         try:
             await session.aclose()
         except Exception:
@@ -790,7 +1148,7 @@ async def _run_call(ctx: JobContext, bus: BusCall, brain: Brain):
 
 
 async def entrypoint(ctx: JobContext):
-    global _ACTIVE_CALL
+    global _ACTIVE_CALL, _CURRENT_CALL_ID
     call_id = ctx.room.name.replace("jett-", "", 1) or uuid.uuid4().hex[:8]
 
     with _CALL_LOCK:
@@ -807,6 +1165,7 @@ async def entrypoint(ctx: JobContext):
             await ctx.room.disconnect()
             return
         _ACTIVE_CALL = call_id
+    _CURRENT_CALL_ID = call_id
 
     try:
         await ctx.connect()  # ensure room handle before reading participants
@@ -818,20 +1177,17 @@ async def entrypoint(ctx: JobContext):
                 break
             await asyncio.sleep(0.5)
         log.info("inbound call %s from %s", call_id, caller)
-        bus = BusCall(call_id, caller)
-        bus_ok = await bus.open()
         brain = resolve_brain()
         if brain is not None:
-            await _run_call(ctx, bus, brain)
+            await _run_call(ctx, brain)
         else:
-            await _run_no_brain(ctx, bus)
-        if not bus_ok:
-            log.warning("bus unavailable; call proceeded without consult")
+            await _run_no_brain(ctx)
     except Exception as e:
         log.exception("call %s failed: %s", call_id, e)
     finally:
         with _CALL_LOCK:
             _ACTIVE_CALL = None
+        _CURRENT_CALL_ID = None
         log.info("call %s done", call_id)
 
 
