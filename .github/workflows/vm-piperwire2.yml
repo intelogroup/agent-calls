@@ -1,0 +1,14 @@
+name: VM get TTS adapter (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== full EspeakTTS class (lines 862-930) ==="
+          sed -n '862,930p' /opt/agent/live_agent.py
+          echo ""
+          echo "=== _tts() factory function ==="
+          grep -n -A 10 "def _tts" /opt/agent/live_agent.py | head -20
