@@ -1,0 +1,152 @@
+name: VM wire Piper TTS (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== backing up live_agent.py ==="
+          sudo cp /opt/agent/live_agent.py /opt/agent/live_agent.py.bak-espeak
+          
+          echo "=== adding PiperTTS adapter ==="
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          import re
+          
+          with open('/opt/agent/live_agent.py', 'r') as f:
+              content = f.read()
+          
+          # PiperTTS adapter class (follows EspeakTTS pattern)
+          piper_class = '''
+          class PiperTTS(tts.TTS):
+              """Piper TTS as a LiveKit TTS (natural voice, 1.5x real-time on CPU)."""
+          
+              PIPER_BIN = "/opt/agent/piper/piper/piper"
+              VOICE_MODEL = "/opt/agent/models/piper/en_US-lessac-medium.onnx"
+              # Alternative: "/opt/agent/models/piper/en_US-ryan-medium.onnx" (male)
+          
+              def __init__(self) -> None:
+                  super().__init__(
+                      capabilities=tts.TTSCapabilities(streaming=False),
+                      sample_rate=22050,
+                      num_channels=1,
+                  )
+                  log.info("Piper TTS ready (lessac-medium)")
+          
+              @property
+              def model(self) -> str:
+                  return "piper-en_US-lessac-medium"
+          
+              @property
+              def provider(self) -> str:
+                  return "piper"
+          
+              def _synth(self, text: str) -> tuple[np.ndarray, int]:
+                  import tempfile, os
+                  # Piper writes to file (no --stdout flag), use temp file
+                  with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
+                      tmp_path = tf.name
+                  try:
+                      result = subprocess.run(
+                          [self.PIPER_BIN, "--model", self.VOICE_MODEL,
+                           "--output_file", tmp_path],
+                          input=text.encode('utf-8'),
+                          capture_output=True, timeout=60)
+                      if result.returncode != 0:
+                          raise RuntimeError(f"piper failed: {result.stderr[:200]}")
+                      with wave.open(tmp_path, 'rb') as w:
+                          n_frames = w.getnframes()
+                          sr = w.getframerate()
+                          n_ch = w.getnchannels()
+                          sampwidth = w.getsampwidth()
+                          data = w.readframes(n_frames)
+                  finally:
+                      try: os.unlink(tmp_path)
+                      except: pass
+                  if sampwidth == 2:
+                      samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                  else:
+                      raise ValueError(f"unexpected sampwidth {sampwidth}")
+                  if n_ch == 2:
+                      samples = samples.reshape(-1, 2).mean(axis=1)
+                  # Piper native 22050 Hz, no resample needed (we advertise 22050)
+                  return samples, sr
+          
+              def synthesize(self, text: str, *, conn_options=DEFAULT_API_CONNECT_OPTIONS
+                             ) -> tts.ChunkedStream:
+                  return _PiperChunkedStream(tts=self, input_text=text,
+                                             conn_options=conn_options)
+          
+          
+          class _PiperChunkedStream(tts.ChunkedStream):
+              async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+                  loop = asyncio.get_running_loop()
+                  output_emitter.initialize(
+                      request_id=uuid.uuid4().hex[:12],
+                      sample_rate=22050,
+                      num_channels=1,
+                      mime_type="audio/pcm",
+                      stream=False,
+                  )
+                  for sent in split_sentences(self._input_text):
+                      try:
+                          samples, _sr = await loop.run_in_executor(
+                              None, self._tts._synth, sent)
+                      except Exception as e:
+                          log_event("tts_error", sentence_len=len(sent),
+                                    error=str(e)[:100])
+                          continue
+                      # Emit as int16 PCM frames
+                      pcm = (samples * 32767).astype(np.int16)
+                      # Chunk into ~20ms frames (441 samples at 22050 Hz)
+                      frame_size = 441
+                      for i in range(0, len(pcm), frame_size):
+                          chunk = pcm[i:i+frame_size]
+                          if len(chunk) < frame_size:
+                              # Pad last chunk
+                              chunk = np.pad(chunk, (0, frame_size - len(chunk)))
+                          frame = rtc.AudioFrame(
+                              data=chunk.tobytes(),
+                              sample_rate=22050,
+                              num_channels=1,
+                              samples_per_channel=frame_size,
+                          )
+                          output_emitter.push(frame)
+                  output_emitter.flush()
+          '''
+          
+          # Insert PiperTTS after EspeakTTS class (before _EspeakChunkedStream)
+          # Find the line "class _EspeakChunkedStream" and insert before it
+          insert_marker = "class _EspeakChunkedStream"
+          if insert_marker in content:
+              content = content.replace(insert_marker, piper_class.strip() + "\n\n\n" + insert_marker, 1)
+              print("Inserted PiperTTS class", flush=True)
+          else:
+              print("ERROR: could not find insert marker", flush=True)
+              exit(1)
+          
+          # Update _tts() factory to return PiperTTS instead of EspeakTTS
+          # Find the _tts function and replace the return
+          old_tts = re.search(r'def _tts\(\).*?return \w+\(\)', content, re.DOTALL)
+          if old_tts:
+              print(f"Found _tts: {old_tts.group(0)[:80]}...", flush=True)
+          # Simpler: replace "return EspeakTTS()" with "return PiperTTS()"
+          # But keep EspeakTTS as fallback comment
+          content = content.replace("return EspeakTTS()", "return PiperTTS()  # Piper (was EspeakTTS)")
+          
+          with open('/opt/agent/live_agent.py', 'w') as f:
+              f.write(content)
+          
+          print("Patched live_agent.py", flush=True)
+          PYEOF
+          
+          echo ""
+          echo "=== syntax check ==="
+          sudo /opt/agent/venv/bin/python -m py_compile /opt/agent/live_agent.py && echo "syntax OK"
+          
+          echo ""
+          echo "=== restarting jett-proxy ==="
+          sudo systemctl restart jett-proxy
+          sleep 3
+          sudo systemctl is-active jett-proxy
