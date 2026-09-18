@@ -21,7 +21,7 @@ on:
 
 jobs:
   call:
-    runs-on: ubuntu-latest  # TEMP A/B test 2026-09-18: was [self-hosted, oracle]
+    runs-on: ubuntu-latest  # audio-call path: GitHub runner has the reliable media path (2026-09-18)
     timeout-minutes: 15
     env:
       DEBUG_CALL: '1'
