@@ -149,7 +149,7 @@ if [ ! -x $AGENT_DIR/venv/bin/python ]; then
 fi
 $AGENT_DIR/venv/bin/pip -q install --upgrade pip
 $AGENT_DIR/venv/bin/pip -q install \
-    livekit-agents livekit-api \
+    livekit-agents livekit-api livekit-plugins-openai livekit-plugins-silero \
     faster-whisper onnxruntime \
     kokoro-onnx \
     soundfile numpy huggingface_hub
