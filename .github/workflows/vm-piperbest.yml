@@ -1,0 +1,29 @@
+name: VM piper best voice test (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          PIPER_BIN=/opt/agent/piper/piper/piper
+          cd /opt/agent/models/piper
+          echo "=== downloading HIGH quality voices ==="
+          for spec in "lessac:high" "ryan:high"; do
+            voice="${spec%%:*}"; qual="${spec##*:}"
+            v="en_US-${voice}-${qual}"
+            base="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${voice}/${qual}/${v}"
+            echo "Fetching ${v} ..."
+            curl -sSL --fail --retry 3 -o "${v}.onnx" "${base}.onnx" &
+            curl -sSL --fail --retry 3 -o "${v}.onnx.json" "${base}.onnx.json" &
+          done
+          wait
+          ls -lh *high.onnx
+          echo ""
+          echo "=== speed test: HIGH vs MEDIUM ==="
+          TEST_TEXT="Hello Jim, this is Jett's assistant. I'm testing the high quality voice to see if it still runs in real time on this small virtual machine."
+          for v in "en_US-lessac-high" "en_US-ryan-high" "en_US-lessac-medium"; do
+            echo "--- $v ---"
+            time echo "$TEST_TEXT" | $PIPER_BIN --model /opt/agent/models/piper/${v}.onnx --output_file /tmp/piper-${v}.wav 2>&1 | grep -E "Real-time factor|Loaded voice"
+          done
