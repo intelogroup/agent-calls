@@ -1,0 +1,11 @@
+name: VM TTS read (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  read:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 2
+    steps:
+      - run: |
+          # Read the KokoroTTS class and how it's instantiated
+          sed -n '770,860p' /opt/agent/live_agent.py
