@@ -1,0 +1,49 @@
+name: VM Kokoro WAV (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  wav:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          python3 << 'PYEOF'
+          import os, sys
+          # Import the proxy's KokoroTTS
+          sys.path.insert(0, '/opt/agent')
+          # Find the TTS class and model path
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("live_agent", "/opt/agent/live_agent.py")
+          # Don't execute the whole module, just get the Kokoro part
+          # Instead, directly use kokoro-onnx
+          try:
+            from kokoro_onnx import Kokoro
+            model = "/opt/agent/models/kokoro-v1.0.int8.onnx"
+            voices = "/opt/agent/models/voices-v1.0.bin"
+            if os.path.exists(model):
+              print(f"model exists: {model}")
+              k = Kokoro(model, voices)
+              print("Kokoro loaded")
+              # Generate greeting
+              import wave, struct
+              samples, sr = k.create("Hey, it's Jett's line. How can I help?", voice="af_heart", speed=1.0)
+              print(f"generated {len(samples)} samples at {sr}Hz")
+              # Check energy (RMS)
+              import math
+              # samples is numpy array or list
+              try:
+                import numpy as np
+                arr = np.array(samples, dtype=float)
+                rms = math.sqrt(sum(arr*arr) / len(arr)) if len(arr) > 0 else 0
+                print(f"RMS energy: {rms:.1f} (speech ~500-5000, silence ~0-10)")
+                print(f"max amplitude: {max(abs(arr)):.1f}")
+              except Exception as e:
+                print(f"numpy check failed: {e}")
+            else:
+              print(f"model NOT found: {model}")
+              print("checking /opt/agent/models/:")
+              os.system("ls -la /opt/agent/models/ 2>&1 | head -10")
+          except Exception as e:
+            print(f"ERROR: {e}")
+            import traceback; traceback.print_exc()
+          PYEOF
