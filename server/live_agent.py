@@ -1161,7 +1161,7 @@ async def _run_no_brain(ctx: JobContext):
     await ctx.connect()
     log_event("no_brain_notice")
     log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
-    tts_engine = KokoroTTS()
+    tts_engine = _tts()
     samples, _ = await asyncio.get_running_loop().run_in_executor(
         None, tts_engine._synth,
         "Hey — this is Jett's voice line, but his brain isn't connected "
@@ -1171,16 +1171,69 @@ async def _run_no_brain(ctx: JobContext):
     await ctx.room.disconnect()
 
 
+# ---------------------------------------------------------------------------
+# Warm model singletons.
+#
+# Whisper, Kokoro and Silero each take tens of seconds to load on this
+# 1-OCPU box. Constructing them per call pushed the SIP 200 OK past 60s and
+# callers hung up before the agent answered (inviteToAcceptMs=75s observed).
+# They are loaded ONCE at worker boot via warm_models() and shared by every
+# call. Calls are strictly sequential (entrypoint rejects a second
+# concurrent call), so sharing is safe.
+# ---------------------------------------------------------------------------
+_STT_ENGINE = None
+_TTS_ENGINE = None
+_VAD = None
+
+
+def warm_models() -> None:
+    """Load STT/TTS/VAD once at worker startup. Any failure is logged and the
+    per-call path falls back to lazy construction."""
+    global _STT_ENGINE, _TTS_ENGINE, _VAD
+    t0 = time.monotonic()
+    try:
+        log.info("warming faster-whisper …")
+        _STT_ENGINE = WhisperSTT()
+    except Exception:
+        log.exception("whisper warm failed; per-call fallback")
+    try:
+        log.info("warming silero VAD …")
+        _VAD = silero.VAD.load()
+    except Exception:
+        log.exception("VAD warm failed; per-call fallback")
+    try:
+        log.info("warming kokoro TTS …")
+        _TTS_ENGINE = KokoroTTS()
+    except Exception:
+        log.exception("kokoro warm failed; per-call fallback")
+    log.info("model warm done in %.1fs (stt=%s vad=%s tts=%s)",
+             time.monotonic() - t0,
+             _STT_ENGINE is not None, _VAD is not None,
+             _TTS_ENGINE is not None)
+
+
+def _stt():
+    return _STT_ENGINE if _STT_ENGINE is not None else WhisperSTT()
+
+
+def _tts():
+    return _TTS_ENGINE if _TTS_ENGINE is not None else KokoroTTS()
+
+
+def _vad():
+    return _VAD if _VAD is not None else silero.VAD.load()
+
+
 async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
     global _CURRENT_CALL_ID
 
     log.info("call brain: %s models=%s max_tokens=%s", brain.label,
              brain.extra_body.get("models", brain.model),
              brain.extra_body.get("max_tokens", "?"))
-    stt_engine = WhisperSTT()
+    stt_engine = _stt()
     stt_stream = stt.StreamAdapter(
-        stt=stt_engine, vad=silero.VAD.load())
-    tts_engine = KokoroTTS()
+        stt=stt_engine, vad=_vad())
+    tts_engine = _tts()
 
     agent_llm = ResilientLLM(brain)
 
@@ -1191,7 +1244,7 @@ async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
     )
     session = AgentSession(
         stt=stt_stream,
-        vad=silero.VAD.load(),
+        vad=_vad(),
         llm=agent_llm,
         tts=tts_engine,
         max_tool_steps=10,
@@ -1235,9 +1288,10 @@ async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
     wd_task = asyncio.create_task(_watchdog())
 
     try:
-        await session.generate_reply(
-            instructions="Greet the caller briefly as Jett's voice proxy: "
-                         f"say hello in one short sentence like: {GREETING}")
+        # Canned greeting through warm TTS — no LLM round-trip. The 200 OK
+        # and first audio must go out in seconds; the brain engages on the
+        # caller's first utterance.
+        await session.say(GREETING)
         await ended.wait()
     finally:
         _CURRENT_CALL_ID = None
@@ -1257,7 +1311,7 @@ async def entrypoint(ctx: JobContext):
             log_event("call_rejected_busy", room=ctx.room.name)
             log.info("busy; rejecting second call %s", ctx.room.name)
             await ctx.connect()
-            engine = KokoroTTS()
+            engine = _tts()
             samples, _ = await asyncio.get_running_loop().run_in_executor(
                 None, engine._synth,
                 "Jett's line is on another call right now. Try again in a bit.")
@@ -1315,6 +1369,7 @@ if __name__ == "__main__":
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
               bus_dir=BUS_DIR,
               bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
+    warm_models()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,
