@@ -1,0 +1,11 @@
+name: VM Kokoro test (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  kokoro:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          # Find how the proxy uses Kokoro and test it directly
+          grep -a -n "kokoro\|Kokoro\|TTS\|tts" /opt/agent/live_agent.py | head -12
