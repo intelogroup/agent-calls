@@ -21,7 +21,7 @@ on:
 
 jobs:
   call:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, oracle]
     timeout-minutes: 15
     env:
       DEBUG_CALL: '1'
@@ -46,6 +46,10 @@ jobs:
       - name: Install SIP client and audio tools
         run: |
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
+          if [ -f /opt/actions-runner/.warm ]; then
+            echo "warm runner: packages pre-installed, skipping apt"
+            command -v baresip && command -v espeak-ng && command -v ffmpeg && echo "tools OK"
+          else
           export DEBIAN_FRONTEND=noninteractive
           for i in 1 2 3; do
             sudo -E apt-get update -qq && break || { echo "apt update retry $i"; sleep 15; }
@@ -53,12 +57,16 @@ jobs:
           sudo -E apt-get install -y -qq baresip espeak-ng ffmpeg || \
             sudo -E apt-get install -y baresip espeak-ng ffmpeg
           command -v baresip && echo "baresip installed"
+          fi
 
       - name: Synthesize voice message (Kokoro TTS)
         run: |
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           MSG="$(cat /tmp/message.txt)"
-          if python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "$MSG"; then
+          if [ -f /opt/actions-runner/.warm ]; then
+            echo "warm runner: espeak-ng only (Kokoro skipped on 1GB box)"
+            espeak-ng -v en-us -s 165 -w message.wav "$MSG"
+          elif python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "$MSG"; then
             echo "TTS engine: kokoro"
           else
             echo "Kokoro unavailable, falling back to espeak-ng"
