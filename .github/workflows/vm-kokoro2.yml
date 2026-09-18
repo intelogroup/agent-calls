@@ -1,0 +1,25 @@
+name: VM Kokoro venv (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  kokoro:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import os, math
+          from kokoro_onnx import Kokoro
+          model = "/opt/agent/models/kokoro-v1.0.int8.onnx"
+          voices = "/opt/agent/models/voices-v1.0.bin"
+          print(f"model exists: {os.path.exists(model)}")
+          k = Kokoro(model, voices)
+          print("Kokoro loaded OK")
+          samples, sr = k.create("Hey, it's Jett's line. How can I help?", voice="af_heart", speed=1.0)
+          print(f"generated {len(samples)} samples at {sr}Hz")
+          import numpy as np
+          arr = np.array(samples, dtype=float)
+          rms = math.sqrt((arr*arr).mean()) if len(arr) > 0 else 0
+          print(f"RMS energy: {rms:.1f} (speech ~500-5000, silence ~0-10)")
+          print(f"max amplitude: {abs(arr).max():.1f}")
+          PYEOF
