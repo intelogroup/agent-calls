@@ -1,0 +1,23 @@
+name: VM diagnose latency (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== CPU/Memory during call ==="
+          top -bn1 | head -15
+          echo ""
+          echo "=== Python process CPU ==="
+          ps -o pid,%cpu,%mem,cmd -p $(pgrep -f live_agent.py | head -1) 2>/dev/null
+          echo ""
+          echo "=== VAD delay stats (last 10 min) ==="
+          sudo journalctl -u jett-proxy --since "10 minutes ago" 2>&1 | grep -o '"delay": [0-9.]*' | awk -F': ' '{sum+=$2; n++; if($2>max) max=$2} END {printf "count=%d avg=%.2fs max=%.2fs\n", n, sum/n, max}'
+          echo ""
+          echo "=== Event loop blocks (last 10 min) ==="
+          sudo journalctl -u jett-proxy --since "10 minutes ago" 2>&1 | grep -o 'blocked for [0-9]*ms' | awk '{gsub(/ms/,"",$3); sum+=$3; n++; if($3>max) max=$3} END {printf "count=%d avg=%.0fms max=%.0fms\n", n, sum/n, max}'
+          echo ""
+          echo "=== STT model info ==="
+          grep -i "whisper\|stt" /opt/agent/live_agent.py | grep -i "model\|tiny\|base" | head -5
