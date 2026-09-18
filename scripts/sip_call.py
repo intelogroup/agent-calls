@@ -337,27 +337,37 @@ def rtp_sender():
     payload = pcm_to_ulaw(frames)
     seq, ts, ssrc = random.randint(0, 65535), random.randint(0, 2**32 - 1), random.randint(0, 2**32 - 1)
     n = 0
-    for off in range(0, len(payload), 160):
-        chunk = payload[off:off + 160]
-        if len(chunk) < 160:
-            chunk += b"\xff" * (160 - len(chunk))  # ulaw silence pad
-        hdr = struct.pack(">BBHII", 0x80, 0x00, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
-        try:
-            rtp_sock.sendto(hdr + chunk, (rtp_ip, rtp_port_peer))
-        except OSError as e:
-            print("RTP_SEND_ERROR", e, flush=True)
-            return
-        seq += 1
-        ts += 160
-        n += 1
-        time.sleep(0.02)
+    # Play twice: a push-woken phone often misses the first second while its
+    # audio session comes up.
+    for repeat in range(2):
+        for off in range(0, len(payload), 160):
+            chunk = payload[off:off + 160]
+            if len(chunk) < 160:
+                chunk += b"\xff" * (160 - len(chunk))  # ulaw silence pad
+            hdr = struct.pack(">BBHII", 0x80, 0x00, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
+            try:
+                rtp_sock.sendto(hdr + chunk, (rtp_ip, rtp_port_peer))
+            except OSError as e:
+                print("RTP_SEND_ERROR", e, flush=True)
+                return
+            seq += 1
+            ts += 160
+            n += 1
+            time.sleep(0.02)
+        if repeat == 0:
+            print("RTP_REPEAT", flush=True)
+            time.sleep(0.5)  # gap between plays
     print(f"RTP_DONE packets={n}", flush=True)
 
 
 if rtp_ip and rtp_port_peer:
+    # Give a push-woken callee a moment to bring its audio path up before
+    # the message starts.
+    print("waiting 2s for callee audio to settle...", flush=True)
+    time.sleep(2)
     t = threading.Thread(target=rtp_sender, daemon=True)
     t.start()
-    t.join(timeout=30)
+    t.join(timeout=60)
     time.sleep(2)  # let tail audio play out
 else:
     print("NO_RTP_TARGET", flush=True)
