@@ -1,0 +1,38 @@
+name: VM piper mem fixed (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import time, wave, io
+          from piper import PiperVoice
+          VOICE = "/opt/agent/models/piper/en_US-lessac-medium.onnx"
+          print("Loading voice into memory...", flush=True)
+          t0 = time.time()
+          voice = PiperVoice.load(VOICE)
+          print(f"Voice load (one-time): {time.time()-t0:.2f}s", flush=True)
+          print(f"Sample rate: {voice.config.sample_rate}", flush=True)
+          sentences = [
+              "Hello Jim, this is Jett's assistant.",
+              "I'm testing Piper with the voice kept in memory.",
+              "Third sentence for streaming verification."
+          ]
+          print(f"\nSynthesizing {len(sentences)} sentences:", flush=True)
+          for i, sent in enumerate(sentences):
+              t0 = time.time()
+              outp = f"/tmp/piper-mem-{i}.wav"
+              with wave.open(outp, "wb") as wf:
+                  wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(voice.config.sample_rate)
+                  voice.synthesize(sent, wf)
+              gen = time.time() - t0
+              with wave.open(outp, "rb") as w:
+                  frames = w.getnframes(); sr = w.getframerate()
+                  dur = frames / sr if sr else 0
+              print(f"  Sentence {i+1}: gen={gen:.2f}s, audio={dur:.2f}s frames={frames}", flush=True)
+              if i == 0:
+                  print(f"  >>> TIME-TO-FIRST-AUDIO: {gen:.2f}s <<<", flush=True)
+          PYEOF
