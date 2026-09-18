@@ -1,0 +1,11 @@
+name: VM find TTS global (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== where _TTS_ENGINE is set ==="
+          grep -n "_TTS_ENGINE" /opt/agent/live_agent.py | head -10
