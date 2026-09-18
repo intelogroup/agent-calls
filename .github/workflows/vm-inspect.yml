@@ -1,0 +1,17 @@
+name: VM inspect agent (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== AgentSession construction ==="
+          grep -n -A 30 "AgentSession(" /opt/agent/live_agent.py | head -60
+          echo ""
+          echo "=== room/input config ==="
+          grep -n -iE "room|input|subscribe|track" /opt/agent/live_agent.py | head -40
+          echo ""
+          echo "=== VAD/STT setup ==="
+          grep -n -iE "vad|stt|whisper|silero" /opt/agent/live_agent.py | head -40
