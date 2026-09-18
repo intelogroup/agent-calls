@@ -1,0 +1,18 @@
+name: VM SIP logs (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  logs:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Check for SIP traffic
+        run: |
+          echo "=== any 'invite' (last 20 min) ==="
+          sudo journalctl -u livekit-sip --since "20 minutes ago" -o cat 2>&1 | grep -ci "invite" || true
+          echo "=== INVITE context lines ==="
+          sudo journalctl -u livekit-sip --since "20 minutes ago" -o cat 2>&1 | grep -i "invite" | tail -10
+          echo "=== non-OPTIONS SIP requests ==="
+          sudo journalctl -u livekit-sip --since "20 minutes ago" -o cat 2>&1 | grep -iE "from.*sip:|to:.*jett" | grep -viE "options" | tail -10
+          echo "=== dispatch rule detail ==="
+          redis-cli hgetall sip_dispatch_rule 2>/dev/null | head -20 || redis-cli get sip_dispatch_rule 2>/dev/null | head -5
