@@ -1,0 +1,98 @@
+name: VM fix Piper emission (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== fixing _PiperChunkedStream._run (raw bytes, not AudioFrame) ==="
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          with open('/opt/agent/live_agent.py', 'r') as f:
+              c = f.read()
+          
+          # Find and replace the buggy _PiperChunkedStream._run method
+          # The bug: used rtc.AudioFrame instead of raw bytes
+          old_run = '''          class _PiperChunkedStream(tts.ChunkedStream):
+              async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+                  loop = asyncio.get_running_loop()
+                  output_emitter.initialize(
+                      request_id=uuid.uuid4().hex[:12],
+                      sample_rate=22050,
+                      num_channels=1,
+                      mime_type="audio/pcm",
+                      stream=False,
+                  )
+                  for sent in split_sentences(self._input_text):
+                      try:
+                          samples, _sr = await loop.run_in_executor(
+                              None, self._tts._synth, sent)
+                      except Exception as e:
+                          log_event("tts_error", sentence_len=len(sent),
+                                    error=str(e)[:100])
+                          continue
+                      # Emit as int16 PCM frames
+                      pcm = (samples * 32767).astype(np.int16)
+                      # Chunk into ~20ms frames (441 samples at 22050 Hz)
+                      frame_size = 441
+                      for i in range(0, len(pcm), frame_size):
+                          chunk = pcm[i:i+frame_size]
+                          if len(chunk) < frame_size:
+                              # Pad last chunk
+                              chunk = np.pad(chunk, (0, frame_size - len(chunk)))
+                          frame = rtc.AudioFrame(
+                              data=chunk.tobytes(),
+                              sample_rate=22050,
+                              num_channels=1,
+                              samples_per_channel=frame_size,
+                          )
+                          output_emitter.push(frame)
+                  output_emitter.flush()'''
+          
+          new_run = '''          class _PiperChunkedStream(tts.ChunkedStream):
+              async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+                  loop = asyncio.get_running_loop()
+                  output_emitter.initialize(
+                      request_id=uuid.uuid4().hex[:12],
+                      sample_rate=22050,
+                      num_channels=1,
+                      mime_type="audio/pcm",
+                      stream=False,
+                  )
+                  for sent in split_sentences(self._input_text):
+                      try:
+                          samples, _sr = await loop.run_in_executor(
+                              None, self._tts._synth, sent)
+                      except Exception as e:
+                          log_event("tts_error", sentence_len=len(sent),
+                                    error=str(e)[:150])
+                          continue
+                      if samples is None or len(samples) == 0:
+                          log_event("tts_empty_synth", sentence_len=len(sent))
+                          continue
+                      pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(
+                          np.int16).tobytes()
+                      frame_bytes = 22050 * 2 // 50
+                      for i in range(0, len(pcm), frame_bytes):
+                          output_emitter.push(pcm[i:i + frame_bytes])
+                  output_emitter.flush()'''
+          
+          if old_run in c:
+              c = c.replace(old_run, new_run)
+              print("Fixed _PiperChunkedStream._run", flush=True)
+          else:
+              print("ERROR: old _run not found - checking pattern", flush=True)
+              # Debug: show what we have
+              import re
+              m = re.search(r'class _PiperChunkedStream.*?output_emitter\.flush\(\)', c, re.DOTALL)
+              if m:
+                  print(f"Found {len(m.group(0))} chars", flush=True)
+              exit(1)
+          
+          with open('/opt/agent/live_agent.py', 'w') as f:
+              f.write(c)
+          print("Patched", flush=True)
+          PYEOF
+          echo ""
+          sudo /opt/agent/venv/bin/python -m py_compile /opt/agent/live_agent.py && echo "syntax OK"
