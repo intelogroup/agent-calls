@@ -1,0 +1,25 @@
+name: VM cleanup disk space (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== disk usage before ==="
+          df -h / | tail -1
+          echo ""
+          echo "=== largest in /opt/agent ==="
+          sudo du -sh /opt/agent/* 2>/dev/null | sort -hr | head -10
+          echo ""
+          echo "=== deleting unusable HIGH quality Piper voices (225MB) ==="
+          sudo rm -f /opt/agent/models/piper/en_US-lessac-high.onnx /opt/agent/models/piper/en_US-lessac-high.onnx.json
+          sudo rm -f /opt/agent/models/piper/en_US-ryan-high.onnx /opt/agent/models/piper/en_US-ryan-high.onnx.json
+          echo "deleted high-quality voices"
+          echo ""
+          echo "=== removing espeak-ng ==="
+          sudo apt-get remove -y espeak-ng espeak-ng-data 2>&1 | tail -3
+          echo ""
+          echo "=== disk usage after ==="
+          df -h / | tail -1
