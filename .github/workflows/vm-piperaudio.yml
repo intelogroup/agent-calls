@@ -1,0 +1,33 @@
+name: VM verify Piper audio (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== generating Piper audio ==="
+          echo "Hello Jim, this is a Piper audio test. Checking for real sound energy." | /opt/agent/piper/piper/piper --model /opt/agent/models/piper/en_US-lessac-medium.onnx --output_file /tmp/piper-verify.wav 2>&1 | grep -E "Real-time"
+          echo ""
+          echo "=== analyzing WAV for real audio (not silence) ==="
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import wave, numpy as np, sys
+          with wave.open('/tmp/piper-verify.wav', 'rb') as w:
+              n = w.getnframes()
+              sr = w.getframerate()
+              data = w.readframes(n)
+              samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+          rms = np.sqrt(np.mean(samples**2))
+          peak = np.max(np.abs(samples))
+          dur = n / sr
+          print(f"Duration: {dur:.2f}s, RMS: {rms:.4f}, Peak: {peak:.4f}", flush=True)
+          # Silence threshold: RMS < 0.001 is essentially silent
+          if rms < 0.001:
+              print("FAIL: Audio is silent (RMS < 0.001)", flush=True)
+              sys.exit(1)
+          elif rms < 0.01:
+              print("WARNING: Audio very quiet but present", flush=True)
+          else:
+              print("PASS: Real audio energy detected", flush=True)
+          PYEOF
