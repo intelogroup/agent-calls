@@ -1,0 +1,20 @@
+name: VM capture Jim INVITE (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  capture:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 12
+    steps:
+      - name: Wait for Jim's call and capture it
+        run: |
+          echo "Waiting up to 9 min for packets from Jim's carrier range..."
+          sudo timeout 540 tcpdump -i any -n -s 1500 -w /tmp/jim3.pcap -c 12 "udp port 5060 and src net 172.56.0.0/16" 2>&1 | tail -3
+          echo "=== captured ==="
+          tcpdump -r /tmp/jim3.pcap -n 2>/dev/null | head -14
+          echo "=== first INVITE full text ==="
+          tcpdump -r /tmp/jim3.pcap -n -A 2>/dev/null | sed -n '1,60p'
+          echo "=== iptables udp/5060 counter ==="
+          sudo iptables -L INPUT -n -v 2>/dev/null | grep "udp dpt:5060"
+          echo "=== conntrack entries for Jim ==="
+          sudo conntrack -L 2>/dev/null | grep -E "172.56.*5060" | head -5 || echo "no conntrack tool/entries"
