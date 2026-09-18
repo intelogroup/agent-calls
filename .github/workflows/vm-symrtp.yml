@@ -1,0 +1,22 @@
+name: VM symmetric RTP (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  fix:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - name: Enable symmetric_rtp and restart livekit-sip
+        run: |
+          set -e
+          # add symmetric_rtp: true to sip.yaml if not present
+          if ! sudo grep -q "symmetric_rtp" /opt/agent/sip.yaml; then
+            echo "symmetric_rtp: true" | sudo tee -a /opt/agent/sip.yaml > /dev/null
+          fi
+          sudo grep "symmetric_rtp" /opt/agent/sip.yaml
+          # restart livekit-sip only (fast, ~seconds)
+          sudo systemctl restart livekit-sip
+          sleep 8
+          sudo systemctl is-active livekit-sip
+          # confirm the service picked up the flag (debug log line on boot)
+          sudo journalctl -u livekit-sip --since "1 min ago" 2>/dev/null | grep -ai "symmetric" | head -3 || echo "(no explicit log line, service is up)"
