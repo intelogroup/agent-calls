@@ -1,0 +1,37 @@
+name: VM switch warmup to Piper (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "=== switching warmup to PiperTTS ==="
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          with open('/opt/agent/live_agent.py', 'r') as f:
+              content = f.read()
+          old = "_TTS_ENGINE = EspeakTTS()"
+          new = "_TTS_ENGINE = PiperTTS()"
+          if old in content:
+              content = content.replace(old, new)
+              print("Switched warmup to PiperTTS", flush=True)
+          else:
+              print("ERROR: warmup pattern not found", flush=True)
+              exit(1)
+          # Also update the log message from "warming espeak-ng" to "warming piper"
+          content = content.replace("warming espeak-ng TTS", "warming Piper TTS")
+          with open('/opt/agent/live_agent.py', 'w') as f:
+              f.write(content)
+          PYEOF
+          echo ""
+          echo "=== syntax check ==="
+          sudo /opt/agent/venv/bin/python -m py_compile /opt/agent/live_agent.py && echo "syntax OK"
+          echo ""
+          echo "=== restarting jett-proxy ==="
+          sudo systemctl restart jett-proxy
+          sleep 8
+          sudo systemctl is-active jett-proxy
+          echo ""
+          echo "=== checking for Piper in logs ==="
+          sudo journalctl -u jett-proxy --since "30 seconds ago" 2>&1 | grep -i "piper" | head -3
