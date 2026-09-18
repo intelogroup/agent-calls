@@ -31,7 +31,8 @@ if [ -n "${OPENROUTER_API_KEY:-}" ]; then
   [ "$CODE" = "200" ] || echo "WARNING: OpenRouter key check returned HTTP $CODE"
 
   # (c) one cheap test completion (a few tokens) to prove the model serves
-  MODEL="${JETT_BRAIN_MODEL:-openrouter/free}"
+  CHAIN="${JETT_BRAIN_MODELS:-${JETT_BRAIN_MODEL:-openrouter/free}}"
+  MODEL="${CHAIN%%,*}"
   echo "test completion with model: $MODEL"
   T0=$(date +%s.%N)
   RESP=$(curl -sS --max-time 90 \
