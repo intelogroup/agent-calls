@@ -1,0 +1,14 @@
+name: VM packet capture (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  capture:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Capture SIP ports for 150s
+        run: |
+          which tcpdump >/dev/null 2>&1 || sudo apt-get install -y -q tcpdump >/dev/null 2>&1
+          echo "CAPTURE START $(date -u +%H:%M:%S)"
+          sudo timeout 150 tcpdump -i any -n -l -s 300 "port 5060 or port 5061" 2>&1 | head -60
+          echo "CAPTURE END $(date -u +%H:%M:%S)"
