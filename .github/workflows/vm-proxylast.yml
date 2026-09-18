@@ -1,0 +1,10 @@
+name: VM proxy last call (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  logs:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 2
+    steps:
+      - run: |
+          sudo journalctl -u jett-proxy --since "20 min ago" 2>/dev/null | grep -a -E "call_start|call_end|greeting|say|GREETING|tts|kokoro|turn|error|Error" | head -25 | cut -c1-220
