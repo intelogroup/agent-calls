@@ -9,7 +9,8 @@ name: Deploy voice agent to Oracle VM
 #   SIP_USER      Linphone username the agent registers as
 #   SIP_PASSWORD  Linphone password for that account
 #
-# Trigger: Actions tab -> "Deploy voice agent to Oracle VM" -> Run workflow.
+# Trigger: Actions tab -> "Deploy voice agent to Oracle VM" -> Run workflow,
+# or push to main touching server/** or this file.
 
 on:
   workflow_dispatch:
@@ -19,13 +20,22 @@ on:
       - '.github/workflows/deploy-vm.yml'
       - 'server/**'
 
+env:
+  VM_HOST: 129.159.189.244
+  VM_USER: ubuntu
+  # Keepalive so a quiet long-running step (e.g. model downloads) can't hang
+  # silently forever; ConnectTimeout fails fast instead of stalling.
+  SSH_OPTS: -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - name: Check required secrets
+        timeout-minutes: 2
         run: |
           [ -n "${{ secrets.VM_SSH_KEY }}" ] || { echo "missing secret VM_SSH_KEY"; exit 1; }
           [ -n "${{ secrets.SIP_USER }}" ] || { echo "missing secret SIP_USER"; exit 1; }
@@ -33,29 +43,36 @@ jobs:
           echo "secrets OK"
 
       - name: Set up SSH
+        timeout-minutes: 3
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/vm_key
           chmod 600 ~/.ssh/vm_key
-          ssh-keyscan -H 129.159.189.244 >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" 'echo "ssh OK: $(hostname) $(date -u)"'
 
       - name: Copy server files to VM
+        timeout-minutes: 5
         run: |
-          tar czf - server | ssh -i ~/.ssh/vm_key -o StrictHostKeyChecking=yes \
-            ubuntu@129.159.189.244 \
+          tar czf - server | ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
             'sudo mkdir -p /opt/agent && sudo tar xzf - -C /opt/agent --strip-components=1 && sudo chown -R root:root /opt/agent'
           echo "files copied"
 
       - name: Provision VM (setup.sh)
+        timeout-minutes: 40
         run: |
-          ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 'sudo bash /opt/agent/setup.sh'
+          echo "starting setup.sh on $VM_HOST at $(date -u)"
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
+            'stdbuf -oL -eL sudo bash /opt/agent/setup.sh'
+          echo "setup.sh finished at $(date -u)"
 
       - name: Write agent.env from secrets
+        timeout-minutes: 3
         env:
           SIP_USER: ${{ secrets.SIP_USER }}
           SIP_PASSWORD: ${{ secrets.SIP_PASSWORD }}
         run: |
-          python3 - <<'PYEOF' | ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 \
+          python3 - <<'PYEOF' | ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
             'sudo tee /opt/agent/agent.env > /dev/null && sudo chmod 600 /opt/agent/agent.env && sudo chown agent:agent /opt/agent/agent.env'
           import os
           vals = {
@@ -80,9 +97,10 @@ jobs:
           echo "agent.env written"
 
       - name: Restart service and show status
+        timeout-minutes: 5
         run: |
-          ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 \
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
             'sudo systemctl restart agent.service || sudo systemctl start agent.service'
           sleep 25
-          ssh -i ~/.ssh/vm_key ubuntu@129.159.189.244 \
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
             'sudo systemctl is-active agent.service; echo "--- recent logs ---"; sudo journalctl -u agent.service --no-pager -n 40'
