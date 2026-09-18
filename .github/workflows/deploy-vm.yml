@@ -111,13 +111,6 @@ jobs:
           PYEOF
           echo "agent.env written (OPENROUTER_API_KEY $([ -n "$OPENROUTER_API_KEY" ] && echo present || echo MISSING), META_API_KEY $([ -n "$META_API_KEY" ] && echo present || echo MISSING))"
 
-      - name: Create SIP trunk + dispatch rule
-        timeout-minutes: 5
-        run: |
-          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'stdbuf -oL -eL sudo -u agent /opt/agent/venv/bin/python /opt/agent/setup-sip.py'
-          echo "sip routing configured"
-
       - name: Restart services and show status
         timeout-minutes: 5
         run: |
@@ -126,6 +119,14 @@ jobs:
           sleep 20
           ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
             'for s in redis-server livekit-server livekit-sip jett-proxy; do printf "%-14s %s\n" "$s" "$(sudo systemctl is-active $s)"; done; echo "--- jett-proxy logs ---"; sudo journalctl -u jett-proxy.service --no-pager -n 30'
+
+      - name: Create SIP trunk + dispatch rule
+        timeout-minutes: 5
+        run: |
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
+            'stdbuf -oL -eL sudo -u agent /opt/agent/venv/bin/python /opt/agent/setup-sip.py'
+          # NB: runs AFTER the restart above — setup-sip.py needs livekit-server on :7880.
+          echo "sip routing configured"
 
       - name: Verify brain wiring + OpenRouter reachability
         timeout-minutes: 5
