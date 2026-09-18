@@ -1,0 +1,16 @@
+name: VM SIP check (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - name: Recent livekit-sip activity
+        run: |
+          echo "=== livekit-sip last 4 min ==="
+          sudo journalctl -u livekit-sip --since "4 minutes ago" --no-pager -o short 2>/dev/null | grep -a -viE "health|ping" | tail -25
+          echo "=== TCP 5060 connections ==="
+          ss -tnp 2>/dev/null | grep -E ":5060" | head -5
+          echo "=== jett-proxy last 4 min ==="
+          sudo journalctl -u jett-proxy --since "4 minutes ago" --no-pager -o short 2>/dev/null | tail -12
