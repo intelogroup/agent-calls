@@ -1,0 +1,54 @@
+name: VM piper warmed streaming (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          PIPER_BIN=/opt/agent/piper/piper/piper
+          VOICE=/opt/agent/models/piper/en_US-lessac-medium.onnx
+          echo "=== PIPER WARMED + STREAMING: sentence-by-sentence ==="
+          echo "Voice: lessac-medium (female)"
+          echo ""
+          
+          # 3-sentence test, each via separate piper invocation (voice reloads each time)
+          # This simulates streaming where we generate per-sentence
+          SENTENCES=(
+            "Hello Jim, this is Jett's assistant."
+            "I'm testing Piper in warmed streaming mode to measure the latency."
+            "This is the third sentence to check for gaps between audio chunks."
+          )
+          
+          echo "Streaming ${#SENTENCES[@]} sentences:"
+          TOTAL_AUDIO=0
+          for i in "${!SENTENCES[@]}"; do
+            SENT="${SENTENCES[$i]}"
+            OUTF="/tmp/piper-stream-$i.wav"
+            START=$(date +%s.%N)
+            echo "$SENT" | $PIPER_BIN --model $VOICE --output_file $OUTF 2>&1 | grep -E "Real-time factor|Loaded voice" | head -2
+            END=$(date +%s.%N)
+            WALL=$(echo "$END - $START" | bc)
+            # Get audio duration
+            DUR=$(python3 -c "
+          import wave
+          w = wave.open('$OUTF')
+          print(f'{w.getnframes()/w.getframerate():.1f}')
+          " 2>/dev/null || echo "?")
+            echo "  Sentence $((i+1)): wall=${WALL}s, audio=${DUR}s"
+            if [ $i -eq 0 ]; then
+              echo "  >>> TIME-TO-FIRST-AUDIO: ${WALL}s <<<"
+            fi
+          done
+          
+          echo ""
+          echo "=== PIPER: single full-text generation (for comparison) ==="
+          FULL_TEXT="Hello Jim, this is Jett's assistant. I'm testing Piper in warmed streaming mode to measure the latency. This is the third sentence to check for gaps between audio chunks."
+          time echo "$FULL_TEXT" | $PIPER_BIN --model $VOICE --output_file /tmp/piper-full.wav 2>&1 | grep "Real-time factor"
+          
+          echo ""
+          echo "=== Summary ==="
+          echo "Piper reloads voice (~1.3s) on each invocation."
+          echo "For true warmed operation, use piper-tts Python package (keeps voice in memory)."
+          echo "Streaming viable if per-sentence wall time <= audio duration."
