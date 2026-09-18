@@ -1,0 +1,18 @@
+name: VM IPv6 check (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - name: Check IPv6
+        run: |
+          echo "=== addresses ==="
+          ip -6 addr show 2>/dev/null | grep -a "inet6" | head -5 || echo "no IPv6 addresses"
+          echo "=== default route v6 ==="
+          ip -6 route show default 2>/dev/null | head -3 || echo "no v6 default route"
+          echo "=== test v6 egress ==="
+          timeout 8 ping -6 -c 2 2606:4700:4700::1111 2>&1 | tail -2 || echo "v6 ping failed"
+          echo "=== livekit-sip RTP config ==="
+          grep -a -iE "rtp|nat|ice|stun" /opt/agent/sip.yaml 2>/dev/null | head -10
