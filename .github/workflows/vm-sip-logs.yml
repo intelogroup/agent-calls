@@ -1,0 +1,18 @@
+name: VM SIP logs (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  logs:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Check INVITEs and dispatch config
+        run: |
+          echo "=== INVITE lines (last 30 min) ==="
+          sudo journalctl -u livekit-sip --since "30 minutes ago" -o cat 2>&1 | grep -i "invite" | tail -25
+          echo "=== errors/rejects (last 30 min) ==="
+          sudo journalctl -u livekit-sip --since "30 minutes ago" -o cat 2>&1 | grep -iE "error|reject|declin|no trunk|no dispatch|404|480|486" | tail -25
+          echo "=== livekit-sip uptime ==="
+          sudo systemctl show livekit-sip -p ActiveEnterTimestamp,NRestarts 2>/dev/null
+          echo "=== redis dispatch/trunk keys ==="
+          redis-cli keys '*' 2>/dev/null | grep -iE "dispatch|trunk" | head -10 || echo "redis-cli unavailable or no keys"
