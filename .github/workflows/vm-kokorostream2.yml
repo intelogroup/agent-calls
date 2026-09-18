@@ -1,0 +1,35 @@
+name: VM kokoro streaming v2 (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 15
+    steps:
+      - run: |
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import time, re
+          from kokoro_onnx import Kokoro
+          t0 = time.time()
+          k = Kokoro("/opt/agent/models/kokoro-v1.0.int8.onnx", "/opt/agent/models/voices-v1.0.bin")
+          print(f"Model load: {time.time()-t0:.1f}s", flush=True)
+          k.create("Hello.", voice="af_heart", speed=1.0, lang="en-us")
+          print("Warmed.", flush=True)
+          text = "Hello Jim, this is Jett's assistant. I'm testing Kokoro streaming to see how fast each sentence generates. This is the third sentence to measure the gaps."
+          sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+          print(f"\nStreaming {len(sentences)} sentences:", flush=True)
+          total_audio = 0
+          first_audio = 0
+          for i, sent in enumerate(sentences):
+              t0 = time.time()
+              samples, sr = k.create(sent, voice="af_heart", speed=1.0, lang="en-us")
+              gen_time = time.time() - t0
+              audio_dur = len(samples) / sr
+              total_audio += audio_dur
+              if i == 0:
+                  first_audio = gen_time
+              print(f"  Sentence {i+1}: gen={gen_time:.1f}s, audio={audio_dur:.1f}s, ratio={gen_time/audio_dur:.1f}x", flush=True)
+          print(f"\n>>> TIME-TO-FIRST-AUDIO: {first_audio:.1f}s <<<", flush=True)
+          print(f"Total audio: {total_audio:.1f}s", flush=True)
+          print("Streaming hides latency only if gen_time <= audio_dur per sentence.", flush=True)
+          PYEOF
