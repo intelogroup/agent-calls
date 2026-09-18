@@ -284,5 +284,17 @@ systemctl enable livekit-server livekit-sip jett-proxy.service redis-server
 echo OK
 
 echo
+echo "== VM firewall: open SIP + RTP (Oracle images REJECT non-SSH inbound) =="
+for spec in "udp 5060" "tcp 5060" "udp 12000:12100"; do
+  set -- $spec
+  iptables -C INPUT -p $1 --dport $2 -j ACCEPT 2>/dev/null     || iptables -I INPUT 5 -p $1 --dport $2 -j ACCEPT
+done
+if ! command -v netfilter-persistent >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q iptables-persistent
+fi
+netfilter-persistent save
+echo OK
+
 echo "DONE. Next: deploy workflow writes agent.env, creates the SIP trunk +"
 echo "dispatch rule (setup-sip.py), and restarts everything."
+
