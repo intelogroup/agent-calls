@@ -1,0 +1,69 @@
+name: VM kokoro fix (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  fix:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          cd /opt/agent/models
+          echo "=== current files ==="
+          ls -lh kokoro-v1.0.int8.onnx voices-v1.0.bin
+          
+          # Backup old files
+          sudo cp voices-v1.0.bin voices-v1.0.bin.bak-corrupt
+          sudo cp kokoro-v1.0.int8.onnx kokoro-v1.0.int8.onnx.bak
+          echo "backed up"
+          
+          # Download fresh from official release
+          echo "=== downloading fresh voices-v1.0.bin ==="
+          sudo curl -sSL --fail --retry 3 -o voices-v1.0.bin \
+            https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+          echo "voices downloaded"
+          
+          echo "=== downloading fresh kokoro-v1.0.int8.onnx ==="
+          sudo curl -sSL --fail --retry 3 -o kokoro-v1.0.int8.onnx \
+            https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx
+          echo "model downloaded"
+          
+          ls -lh kokoro-v1.0.int8.onnx voices-v1.0.bin
+          
+          # Test: check voice tensor + generate real output
+          echo "=== testing ==="
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          from kokoro_onnx import Kokoro
+          import numpy as np
+          
+          k = Kokoro("/opt/agent/models/kokoro-v1.0.int8.onnx",
+                     "/opt/agent/models/voices-v1.0.bin")
+          
+          # 1. Voice tensor health
+          v = k.get_voice_style("af_heart")
+          print(f"voice shape: {v.shape}")
+          print(f"voice max abs: {np.abs(v).max():.6f}")
+          print(f"voice mean: {v.mean():.6f}")
+          
+          # 2. Generate and check output
+          import time
+          t0 = time.time()
+          samples, sr = k.create("Hey, it's Jett's line. Can you hear me now?",
+                                 voice="af_heart", speed=1.0, lang="en-us")
+          dt = time.time() - t0
+          rms = np.sqrt((samples**2).mean())
+          print(f"generated {len(samples)} samples at {sr}Hz in {dt:.1f}s")
+          print(f"output RMS: {rms:.4f} (want > 0.05 for real speech)")
+          print(f"output max abs: {np.abs(samples).max():.4f}")
+          
+          if rms > 0.05:
+              print("SUCCESS: real speech output!")
+              # Save a test WAV
+              import wave
+              pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+              with wave.open("/tmp/kokoro-fixed-test.wav", "wb") as w:
+                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+                  w.writeframes(pcm.tobytes())
+              print("saved /tmp/kokoro-fixed-test.wav")
+          else:
+              print("STILL SILENT: voices file was not the issue")
+          PYEOF
