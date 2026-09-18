@@ -1,0 +1,52 @@
+name: VM piper in-memory retest (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - run: |
+          # Install piper-tts Python package in the agent venv (if not present)
+          /opt/agent/venv/bin/pip install -q piper-tts 2>&1 | tail -2
+          /opt/agent/venv/bin/python << 'PYEOF'
+          import time, wave, io
+          from piper import PiperVoice
+
+          VOICE = "/opt/agent/models/piper/en_US-lessac-medium.onnx"
+          
+          print("=== PIPER: voice kept in memory ===", flush=True)
+          t0 = time.time()
+          voice = PiperVoice.load(VOICE)
+          load_time = time.time() - t0
+          print(f"Voice load (one-time): {load_time:.2f}s", flush=True)
+          
+          sentences = [
+              "Hello Jim, this is Jett's assistant.",
+              "I'm testing Piper with the voice kept in memory to eliminate reload overhead.",
+              "This is the third sentence to verify seamless streaming."
+          ]
+          
+          print(f"\nStreaming {len(sentences)} sentences (voice stays loaded):", flush=True)
+          for i, sent in enumerate(sentences):
+              t0 = time.time()
+              # Synthesize to WAV in memory
+              wav_io = io.BytesIO()
+              with wave.open(wav_io, "wb") as wav_file:
+                  wav_file.setnchannels(1)
+                  wav_file.setsampwidth(2)
+                  wav_file.setframerate(voice.config.sample_rate)
+                  voice.synthesize(sent, wav_file)
+              gen_time = time.time() - t0
+              wav_io.seek(0)
+              with wave.open(wav_io, "rb") as w:
+                  audio_dur = w.getnframes() / w.getframerate()
+              # Save for verification
+              with open(f"/tmp/piper-mem-{i}.wav", "wb") as f:
+                  f.write(wav_io.getvalue())
+              print(f"  Sentence {i+1}: gen={gen_time:.2f}s, audio={audio_dur:.2f}s, ratio={gen_time/audio_dur:.2f}x", flush=True)
+              if i == 0:
+                  print(f"  >>> TIME-TO-FIRST-AUDIO: {gen_time:.2f}s <<<", flush=True)
+          
+          print("\nNo voice reload between sentences. Compare to binary mode (1.3s reload each).", flush=True)
+          PYEOF
