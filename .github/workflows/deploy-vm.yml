@@ -1,24 +1,31 @@
 name: Deploy voice agent to Oracle VM
 
-# Deploys server/ to the Oracle Cloud VM (129.159.189.244), provisions it,
-# writes agent.env from secrets, and (re)starts the agent service.
+# Deploys server/ to the Oracle Cloud VM (129.159.189.244), provisions the
+# LiveKit inbound voice stack, writes agent.env from secrets, creates the SIP
+# trunk + dispatch rule, and (re)starts all services.
 # The sandbox cannot SSH out, so this workflow is the deploy path.
 #
 # Required Actions secrets (repo Settings -> Secrets and variables -> Actions):
 #   VM_SSH_KEY    private key matching the VM's authorized key
-#   SIP_USER      Linphone username the agent registers as
-#   SIP_PASSWORD  Linphone password for that account
+# Optional:
+#   META_API_KEY  Meta Model API key (live agent brain). Without it the
+#                 proxy worker starts but tells callers the brain is missing.
 #
-# Trigger: Actions tab -> "Deploy voice agent to Oracle VM" -> Run workflow,
-# or push to main touching server/** or this file.
+# Triggers:
+#   - Actions tab -> "Deploy voice agent to Oracle VM" -> Run workflow
+#   - repository_dispatch event type "deploy-vm" (for automation)
+#   - push to main touching server/** or this file.
 
 on:
   workflow_dispatch:
+  repository_dispatch:
+    types: [deploy-vm]
   push:
     branches: [main]
     paths:
       - '.github/workflows/deploy-vm.yml'
       - 'server/**'
+      - 'JETT.md'
 
 env:
   VM_HOST: 129.159.189.244
@@ -38,8 +45,11 @@ jobs:
         timeout-minutes: 2
         run: |
           [ -n "${{ secrets.VM_SSH_KEY }}" ] || { echo "missing secret VM_SSH_KEY"; exit 1; }
-          [ -n "${{ secrets.SIP_USER }}" ] || { echo "missing secret SIP_USER"; exit 1; }
-          [ -n "${{ secrets.SIP_PASSWORD }}" ] || { echo "missing secret SIP_PASSWORD"; exit 1; }
+          if [ -z "${{ secrets.META_API_KEY }}" ]; then
+            echo "NOTE: META_API_KEY not set — proxy worker will idle gracefully until it is added."
+          else
+            echo "META_API_KEY present."
+          fi
           echo "secrets OK"
 
       - name: Set up SSH
@@ -54,8 +64,8 @@ jobs:
       - name: Copy server files to VM
         timeout-minutes: 5
         run: |
-          tar czf - server | ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'sudo mkdir -p /opt/agent && sudo tar xzf - -C /opt/agent --strip-components=1 && sudo chown -R root:root /opt/agent'
+          tar czf - server JETT.md | ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
+            'sudo mkdir -p /opt/agent /tmp/stage && sudo tar xzf - -C /tmp/stage && sudo cp -r /tmp/stage/server/. /opt/agent/ && sudo cp /tmp/stage/JETT.md /opt/agent/JETT.md && sudo chown -R root:root /opt/agent && rm -rf /tmp/stage'
           echo "files copied"
 
       - name: Provision VM (setup.sh)
@@ -69,38 +79,41 @@ jobs:
       - name: Write agent.env from secrets
         timeout-minutes: 3
         env:
-          SIP_USER: ${{ secrets.SIP_USER }}
-          SIP_PASSWORD: ${{ secrets.SIP_PASSWORD }}
+          META_API_KEY: ${{ secrets.META_API_KEY }}
         run: |
           python3 - <<'PYEOF' | ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
             'sudo tee /opt/agent/agent.env > /dev/null && sudo chmod 600 /opt/agent/agent.env && sudo chown agent:agent /opt/agent/agent.env'
           import os
           vals = {
-              "AGENT_SIP_USER": os.environ["SIP_USER"],
-              "AGENT_SIP_PASS": os.environ["SIP_PASSWORD"],
-              "AGENT_SIP_DOMAIN": "sip.linphone.org",
-              "AGENT_SIP_PORT": "5060",
               "AGENT_NAME": "Jett",
-              "AGENT_RTP_PORT": "10000",
-              "AGENT_PUBLIC_IP": "129.159.189.244",
-              "AGENT_WHISPER_MODEL": "tiny.en",
-              "AGENT_LLM_MODEL": "/opt/agent/models/llm.gguf",
-              "AGENT_TTS_ENGINE": "espeak",
-              "AGENT_THREADS": "1",
-              "AGENT_MAX_TURNS": "8",
-              "AGENT_MAX_CALL_SEC": "300",
-              "AGENT_GREETING": "Hey, it's Jett. What do you want to talk about?",
+              "AGENT_GREETING": "Hey, it's Jett's line. What do you want to talk about?",
+              "LIVEKIT_URL": "ws://localhost:7880",
+              # LIVEKIT_API_KEY / LIVEKIT_API_SECRET are generated server-side
+              # by setup.sh into /opt/agent/livekit.env and merged at runtime.
+              "META_API_KEY": os.environ.get("META_API_KEY", ""),
+              "META_MODEL": "muse-spark-1.3",
+              "BUS_REPO_SSH": "git@github.com:intelogroup/agent-call-bus.git",
+              "BUS_DIR": "/opt/agent/bus",
+              "CONSULT_TIMEOUT_SEC": "180",
+              "AGENT_MAX_CALL_SEC": "600",
           }
           for k, v in vals.items():
               print(f"{k}={v}")
           PYEOF
-          echo "agent.env written"
+          echo "agent.env written (META_API_KEY $([ -n "$META_API_KEY" ] && echo present || echo MISSING))"
 
-      - name: Restart service and show status
+      - name: Create SIP trunk + dispatch rule
         timeout-minutes: 5
         run: |
           ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'sudo systemctl restart agent.service || sudo systemctl start agent.service'
-          sleep 25
+            'stdbuf -oL -eL sudo -u agent /opt/agent/venv/bin/python /opt/agent/setup-sip.py'
+          echo "sip routing configured"
+
+      - name: Restart services and show status
+        timeout-minutes: 5
+        run: |
           ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'sudo systemctl is-active agent.service; echo "--- recent logs ---"; sudo journalctl -u agent.service --no-pager -n 40'
+            'sudo systemctl restart redis-server livekit-server livekit-sip jett-proxy.service'
+          sleep 20
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
+            'for s in redis-server livekit-server livekit-sip jett-proxy; do printf "%-14s %s\n" "$s" "$(sudo systemctl is-active $s)"; done; echo "--- jett-proxy logs ---"; sudo journalctl -u jett-proxy.service --no-pager -n 30'

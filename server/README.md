@@ -1,61 +1,74 @@
-# Inbound voice agent — call Jett anytime
+# Jett's voice proxy — call Jett anytime
 
-A 24/7 server that registers a SIP identity, answers incoming calls, and
-holds a spoken conversation: listen → transcribe (faster-whisper) →
-think (Qwen 2.5 1.5B via llama.cpp) → speak (Kokoro, espeak-ng fallback).
+One SIP line, one worker. Dial `sip:jett@129.159.189.244` and talk to
+Jett's voice proxy: real-time voice (LiveKit handles VAD / barge-in /
+turn-taking), a Muse Spark brain briefed on Jett's notes (`JETT.md`), and a
+warm Kokoro voice.
 
-## What you need (the 3 things only you can do)
+The proxy answers from its brief when confident — and for anything needing
+the real Jett's live memory, tools, or judgment it calls `consult_jett()`,
+which drops the question into the private `intelogroup/agent-call-bus` repo
+(`calls/live/<call-id>/in.jsonl`) and speaks Jett's reply back when it lands
+(`out.jsonl`). See `PROTOCOL.md` in that repo.
 
-1. **Oracle Cloud Free Tier account** — oracle.com/cloud/free. Email + card
-   for verification (never charged on the free tier). This is the always-on box.
-2. **A VM**: Ampere A1, Ubuntu 24.04, 4 OCPU / 24 GB RAM (inside free limits).
-   - Subnet security list: allow ingress **UDP port 10000** (RTP audio) and
-     **TCP port 22** (SSH) from anywhere. Egress: all.
-   - Add this SSH public key so the assistant can deploy for you:
-     ```
-     ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOSv8vb0slmLAo62ta1sMlXlyqFY15uau2zznOONbaSB hatch
-     ```
-   - Note the VM's **public IP**.
-3. **A second free Linphone account for the agent** — in the Linphone app:
-   add account → create a new free account (e.g. username `jett-agent`).
-   The agent registers as this identity; you dial it like any contact.
+## Stack (1 GB VM, no local LLM)
 
-Then send the assistant: the VM's public IP + the agent's SIP username/password.
-
-## What the assistant does from there
-
-```bash
-scp -r server/ root@<VM-IP>:/opt/agent/
-ssh root@<VM-IP> "bash /opt/agent/setup.sh"   # installs everything, ~20-40 min
-# fill /opt/agent/agent.env, then:
-systemctl start agent.service
-```
+- `livekit-server` — SFU, localhost signaling (`:7880`)
+- `livekit-sip` — SIP↔WebRTC bridge (public SIP `:5060`, RTP `12000-12100/udp`)
+- `redis-server` — shared bus for the above
+- `live_agent.py` — the proxy worker (LiveKit Agents pipeline):
+  faster-whisper `tiny.en` STT → Muse Spark LLM → kokoro-onnx TTS
+- `setup-sip.py` — creates the inbound trunk (`jett`) + dispatch rule
+  (room prefix `jett-`, auto-dispatches agent `jett-proxy`)
 
 ## Files
 
-- `sip_server.py` — the daemon: TCP SIP registration (with re-register +
-  auto-reconnect), inbound INVITE handling, RTP/PCMU send/recv, voice loop
-  with energy-based end-of-speech detection, Whisper STT, llama.cpp LLM,
-  Kokoro/espeak TTS. One call at a time; second caller gets 486 Busy.
-- `setup.sh` — provisioning: system packages, venv, pip deps, model downloads.
-- `requirements.txt` — faster-whisper, llama-cpp-python, kokoro, torch, etc.
-- `agent.service` — systemd unit (auto-restart).
+- `live_agent.py` — the proxy worker. Loads repo-root `JETT.md` as its brief.
+- `setup.sh` — provisioning: binaries, venv, models, systemd units, bus key.
+- `setup-sip.py` — idempotent SIP trunk + dispatch rule creation.
+- `jett-proxy.service` — systemd unit for the worker.
+- `requirements.txt` — python deps.
 - `agent.env.example` — config template.
+- `sip_server.py` — **RETIRED / superseded.** The old DIY half-duplex
+  inbound server (raw SIP + local Qwen). Kept for reference only; the
+  LiveKit proxy above replaces it.
 
-## Config (`/opt/agent/agent.env`)
+## Config (`/opt/agent/agent.env` + `/opt/agent/livekit.env`)
 
 | Var | Meaning |
 |---|---|
-| `AGENT_SIP_USER` / `AGENT_SIP_PASS` | agent's Linphone account |
-| `AGENT_PUBLIC_IP` | VM public IP (used in SDP) |
-| `AGENT_RTP_PORT` | UDP port for audio (default 10000) |
-| `AGENT_TTS_ENGINE` | `kokoro` (nicer) or `espeak` (instant, robotic) |
-| `AGENT_MAX_TURNS` / `AGENT_MAX_CALL_SEC` | call length guards |
+| `META_API_KEY` | Meta Model API key (live brain). Worker idles gracefully without it. |
+| `META_MODEL` | model name, default `muse-spark-1.3` (auto-discovery via `/v1/models`) |
+| `LIVEKIT_URL` | `ws://localhost:7880` |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | generated server-side into `livekit.env` |
+| `BUS_DIR` / `BUS_REPO_SSH` | agent-call-bus checkout for `consult_jett` |
+| `CONSULT_TIMEOUT_SEC` | how long to wait for Jett's reply (default 180) |
+| `AGENT_MAX_CALL_SEC` | call length guard (default 600) |
 
-## Honest expectations
+## Firewall (OCI security list)
 
-- Each reply takes **tens of seconds** (transcribe + think + speak on a small
-  CPU VM). Voice-message pace, not a phone-call pace.
-- Logs: `journalctl -u agent.service -f`.
-- If the LLM model fails to load, the agent says so out loud and keeps
-  listening (degraded but honest).
+Inbound needed: **TCP+UDP 5060** (SIP), **UDP 12000–12100** (SIP media).
+Nothing else public: LiveKit's `:7880`/RTC ports are localhost-only in this
+SIP-only setup.
+
+## Logs
+
+`journalctl -u jett-proxy.service -f`, `journalctl -u livekit-sip.service -f`.
+
+## Post-deploy checklist (operator)
+
+1. **Deploy key**: setup.sh generates `/home/agent/.ssh/bus_key` and prints
+   the public key in the deploy log. Register it with WRITE access:
+   `gh-api api POST /repos/intelogroup/agent-call-bus/keys
+   '{"title":"jett-proxy-bus","key":"ssh-ed25519 AAAA…","read_only":false}'`
+   (manual fallback: repo Settings → Deploy keys). Without it, `consult_jett`
+   degrades honestly ("can't reach Jett").
+2. **Brain key**: store `META_API_KEY` as a GitHub Actions secret, re-run
+   deploy (writes `agent.env`, restarts worker). Until then the worker
+   answers calls with a spoken "brain not connected" notice — never silence.
+3. **Verify**: `systemctl is-active` on redis/livekit-server/livekit-sip/
+   jett-proxy; place a test call to `sip:jett@129.159.189.244` from Linphone
+   on cellular data (hospital Wi-Fi blocks UDP media — see root README).
+4. **Consult test**: ask something only Jett would know; watch
+   `calls/live/<call-id>/in.jsonl` appear in agent-call-bus; reply in
+   `out.jsonl` and confirm the caller hears it.
