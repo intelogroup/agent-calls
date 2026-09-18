@@ -1,0 +1,83 @@
+name: Setup Oracle self-hosted runner
+
+# Installs a GitHub Actions self-hosted runner on the Oracle Cloud VM
+# (129.159.189.244) so the Call workflow runs warm: no per-run apt/pip
+# installs, dial in ~15-30s instead of ~4 minutes.
+#
+# The registration token expires 1 hour after creation — generate one via:
+#   POST /repos/intelogroup/agent-calls/actions/runners/registration-token
+# then dispatch this workflow immediately with the token.
+#
+# Trigger: Actions tab -> "Setup Oracle self-hosted runner" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      registration_token:
+        description: 'Runner registration token (expires 1h after creation)'
+        required: true
+
+env:
+  VM_HOST: 129.159.189.244
+  VM_USER: ubuntu
+  SSH_OPTS: -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8
+  RUNNER_VERSION: 2.337.0
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Set up SSH
+        timeout-minutes: 3
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/vm_key
+          chmod 600 ~/.ssh/vm_key
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" 'echo "ssh OK: $(hostname) $(date -u)"'
+
+      - name: Install and register runner on VM
+        timeout-minutes: 25
+        env:
+          REG_TOKEN: ${{ inputs.registration_token }}
+        run: |
+          set +x  # never trace the token
+          cat > /tmp/setup-runner.sh <<EOF
+          set -e
+          echo "--- installing packages ---"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tar jq espeak-ng ffmpeg python3 baresip
+          echo "--- creating actions-runner user ---"
+          if ! id actions-runner >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash actions-runner
+            echo "actions-runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/actions-runner >/dev/null
+            sudo chmod 440 /etc/sudoers.d/actions-runner
+          fi
+          echo "--- downloading runner v$RUNNER_VERSION ---"
+          sudo mkdir -p /opt/actions-runner
+          sudo chown actions-runner:actions-runner /opt/actions-runner
+          cd /opt/actions-runner
+          sudo -u actions-runner curl -sL -o runner.tar.gz "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-linux-x64-v$RUNNER_VERSION.tar.gz"
+          sudo -u actions-runner tar xzf runner.tar.gz
+          rm -f runner.tar.gz
+          echo "--- installing runner dependencies ---"
+          sudo ./bin/installdependencies.sh
+          echo "--- configuring runner ---"
+          sudo -u actions-runner ./config.sh --unattended --replace \
+            --url https://github.com/intelogroup/agent-calls \
+            --token "\$REG_TOKEN" \
+            --name oracle-voice \
+            --labels oracle,voice \
+            --work _work
+          echo "--- installing service ---"
+          sudo ./svc.sh install actions-runner
+          sudo ./svc.sh start
+          sudo touch /opt/actions-runner/.warm
+          sleep 5
+          sudo ./svc.sh status
+          echo "--- runner setup complete ---"
+          EOF
+          scp -i ~/.ssh/vm_key $SSH_OPTS /tmp/setup-runner.sh "$VM_USER@$VM_HOST:/tmp/setup-runner.sh"
+          ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" "sudo REG_TOKEN='$REG_TOKEN' bash /tmp/setup-runner.sh"
+          echo "setup workflow finished"
