@@ -1,0 +1,140 @@
+name: VM TTS patch (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  patch:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 3
+    steps:
+      - run: |
+          # Backup
+          sudo cp /opt/agent/live_agent.py /opt/agent/live_agent.py.bak-kokoro
+          echo "backup done"
+          
+          # Patch via Python
+          sudo /opt/agent/venv/bin/python << 'PYEOF'
+          import re
+          
+          path = "/opt/agent/live_agent.py"
+          with open(path) as f:
+            src = f.read()
+          
+          # 1. Add imports if missing (subprocess, wave, io)
+          if "import subprocess" not in src:
+            src = src.replace("import os", "import os\nimport subprocess", 1)
+          if "import wave" not in src:
+            src = src.replace("import subprocess", "import subprocess\nimport wave\nimport io", 1)
+          
+          # 2. Add EspeakTTS class after _KokoroChunkedStream (before agent-call-bus marker)
+          espeak_class = '''
+          class EspeakTTS(tts.TTS):
+              """espeak-ng as a LiveKit TTS (fast, reliable, chunked synthesis)."""
+
+              def __init__(self) -> None:
+                  super().__init__(
+                      capabilities=tts.TTSCapabilities(streaming=False),
+                      sample_rate=24000,
+                      num_channels=1,
+                  )
+                  log.info("espeak-ng TTS ready")
+
+              @property
+              def model(self) -> str:
+                  return "espeak-ng-1.51"
+
+              @property
+              def provider(self) -> str:
+                  return "espeak-ng"
+
+              def _synth(self, text: str) -> tuple[np.ndarray, int]:
+                  result = subprocess.run(
+                      ["espeak-ng", "-v", "en-us", "-s", "175", "--stdout", text],
+                      capture_output=True, timeout=30)
+                  if result.returncode != 0:
+                      raise RuntimeError(f"espeak-ng failed: {result.stderr[:200]}")
+                  wav_io = io.BytesIO(result.stdout)
+                  with wave.open(wav_io, 'rb') as w:
+                      n_frames = w.getnframes()
+                      sr = w.getframerate()
+                      n_ch = w.getnchannels()
+                      sampwidth = w.getsampwidth()
+                      data = w.readframes(n_frames)
+                  if sampwidth == 2:
+                      samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                  else:
+                      raise ValueError(f"unexpected sampwidth {sampwidth}")
+                  if n_ch == 2:
+                      samples = samples.reshape(-1, 2).mean(axis=1)
+                  if sr != 24000:
+                      orig_len = len(samples)
+                      new_len = int(orig_len * 24000 / sr)
+                      old_idx = np.linspace(0, orig_len - 1, orig_len)
+                      new_idx = np.linspace(0, orig_len - 1, new_len)
+                      samples = np.interp(new_idx, old_idx, samples).astype(np.float32)
+                      sr = 24000
+                  return samples, sr
+
+              def synthesize(self, text: str, *, conn_options=DEFAULT_API_CONNECT_OPTIONS
+                             ) -> tts.ChunkedStream:
+                  return _EspeakChunkedStream(tts=self, input_text=text,
+                                              conn_options=conn_options)
+
+
+          class _EspeakChunkedStream(tts.ChunkedStream):
+              async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+                  loop = asyncio.get_running_loop()
+                  output_emitter.initialize(
+                      request_id=uuid.uuid4().hex[:12],
+                      sample_rate=24000,
+                      num_channels=1,
+                      mime_type="audio/pcm",
+                      stream=False,
+                  )
+                  for sent in split_sentences(self._input_text):
+                      try:
+                          samples, _sr = await loop.run_in_executor(
+                              None, self._tts._synth, sent)
+                      except Exception as e:
+                          log_event("tts_error", sentence_len=len(sent),
+                                    error=str(e)[:150])
+                          continue
+                      if samples is None or len(samples) == 0:
+                          log_event("tts_empty_synth", sentence_len=len(sent))
+                          continue
+                      pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(
+                          np.int16).tobytes()
+                      frame_bytes = 24000 * 2 // 50
+                      for i in range(0, len(pcm), frame_bytes):
+                          output_emitter.push(pcm[i:i + frame_bytes])
+                  output_emitter.flush()
+
+          '''
+          
+          # Insert before the agent-call-bus marker
+          marker = "# ------------------------------------------------- agent-call-bus ---"
+          if marker in src and "class EspeakTTS" not in src:
+            src = src.replace(marker, espeak_class + marker, 1)
+            print("EspeakTTS class added")
+          else:
+            print("EspeakTTS already present or marker not found")
+          
+          # 3. Replace KokoroTTS() with EspeakTTS()
+          src = src.replace("KokoroTTS()", "EspeakTTS()")
+          print("replaced KokoroTTS() with EspeakTTS()")
+          
+          # 4. Update warmup log message
+          src = src.replace('log.info("warming kokoro TTS …")', 'log.info("warming espeak-ng TTS …")')
+          src = src.replace('"kokoro warm failed; per-call fallback"', '"espeak warm failed; per-call fallback"')
+          
+          with open(path, "w") as f:
+            f.write(src)
+          print("patch written")
+          PYEOF
+          
+          # Verify syntax
+          sudo /opt/agent/venv/bin/python -m py_compile /opt/agent/live_agent.py && echo "syntax OK"
+          
+          # Restart the service
+          sudo systemctl restart jett-proxy
+          sleep 3
+          sudo systemctl is-active jett-proxy
