@@ -19,5 +19,6 @@ jobs:
         env:
           DBPW: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
-          DBURL=$(python3 -c "import urllib.parse,os; print('postgresql://postgres:'+urllib.parse.quote(os.environ['DBPW'])+'@db.fsbdpunmxdywfysobfrk.supabase.co:5432/postgres')")
+          if [ -z "$DBPW" ]; then echo "SUPABASE_DB_PASSWORD secret is not set"; exit 1; fi
+          DBURL=$(python3 -c "import urllib.parse,os; print('postgresql://postgres.fsbdpunmxdywfysobfrk:'+urllib.parse.quote(os.environ['DBPW'])+'@aws-0-ca-central-1.pooler.supabase.com:6543/postgres')")
           /tmp/supabase db push --db-url "$DBURL" --yes
