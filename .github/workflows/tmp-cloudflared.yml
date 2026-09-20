@@ -5,14 +5,20 @@ jobs:
   install:
     runs-on: [self-hosted, oracle]
     steps:
-      - name: Install cloudflared (arm64)
+      - name: Install cloudflared (arch-aware)
         run: |
           set -euo pipefail
-          if ! command -v cloudflared >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64
-            chmod +x /tmp/cloudflared
-            sudo install /tmp/cloudflared /usr/local/bin/cloudflared
-          fi
+          ARCH=$(uname -m)
+          echo "arch=$ARCH"
+          case "$ARCH" in
+            x86_64)  CFARCH=amd64 ;;
+            aarch64) CFARCH=arm64 ;;
+            *) echo "unsupported arch $ARCH"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CFARCH}"
+          chmod +x /tmp/cloudflared
+          file /tmp/cloudflared | head -1
+          sudo install /tmp/cloudflared /usr/local/bin/cloudflared
           cloudflared --version
       - name: Write token and systemd unit
         run: |
