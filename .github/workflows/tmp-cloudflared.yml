@@ -5,13 +5,13 @@ jobs:
   diag:
     runs-on: [self-hosted, oracle]
     steps:
-      - name: Diagnose port 7880
+      - name: Full port identification
         run: |
-          echo "--- listening sockets ---"
-          sudo ss -tlnp | grep -E "7880|LISTEN" | head -10
-          echo "--- curl -i localhost:7880/ ---"
-          curl -sS -i --max-time 10 http://localhost:7880/ | head -20
-          echo "--- livekit service status ---"
-          sudo systemctl is-active livekit-server.service livekit-sip.service jett-proxy.service 2>/dev/null
-          echo "--- livekit config port ---"
-          sudo grep -rE "port|address" /etc/livekit* /opt/agent/livekit* 2>/dev/null | grep -iv "password\|key\|secret" | head -10
+          echo "--- all tcp listeners with process ---"
+          sudo ss -tlnp | grep -v "^State" 
+          echo "--- body of localhost:7880/ ---"
+          curl -sS --max-time 10 http://localhost:7880/ | head -c 300; echo
+          echo "--- what is python on 8081 ---"
+          sudo ls -l /proc/58624/cwd 2>/dev/null; sudo tr '\0' ' ' < /proc/58624/cmdline 2>/dev/null; echo
+          echo "--- livekit-server listening? ---"
+          sudo ss -tlnp | grep -c 7880 || echo "no 7880 listener"
