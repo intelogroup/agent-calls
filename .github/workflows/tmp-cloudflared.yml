@@ -1,0 +1,43 @@
+name: tmp-cloudflared-install
+on:
+  workflow_dispatch:
+jobs:
+  install:
+    runs-on: [self-hosted, oracle]
+    steps:
+      - name: Install cloudflared (arm64)
+        run: |
+          set -euo pipefail
+          if ! command -v cloudflared >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64
+            chmod +x /tmp/cloudflared
+            sudo install /tmp/cloudflared /usr/local/bin/cloudflared
+          fi
+          cloudflared --version
+      - name: Write token and systemd unit
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/cloudflared
+          printf '%s' "${{ secrets.CLOUDFLARED_TUNNEL_TOKEN }}" | sudo tee /etc/cloudflared/token >/dev/null
+          sudo chmod 600 /etc/cloudflared/token
+          sudo tee /etc/systemd/system/cloudflared-tunnel.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Cloudflare Tunnel (oracle-livekit)
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file /etc/cloudflared/token
+          Restart=always
+          RestartSec=10
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now cloudflared-tunnel.service
+      - name: Verify tunnel and local LiveKit
+        run: |
+          sleep 10
+          sudo systemctl is-active cloudflared-tunnel.service
+          sudo journalctl -u cloudflared-tunnel.service --no-pager -n 20 | grep -iE "registered tunnel connection|failed|error" || true
+          echo "--- livekit local ---"
+          curl -s -o /dev/null -w "localhost:7880 -> %{http_code}\n" --max-time 10 http://localhost:7880/ || echo "localhost:7880 unreachable"
