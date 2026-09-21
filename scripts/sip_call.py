@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal SIP caller over TCP: REGISTER, INVITE, RTP playback of a wav as PCMU, BYE.
+"""Minimal SIP caller over TCP: STUN for public IP, INVITE (digest auth), RTP playback of a wav as PCMU, BYE.
 
 Usage: sip_call.py <user> <dest_uri> <wav_path>
 Password via SIP_CALL_PASS env (never logged). Prints CALL_ESTABLISHED on success.
@@ -26,7 +26,7 @@ PASS = os.environ["SIP_CALL_PASS"]
 DEBUG = os.environ.get("DEBUG_CALL", "0") == "1"
 
 LOCAL_IP = "10.0.0.1"  # placeholder; server learns real IP via rport/received
-PUBLIC_IP = None  # filled from REGISTER 401 Via: received=
+PUBLIC_IP = None  # filled via STUN (no REGISTER: avoids self-fork loop-back)
 
 
 def rnd(n):
@@ -205,40 +205,51 @@ def wait_response(cseq_expected, timeout=15):
     return None
 
 
-def transact(method, uri, headers_extra="", body="", timeout=15, to_tag=None,
-             to_uri=None):
-    cseq = request(method, uri, headers_extra, body, to_tag=to_tag, to_uri=to_uri)
-    resp = wait_response(cseq, timeout)
-    if resp is None:
-        return None, None
-    first, headers, _ = resp
-    code = int(first.split()[1])
-    if code in (401, 407):
-        chal = parse_challenge(resp)
-        cseq = request(method, uri, headers_extra, body, auth_params=chal,
-                       to_tag=to_tag, to_uri=to_uri)
-        resp = wait_response(cseq, timeout)
-        if resp is None:
-            return None, None
-        first, headers, _ = resp
-        code = int(first.split()[1])
-    return code, resp
+def stun_public_ip(server="stun.l.google.com", port=19302, timeout=5):
+    """RFC 5389 binding request: learn our reflexive IPv4 without REGISTERing.
+
+    We deliberately do NOT REGISTER with the SIP server: registering the
+    caller under the callee's address-of-record makes the proxy fork our own
+    INVITE back to us (486 loop-back noise). STUN gives us the public IP for
+    the SDP offer without creating a server-side contact binding. The
+    outbound INVITE is still digest-authenticated (407 challenge), which the
+    proxy accepts without a prior REGISTER.
+    """
+    tid = bytes(random.getrandbits(8) for _ in range(12))
+    req = b"\x00\x01\x00\x00\x21\x12\xa4\x42" + tid
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(req, (server, port))
+        data, _ = s.recvfrom(2048)
+    finally:
+        s.close()
+    if len(data) < 20 or data[0:2] != b"\x01\x01":
+        raise RuntimeError("bad STUN response")
+    if data[8:20] != tid:
+        raise RuntimeError("STUN transaction id mismatch")
+    off = 20
+    while off + 4 <= len(data):
+        atype = int.from_bytes(data[off:off + 2], "big")
+        alen = int.from_bytes(data[off + 2:off + 4], "big")
+        val = data[off + 4:off + 4 + alen]
+        # XOR-MAPPED-ADDRESS (0x0020), IPv4 family (0x01)
+        if atype == 0x0020 and len(val) >= 8 and val[1] == 0x01:
+            xaddr = int.from_bytes(val[4:8], "big") ^ 0x2112A442
+            return socket.inet_ntoa(xaddr.to_bytes(4, "big"))
+        off += 4 + ((alen + 3) // 4) * 4
+    raise RuntimeError("no XOR-MAPPED-ADDRESS in STUN response")
 
 
-# ---------------------------------------------------------------- 1. REGISTER
-print("== REGISTER ==", flush=True)
-code, resp = transact("REGISTER", f"sip:{DOMAIN}",
-                     headers_extra="Expires: 600\r\n")
-if resp:
-    via = resp[1].get("via", "")
-    m = re.search(r"received=([0-9.]+)", via)
-    if m:
-        PUBLIC_IP = m.group(1)
-        print("public ip seen by server:", PUBLIC_IP, flush=True)
-if code != 200:
-    print(f"REGISTER_FAILED code={code}")
+# ---------------------------------------------------------------- 1. PUBLIC IP via STUN (no REGISTER)
+print("== STUN ==", flush=True)
+try:
+    PUBLIC_IP = stun_public_ip()
+except Exception as e:  # noqa: BLE001
+    print(f"STUN_FAILED: {e}")
     sys.exit(1)
-print("REGISTER_OK", flush=True)
+print("public ip via STUN:", PUBLIC_IP, flush=True)
+print("STUN_OK", flush=True)
 
 # ---------------------------------------------------------------- 2. INVITE
 rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
