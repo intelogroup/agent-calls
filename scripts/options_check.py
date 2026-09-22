@@ -79,16 +79,61 @@ def build_options(dest, aor, auth_value=None):
     return "\r\n".join(lines), callid
 
 
-def transact(message):
-    """Send one SIP message over a fresh TCP connection, return raw response."""
+def transact(message, overall_timeout=25):
+    """Send one SIP message over TCP, read until a FINAL (>=200) response.
+
+    A 100 Trying is only provisional: the proxy is still routing. Returns the
+    raw text of the final response, or None on timeout/transport failure.
+    """
+    import time
     s = socket.create_connection((DOMAIN, 5060), timeout=10)
+    deadline = time.time() + overall_timeout
     try:
         s.sendall(message.encode())
-        s.settimeout(TIMEOUT)
-        data = s.recv(8192)
+        buf = b""
+        final_raw = None
+        while time.time() < deadline:
+            s.settimeout(max(1, deadline - time.time()))
+            try:
+                chunk = s.recv(8192)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            # extract complete SIP messages from the buffer
+            while True:
+                head_end = buf.find(b"\r\n\r\n")
+                if head_end < 0:
+                    break
+                head = buf[:head_end].decode(errors="replace")
+                body_len = 0
+                m = re.search(r"(?im)^content-length:\s*(\d+)", head)
+                if m:
+                    body_len = int(m.group(1))
+                total = head_end + 4 + body_len
+                if len(buf) < total:
+                    break
+                raw = buf[:total].decode(errors="replace")
+                buf = buf[total:]
+                first = head.split("\r\n")[0] if head else ""
+                parts = first.split()
+                code = None
+                if len(parts) >= 2 and parts[0].startswith("SIP/2"):
+                    try:
+                        code = int(parts[1])
+                    except ValueError:
+                        pass
+                if code is not None:
+                    print("recv:", first, flush=True)
+                    if code >= 200:
+                        final_raw = raw
+                    # provisional (<200): keep reading for the final
+            if final_raw is not None:
+                return final_raw
+        return final_raw
     finally:
         s.close()
-    return data.decode(errors="replace")
 
 
 def status_and_challenge(raw):
@@ -115,12 +160,16 @@ def status_and_challenge(raw):
 def probe_once(dest, aor):
     msg, _ = build_options(dest, aor)
     raw = transact(msg)
+    if raw is None:
+        return None
     code, first, challenge, proxy = status_and_challenge(raw)
     print("raw:", first, flush=True)
     if code in (401, 407) and challenge and USER and PASS:
         auth = auth_header(challenge, "OPTIONS", dest, proxy_auth=proxy)
         msg2, _ = build_options(dest, aor, auth)
         raw2 = transact(msg2)
+        if raw2 is None:
+            return None
         code2, first2, _, _ = status_and_challenge(raw2)
         print("authed raw:", first2, flush=True)
         return code2
@@ -152,11 +201,13 @@ def main():
         if code is None:
             continue
         last = code
-        if 100 <= code < 200 or code in (200, 486, 487):
+        if code in (200, 486, 487):
             verdict("REGISTERED", f"final {code}")
-        if code in (404, 410, 480, 483, 503, 604):
+        if code in (404, 408, 410, 480, 483, 503, 604):
+            # 408 on an authed probe = proxy routed to a registered contact
+            # that never answered: the binding is effectively dead.
             verdict("NOT_REGISTERED", f"final {code}")
-        # anything else (401/403/407/408/500/...) is inconclusive: retry
+        # anything else (401/403/407/500/...) is inconclusive: retry
     if last is None:
         verdict("UNKNOWN", "no SIP response after retries")
     verdict("UNKNOWN", f"inconclusive final code {last} after retries")
