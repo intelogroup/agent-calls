@@ -15,8 +15,11 @@ jobs:
             TAG=$(curl -s -m 20 https://api.github.com/repos/binwiederhier/ntfy/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
             echo "installing ntfy $TAG"
             curl -sL -m 120 -o /tmp/ntfy.tgz "https://github.com/binwiederhier/ntfy/releases/download/${TAG}/ntfy_${TAG#v}_linux_amd64.tar.gz"
-            tar -xzf /tmp/ntfy.tgz -C /tmp ntfy
-            sudo install -m 0755 /tmp/ntfy /usr/local/bin/ntfy
+            tar -tzf /tmp/ntfy.tgz
+            tar -xzf /tmp/ntfy.tgz -C /tmp
+            BIN=$(find /tmp -maxdepth 3 -name ntfy -type f | head -1)
+            echo "binary at $BIN"
+            sudo install -m 0755 "$BIN" /usr/local/bin/ntfy
             rm -f /tmp/ntfy.tgz /tmp/ntfy
           fi
           ntfy --version
