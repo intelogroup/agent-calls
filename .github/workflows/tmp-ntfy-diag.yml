@@ -1,0 +1,17 @@
+name: tmp-ntfy-diag
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Diagnose ntfy service failure
+        run: |
+          ntfy serve --help 2>&1 | head -20
+          echo "=== journal ==="
+          sudo journalctl -u ntfy.service --no-pager -n 15 2>&1 | head -25
+          echo "=== config perms ==="
+          ls -la /etc/ntfy/
