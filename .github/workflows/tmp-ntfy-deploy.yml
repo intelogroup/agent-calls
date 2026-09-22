@@ -44,7 +44,7 @@ jobs:
           auth-file: "/etc/ntfy/auth.db"
           auth-default-access: "deny-all"
           EOF
-          sudo chmod 600 /etc/ntfy/server.yml
+          sudo chmod 644 /etc/ntfy/server.yml  # readable by ntfy service user; holds no secrets
           if ! id ntfy >/dev/null 2>&1; then
             sudo useradd --system --no-create-home --shell /usr/sbin/nologin ntfy
           fi
@@ -71,7 +71,7 @@ jobs:
           [Service]
           Type=simple
           User=ntfy
-          ExecStart=/usr/local/bin/ntfy serve -c /etc/ntfy/server.yml
+          ExecStart=/usr/local/bin/ntfy serve
           Restart=always
           RestartSec=5
           NoNewPrivileges=true
