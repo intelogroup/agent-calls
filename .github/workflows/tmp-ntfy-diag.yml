@@ -8,10 +8,12 @@ jobs:
     runs-on: [self-hosted, oracle]
     timeout-minutes: 5
     steps:
-      - name: Diagnose ntfy service failure
+      - name: Report ntfy status
         run: |
-          ntfy serve --help 2>&1 | head -20
-          echo "=== journal ==="
-          sudo journalctl -u ntfy.service --no-pager -n 15 2>&1 | head -25
-          echo "=== config perms ==="
-          ls -la /etc/ntfy/
+          echo "topic: $(cat /etc/ntfy/.topic_public)"
+          echo "ntfy: $(sudo systemctl is-active ntfy.service)"
+          echo "cloudflared-ntfy: $(sudo systemctl is-active cloudflared-ntfy.service)"
+          echo "cloudflared procs:"; pgrep -a cloudflared
+          echo "local health: $(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:2580/v1/health)"
+          echo "public health: $(curl -s -o /dev/null -w '%{http_code}' -m 15 https://ntfy-alerts.clixen.app/v1/health)"
+          echo "listen: $(ss -tlnp 2>/dev/null | grep 2580)"
