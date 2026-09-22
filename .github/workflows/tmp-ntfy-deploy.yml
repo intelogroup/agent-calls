@@ -12,7 +12,7 @@ jobs:
         run: |
           set -e
           if ! command -v ntfy >/dev/null; then
-            TAG=$(curl -s -m 20 https://api.github.com/repos/binwiederhier/ntfy/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+            TAG=$(curl -s -m 20 https://api.github.com/repos/binwiederhier/ntfy/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
             echo "installing ntfy $TAG"
             curl -sL -m 120 -o /tmp/ntfy.tgz "https://github.com/binwiederhier/ntfy/releases/download/${TAG}/ntfy_${TAG#v}_linux_amd64.tar.gz"
             tar -tzf /tmp/ntfy.tgz
