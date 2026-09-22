@@ -67,10 +67,10 @@ jobs:
           fi
           TOPIC=$(sudo cat "$TOPIC_FILE")
           NTFY_USER=alerts
-          if ! sudo ntfy -c /etc/ntfy/server.yml user list 2>/dev/null | grep -q "^${NTFY_USER}$"; then
-            printf '%s\n%s\n' "$PW" "$PW" | sudo ntfy -c /etc/ntfy/server.yml user add "$NTFY_USER" >/dev/null
+          if ! sudo ntfy user list 2>/dev/null | grep -q "^${NTFY_USER}$"; then
+            printf '%s\n%s\n' "$PW" "$PW" | sudo ntfy user add "$NTFY_USER" >/dev/null
           fi
-          sudo ntfy -c /etc/ntfy/server.yml access "$NTFY_USER" "$TOPIC" read-write
+          sudo ntfy access "$NTFY_USER" "$TOPIC" read-write
           echo "topic=$TOPIC" | sudo tee /etc/ntfy/.topic_public >/dev/null
           sudo chmod 644 /etc/ntfy/.topic_public
           # Tunnel token from Actions secret (masked in logs), stored root-only.
