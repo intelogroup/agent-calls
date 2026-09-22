@@ -36,33 +36,28 @@ def md5(s):
 
 
 def parse_auth(header_value):
-    """Pull realm/nonce/qop out of a Digest challenge header."""
-    params = {}
-    for k in ("realm", "nonce", "qop", "algorithm"):
-        m = re.search(k + r'="([^"]+)"', header_value)
-        if m:
-            params[k] = m.group(1)
+    """Pull Digest challenge params. Mirrors sip_call.py's parse_challenge."""
+    params = dict(re.findall(r'(\w+)="([^"]*)"', header_value))
     return params
 
 
-def auth_header(challenge, method, uri):
+def auth_header(challenge, method, uri, proxy_auth):
+    """Build the auth header. Mirrors sip_call.py's auth_header exactly."""
     p = parse_auth(challenge)
-    realm, nonce = p.get("realm", ""), p.get("nonce", "")
-    qop = p.get("qop", "")
+    realm, nonce = p["realm"], p["nonce"]
+    qop = p.get("qop", "auth").split(",")[0].strip()
+    nc, cnonce = "00000001", rnd(8)
     ha1 = md5(f"{USER}:{realm}:{PASS}")
     ha2 = md5(f"{method}:{uri}")
-    if qop:
-        cnonce, nc = rnd(8), "00000001"
-        resp = md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
-        return (f'Digest username="{USER}", realm="{realm}", nonce="{nonce}", '
-                f'uri="{uri}", response="{resp}", algorithm=MD5, '
-                f'cnonce="{cnonce}", nc={nc}, qop={qop}')
-    resp = md5(f"{ha1}:{nonce}:{ha2}")
-    return (f'Digest username="{USER}", realm="{realm}", nonce="{nonce}", '
-            f'uri="{uri}", response="{resp}", algorithm=MD5')
+    resp = md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+    hdr = "Proxy-Authorization" if proxy_auth else "Authorization"
+    return (f'{hdr}: Digest username="{USER}", realm="{realm}", nonce="{nonce}", '
+            f'uri="{uri}", response="{resp}", algorithm=MD5, '
+            f'cnonce="{cnonce}", opaque="{p.get("opaque", "")}", '
+            f'qop={qop}, nc={nc}')
 
 
-def build_options(dest, aor, auth_value=None, proxy_auth=False):
+def build_options(dest, aor, auth_value=None):
     branch, callid, tag = "z9hG4bK" + rnd(12), rnd(16), rnd(8)
     lines = [
         f"OPTIONS {dest} SIP/2.0",
@@ -76,8 +71,7 @@ def build_options(dest, aor, auth_value=None, proxy_auth=False):
         "User-Agent: predial-check/1.0",
     ]
     if auth_value:
-        hdr = "Proxy-Authorization" if proxy_auth else "Authorization"
-        lines.append(f"{hdr}: {auth_value}")
+        lines.append(auth_value)
     lines += ["Content-Length: 0", "", ""]
     return "\r\n".join(lines), callid
 
@@ -121,8 +115,8 @@ def probe_once(dest, aor):
     code, first, challenge, proxy = status_and_challenge(raw)
     print("raw:", first, flush=True)
     if code in (401, 407) and challenge and USER and PASS:
-        auth = auth_header(challenge, "OPTIONS", dest)
-        msg2, _ = build_options(dest, aor, auth, proxy_auth=proxy)
+        auth = auth_header(challenge, "OPTIONS", dest, proxy_auth=proxy)
+        msg2, _ = build_options(dest, aor, auth)
         raw2 = transact(msg2)
         code2, first2, _, _ = status_and_challenge(raw2)
         print("authed raw:", first2, flush=True)
