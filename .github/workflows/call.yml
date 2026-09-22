@@ -96,14 +96,6 @@ jobs:
               print("UDP_NO_RESPONSE")
           EOF
 
-      - name: SIP TCP probe (raw REGISTER)
-        env:
-          SIP_USER: ${{ secrets.SIP_USERNAME }}
-          SIP_PROBE_PASS: ${{ secrets.SIP_PASSWORD }}
-        run: |
-          set +x
-          python3 scripts/sip_probe.py "$SIP_USER" || true
-
       - name: Configure baresip
         env:
           SIP_USER: ${{ secrets.SIP_USERNAME }}
