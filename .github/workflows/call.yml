@@ -115,7 +115,7 @@ jobs:
             config/baresip.conf > ~/.baresip/config
           grep -E '^(module_path|module|audio_source|log_level|sip_listen)' ~/.baresip/config
 
-      - name: Pre-dial callee check (fail fast if phone not registered)
+      - name: Pre-dial callee check (advisory only — push wakes sleeping phones)
         env:
           SIP_CHECK_USER: ${{ secrets.SIP_USERNAME }}
           SIP_CHECK_PASS: ${{ secrets.SIP_PASSWORD }}
@@ -126,8 +126,8 @@ jobs:
           rc=$?
           if [ "$rc" -eq 1 ]; then
             echo "CALLEE_NOT_REGISTERED: $DEST has no live SIP binding at sip.linphone.org."
-            echo "Open Linphone on the phone, confirm the account shows connected, then retry."
-            exit 1
+            echo "Proceeding anyway: a sleeping iOS client has no live binding by design;"
+            echo "the proxy will push-wake the phone on INVITE (PushKit -> CallKit)."
           elif [ "$rc" -eq 2 ]; then
             echo "WARNING: callee check inconclusive, proceeding with the call attempt."
           else
