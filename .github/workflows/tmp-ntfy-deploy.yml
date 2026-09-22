@@ -41,18 +41,14 @@ jobs:
           behind-proxy: true
           upstream-base-url: "https://ntfy.sh"
           cache-file: "/var/lib/ntfy/cache.db"
-          auth-file: "/etc/ntfy/auth.db"
+          auth-file: "/var/lib/ntfy/auth.db"
           auth-default-access: "deny-all"
           EOF
-          sudo chmod 644 /etc/ntfy/server.yml  # readable by ntfy service user; holds no secrets
+          sudo chmod 644 /etc/ntfy/server.yml
           if ! id ntfy >/dev/null 2>&1; then
             sudo useradd --system --no-create-home --shell /usr/sbin/nologin ntfy
           fi
           sudo chown -R ntfy:ntfy /var/lib/ntfy /var/cache/ntfy
-          # ntfy user CLI runs as root; auth.db must be writable by both root (CLI) and ntfy (server)
-          sudo touch /etc/ntfy/auth.db
-          sudo chown ntfy:root /etc/ntfy/auth.db
-          sudo chmod 660 /etc/ntfy/auth.db
 
       - name: Write tunnel token file
         run: |
@@ -94,7 +90,7 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable --now ntfy.service
           sudo systemctl enable --now cloudflared-ntfy.service
-          sleep 4
+          sleep 6
           sudo systemctl is-active ntfy.service
           sudo systemctl is-active cloudflared-ntfy.service
           echo "--- cloudflared processes (livekit tunnel untouched) ---"
