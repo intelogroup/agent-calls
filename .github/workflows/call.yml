@@ -96,14 +96,6 @@ jobs:
               print("UDP_NO_RESPONSE")
           EOF
 
-      - name: SIP TCP probe (raw REGISTER)
-        env:
-          SIP_USER: ${{ secrets.SIP_USERNAME }}
-          SIP_PROBE_PASS: ${{ secrets.SIP_PASSWORD }}
-        run: |
-          set +x
-          python3 scripts/sip_probe.py "$SIP_USER" || true
-
       - name: Configure baresip
         env:
           SIP_USER: ${{ secrets.SIP_USERNAME }}
@@ -122,6 +114,25 @@ jobs:
           sed -e "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" -e "s|__MODPATH__|$MODPATH|g" \
             config/baresip.conf > ~/.baresip/config
           grep -E '^(module_path|module|audio_source|log_level|sip_listen)' ~/.baresip/config
+
+      - name: Pre-dial callee check (fail fast if phone not registered)
+        env:
+          SIP_CHECK_USER: ${{ secrets.SIP_USERNAME }}
+          SIP_CHECK_PASS: ${{ secrets.SIP_PASSWORD }}
+        run: |
+          set +e  # handle the verdict code ourselves
+          DEST="$(cat /tmp/dest.txt)"
+          python3 scripts/options_check.py "$DEST"
+          rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "CALLEE_NOT_REGISTERED: $DEST has no live SIP binding at sip.linphone.org."
+            echo "Open Linphone on the phone, confirm the account shows connected, then retry."
+            exit 1
+          elif [ "$rc" -eq 2 ]; then
+            echo "WARNING: callee check inconclusive, proceeding with the call attempt."
+          else
+            echo "Callee registered, proceeding with the call."
+          fi
 
       - name: Place call and play message (python SIP client)
         env:
