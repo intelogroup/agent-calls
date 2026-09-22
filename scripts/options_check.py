@@ -2,14 +2,15 @@
 """Pre-dial callee registration check over TCP (digest-authenticated).
 
 Sends SIP OPTIONS to the destination AOR and reports whether the callee
-has a live binding at the proxy. Lets the workflow fail fast -- before
-the expensive TTS/call attempt -- when the phone is not registered.
+has a live binding at the proxy. ADVISORY ONLY: the workflow proceeds
+regardless of the verdict, because a sleeping iOS client has no live
+binding by design -- the proxy push-wakes it (PushKit -> CallKit) when
+the INVITE arrives.
 
 Usage: options_check.py <dest_uri>   (e.g. sip:intelogroup@sip.linphone.org)
 Auth (optional but recommended): SIP_CHECK_USER / SIP_CHECK_PASS env vars.
   Without auth the proxy may 407 the probe, which yields UNKNOWN.
-Exit codes: 0 = REGISTERED (proceed), 1 = NOT_REGISTERED (abort),
-            2 = UNKNOWN (proceed with warning).
+Exit codes: 0 = REGISTERED, 1 = NOT_REGISTERED, 2 = UNKNOWN.
 """
 import hashlib
 import os
