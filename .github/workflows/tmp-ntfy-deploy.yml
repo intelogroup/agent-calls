@@ -22,12 +22,12 @@ jobs:
             echo "installing ntfy $TAG"
             curl -sL -m 180 -o /tmp/ntfy.tgz "https://github.com/binwiederhier/ntfy/releases/download/${TAG}/ntfy_${TAG#v}_linux_amd64.tar.gz"
             gzip -t /tmp/ntfy.tgz && echo "tarball integrity ok"
-            tar -tzf /tmp/ntfy.tgz
             tar -xzf /tmp/ntfy.tgz -C /tmp
             BIN=$(find /tmp -maxdepth 3 -name ntfy -type f | head -1)
             echo "binary at $BIN"
             sudo install -m 0755 "$BIN" /usr/local/bin/ntfy
-            rm -f /tmp/ntfy.tgz /tmp/ntfy
+            rm -f /tmp/ntfy.tgz
+            rm -rf /tmp/ntfy_2*
           fi
           ntfy --version
 
@@ -49,34 +49,17 @@ jobs:
             sudo useradd --system --no-create-home --shell /usr/sbin/nologin ntfy
           fi
           sudo chown -R ntfy:ntfy /var/lib/ntfy /var/cache/ntfy
+          # ntfy user CLI runs as root; auth.db must be writable by both root (CLI) and ntfy (server)
+          sudo touch /etc/ntfy/auth.db
+          sudo chown ntfy:root /etc/ntfy/auth.db
+          sudo chmod 660 /etc/ntfy/auth.db
 
-      - name: Create ntfy user, topic grant, tunnel token file
+      - name: Write tunnel token file
         run: |
           set -e
-          # Password generated on-VM, stored root-only, never printed.
-          PW_FILE=/etc/ntfy/.pw
-          if [ ! -f "$PW_FILE" ]; then
-            openssl rand -hex 24 | sudo tee "$PW_FILE" >/dev/null
-            sudo chmod 600 "$PW_FILE"
-          fi
-          PW=$(sudo cat "$PW_FILE")
-          TOPIC_FILE=/etc/ntfy/.topic
-          if [ ! -f "$TOPIC_FILE" ]; then
-            printf 'money-emergencies-%s' "$(openssl rand -hex 4)" | sudo tee "$TOPIC_FILE" >/dev/null
-            sudo chmod 600 "$TOPIC_FILE"
-          fi
-          TOPIC=$(sudo cat "$TOPIC_FILE")
-          NTFY_USER=alerts
-          if ! sudo ntfy user list 2>/dev/null | grep -q "^${NTFY_USER}$"; then
-            printf '%s\n%s\n' "$PW" "$PW" | sudo ntfy user add "$NTFY_USER" >/dev/null
-          fi
-          sudo ntfy access "$NTFY_USER" "$TOPIC" read-write
-          echo "topic=$TOPIC" | sudo tee /etc/ntfy/.topic_public >/dev/null
-          sudo chmod 644 /etc/ntfy/.topic_public
-          # Tunnel token from Actions secret (masked in logs), stored root-only.
           printf '%s' '${{ secrets.NTFY_TUNNEL_TOKEN }}' | sudo tee /etc/cloudflared/ntfy-token >/dev/null
           sudo chmod 600 /etc/cloudflared/ntfy-token
-          echo "ntfy user + access configured; token file written"
+          echo "token file written"
 
       - name: Install systemd units and start
         run: |
@@ -114,8 +97,39 @@ jobs:
           sleep 4
           sudo systemctl is-active ntfy.service
           sudo systemctl is-active cloudflared-ntfy.service
-          echo "--- existing livekit tunnel untouched ---"
+          echo "--- cloudflared processes (livekit tunnel untouched) ---"
           pgrep -a cloudflared
+
+      - name: Create ntfy user and topic grant
+        run: |
+          set -e
+          # Password generated on-VM, stored root-only, never printed.
+          PW_FILE=/etc/ntfy/.pw
+          if [ ! -f "$PW_FILE" ]; then
+            openssl rand -hex 24 | sudo tee "$PW_FILE" >/dev/null
+            sudo chmod 600 "$PW_FILE"
+          fi
+          PW=$(sudo cat "$PW_FILE")
+          TOPIC_FILE=/etc/ntfy/.topic
+          if [ ! -f "$TOPIC_FILE" ]; then
+            printf 'money-emergencies-%s' "$(openssl rand -hex 4)" | sudo tee "$TOPIC_FILE" >/dev/null
+            sudo chmod 600 "$TOPIC_FILE"
+          fi
+          TOPIC=$(sudo cat "$TOPIC_FILE")
+          NTFY_USER=alerts
+          if ! sudo ntfy user list 2>/dev/null | grep -q "^${NTFY_USER}$"; then
+            printf '%s\n%s\n' "$PW" "$PW" | sudo ntfy user add "$NTFY_USER" >/dev/null
+            echo "user created"
+          else
+            echo "user already exists"
+          fi
+          sudo ntfy access "$NTFY_USER" "$TOPIC" read-write
+          echo "topic=$TOPIC" | sudo tee /etc/ntfy/.topic_public >/dev/null
+          sudo chmod 644 /etc/ntfy/.topic_public
+          sudo systemctl restart ntfy.service
+          sleep 3
+          sudo systemctl is-active ntfy.service
+          echo "auth configured"
 
       - name: Verify auth behavior locally
         run: |
