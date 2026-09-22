@@ -59,15 +59,18 @@ def auth_header(challenge, method, uri, proxy_auth):
 
 def build_options(dest, aor, auth_value=None):
     branch, callid, tag = "z9hG4bK" + rnd(12), rnd(16), rnd(8)
+    # From must be the authenticated account: Flexisip 403s probes whose
+    # From URI is not a real local user.
+    from_uri = f"sip:{USER}@{DOMAIN}" if USER else f"sip:predial-check@{DOMAIN}"
     lines = [
         f"OPTIONS {dest} SIP/2.0",
         f"Via: SIP/2.0/TCP 10.9.9.9:5060;branch={branch};rport",
         "Max-Forwards: 70",
-        f"From: <sip:predial-check@{DOMAIN}>;tag={tag}",
+        f"From: <{from_uri}>;tag={tag}",
         f"To: <sip:{aor}>",
         f"Call-ID: {callid}",
         "CSeq: 1 OPTIONS",
-        "Contact: <sip:predial-check@10.9.9.9:5060;transport=tcp>",
+        f"Contact: <{from_uri}>;transport=tcp",
         "User-Agent: predial-check/1.0",
     ]
     if auth_value:
