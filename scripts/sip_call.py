@@ -273,24 +273,73 @@ for ln in sdp.split("\r\n"):
 print(f"RTP_SOCK_BOUND: {rtp_sock.getsockname()}", flush=True)
 t0 = time.time()
 cseq = request("INVITE", DEST, body=sdp)
-# wait for final response, tolerating 100/180 provisionals
+# Wait for a final response, tolerating 100/180 provisionals.
+# Push-binding gate (2026-09-25): the proxy can only wake a sleeping phone if
+# it holds a push-token binding for the callee, which it signals with
+# "110 Push sent" (RFC 8599) ~100ms after 100 Trying on the authed INVITE.
+# No 110 within PUSH_WAIT_S of 100 Trying means no binding exists, so no
+# INVITE can ever wake the phone -- fail fast with exit code 2 and an
+# actionable verdict instead of burning 50s on the inevitable 408 timeout.
+PUSH_WAIT_S = 3.0
 final = None
+authed_cseq = None   # CSeq of the digest-authed INVITE
+trying_at = None     # when 100 Trying arrived for the authed INVITE
+saw_push_sent = False
 end = time.time() + 60
 while time.time() < end:
-    resp = wait_response(cseq, timeout=max(0.5, end - time.time()))
+    # Poll in short slices while inside the push-watch window so we can bail
+    # the moment it closes without a 110.
+    timeout = max(0.5, end - time.time())
+    if trying_at is not None and not saw_push_sent:
+        timeout = min(timeout, 0.5)
+    resp = wait_response(cseq, timeout=timeout)
     if resp is None:
-        break
+        if (trying_at is not None and not saw_push_sent
+                and time.time() - trying_at >= PUSH_WAIT_S):
+            break  # push window closed with no 110 -> verdict below
+        continue
     first, headers, body = resp
     code = int(first.split()[1])
     print("invite response:", first.split(" ", 2)[1], first.split(" ", 2)[2] if len(first.split(" ", 2)) > 2 else "", flush=True)
     if code in (401, 407):
         chal = parse_challenge(resp)
         cseq = request("INVITE", DEST, body=sdp, auth_params=chal)
+        authed_cseq = cseq
+        trying_at = None
+        saw_push_sent = False
         continue
     if code < 200:
+        if code == 100 and authed_cseq is not None and trying_at is None:
+            trying_at = time.time()
+        elif code == 110:
+            saw_push_sent = True
+            print("PUSH_SENT: proxy fired a push notification to wake the callee", flush=True)
         continue
     final = resp
     break
+
+if trying_at is not None and not saw_push_sent and final is None:
+    print("VERDICT: NO_PUSH_BINDING", flush=True)
+    print(f"NO_PUSH_BINDING: {DEST} has no push-token binding at the proxy, so the",
+          flush=True)
+    print("proxy cannot wake the phone. Open Linphone on the phone to re-register,",
+          flush=True)
+    print("then retry the call.", flush=True)
+    # CANCEL the outstanding INVITE (same CSeq number per RFC 3261) so the
+    # proxy stops hunting for an unreachable callee. Exit 2 lets the workflow
+    # tell "phone unwakeable" apart from other call failures.
+    stack.send(
+        f"CANCEL {DEST} SIP/2.0\r\n"
+        f"Via: SIP/2.0/TCP {LOCAL_IP}:5060;branch=z9hG4bK{rnd(12)};rport\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:{USER}@{DOMAIN}>;tag={from_tag}\r\n"
+        f"To: <{DEST}>\r\n"
+        f"Call-ID: {request.call_id}\r\n"
+        f"CSeq: {authed_cseq} CANCEL\r\n"
+        f"Content-Length: 0\r\n\r\n")
+    print("CANCEL_SENT", flush=True)
+    stack.close()
+    sys.exit(2)
 
 if final is None or int(final[0].split()[1]) >= 300:
     print("INVITE_FAILED")

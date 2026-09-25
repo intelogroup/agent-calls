@@ -126,8 +126,10 @@ jobs:
           rc=$?
           if [ "$rc" -eq 1 ]; then
             echo "CALLEE_NOT_REGISTERED: $DEST has no live SIP binding at sip.linphone.org."
-            echo "Proceeding anyway: a sleeping iOS client has no live binding by design;"
-            echo "the proxy will push-wake the phone on INVITE (PushKit -> CallKit)."
+            echo "Proceeding anyway: a sleeping iOS client has no live binding by design."
+            echo "Whether the phone can be woken depends on the proxy still holding a"
+            echo "push-token binding for it -- the INVITE step verifies this via the"
+            echo "'110 Push sent' response and fails fast if it is absent."
           elif [ "$rc" -eq 2 ]; then
             echo "WARNING: callee check inconclusive, proceeding with the call attempt."
           else
@@ -138,10 +140,20 @@ jobs:
         env:
           SIP_USER: ${{ secrets.SIP_USERNAME }}
           SIP_CALL_PASS: ${{ secrets.SIP_PASSWORD }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
         run: |
           set +x  # never trace credentials
+          set +e  # handle the verdict code ourselves
           DEST="$(cat /tmp/dest.txt)"
           python3 scripts/sip_call.py "$SIP_USER" "$DEST" "$GITHUB_WORKSPACE/message-8k.wav" 2>&1 | tee sip-call.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::NO_PUSH_BINDING: the proxy holds no push-token binding for $DEST, so the phone cannot be woken. Open Linphone on the phone to re-register, then retry."
+            if [ -n "$NTFY_URL" ]; then
+              curl -sS -m 10 -d "Linphone push binding expired -- open Linphone to re-register so voice calls can reach the phone." "$NTFY_URL" || true
+            fi
+            exit 2
+          fi
           grep -q "CALL_ESTABLISHED" sip-call.log
 
       - name: Upload call logs

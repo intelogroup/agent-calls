@@ -4,8 +4,10 @@
 Sends SIP OPTIONS to the destination AOR and reports whether the callee
 has a live binding at the proxy. ADVISORY ONLY: the workflow proceeds
 regardless of the verdict, because a sleeping iOS client has no live
-binding by design -- the proxy push-wakes it (PushKit -> CallKit) when
-the INVITE arrives.
+binding by design. NOTE: a sleeping client is wakeable ONLY if the proxy
+still holds a push-token binding for it -- the INVITE step verifies this
+via the "110 Push sent" (RFC 8599) response and fails fast (exit 2,
+NO_PUSH_BINDING) when the binding is gone.
 
 Usage: options_check.py <dest_uri>   (e.g. sip:intelogroup@sip.linphone.org)
 Auth (optional but recommended): SIP_CHECK_USER / SIP_CHECK_PASS env vars.
