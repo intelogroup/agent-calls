@@ -1,0 +1,11 @@
+name: "(temporary) read full livekit.yaml"
+on:
+  workflow_dispatch:
+jobs:
+  read:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Read livekit.yaml turn section
+        run: |
+          sudo cat /opt/agent/livekit.yaml | sed -E 's/(api_key|api_secret|secret|password)(: *).*/\1\2<redacted>/i' | head -60
