@@ -1,0 +1,15 @@
+name: "(temporary) stop oracle jett-proxy"
+on:
+  workflow_dispatch:
+jobs:
+  stop:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Stop jett-proxy worker
+        run: |
+          set -x
+          systemctl list-units --type=service --state=running | grep -i -E "jett|livekit" || echo "no match in running units"
+          sudo systemctl stop jett-proxy 2>&1 || echo "stop jett-proxy failed"
+          sleep 2
+          systemctl is-active jett-proxy && echo "STILL_ACTIVE" || echo "STOPPED"
