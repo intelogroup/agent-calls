@@ -1,0 +1,27 @@
+name: "(temporary) grant Jim SSH access"
+on:
+  workflow_dispatch:
+jobs:
+  grant:
+    runs-on: [self-hosted, oracle, voice]
+    timeout-minutes: 5
+    steps:
+      - name: Install Jim's public key for ubuntu
+        run: |
+          set -euo pipefail
+          PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHbNStgfINnFsx0coKUn9ZheFsjyB6FoctIL0ZrgOQC1 kalinovdameus@Kalinovs-MacBook-Air.local'
+          case "$PUBKEY" in
+            ssh-ed25519\ AAAA*) echo "key format OK" ;;
+            *) echo "BAD KEY FORMAT"; exit 1 ;;
+          esac
+          sudo mkdir -p /home/ubuntu/.ssh
+          if sudo grep -qF "$PUBKEY" /home/ubuntu/.ssh/authorized_keys 2>/dev/null; then
+            echo "key already present"
+          else
+            echo "$PUBKEY" | sudo tee -a /home/ubuntu/.ssh/authorized_keys > /dev/null
+            echo "key installed"
+          fi
+          sudo chmod 700 /home/ubuntu/.ssh
+          sudo chmod 600 /home/ubuntu/.ssh/authorized_keys
+          sudo chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+          echo "done"
