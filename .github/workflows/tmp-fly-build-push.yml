@@ -1,0 +1,29 @@
+name: "(temporary) build jett-voice image"
+on:
+  workflow_dispatch:
+    inputs:
+      fly_token:
+        description: "Fly API token (transient, revoked after use)"
+        required: true
+      tag:
+        description: "image tag"
+        required: true
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/fly-build
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Build and push to Fly registry
+        env:
+          FLY_API_TOKEN: ${{ inputs.fly_token }}
+        run: |
+          set -euo pipefail
+          flyctl auth docker
+          docker build -t registry.fly.io/jett-voice:${{ inputs.tag }} .
+          docker push registry.fly.io/jett-voice:${{ inputs.tag }}
+          echo "pushed registry.fly.io/jett-voice:${{ inputs.tag }}"
