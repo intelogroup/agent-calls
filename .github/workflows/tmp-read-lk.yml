@@ -1,0 +1,12 @@
+name: "(temporary) read livekit.yaml"
+on:
+  workflow_dispatch:
+jobs:
+  read:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Read livekit.yaml (redacted)
+        run: |
+          set -x
+          sudo cat /opt/agent/livekit.yaml | sed -E 's/(api_key|api_secret|key|secret)(: *).*/\1\2<redacted>/i'
