@@ -1,0 +1,14 @@
+name: "(temporary) dump firewall"
+on:
+  workflow_dispatch:
+jobs:
+  dump:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Dump full INPUT chain
+        run: |
+          set -x
+          sudo iptables -L INPUT -n -v --line-numbers | head -30
+          echo "--- fail2ban ---"
+          sudo iptables -L f2b-sshd -n --line-numbers 2>/dev/null | head -5 || echo "no f2b chain"
