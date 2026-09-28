@@ -1,0 +1,16 @@
+name: "(temporary) check 7880 firewall"
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Check iptables and listening socket
+        run: |
+          set -x
+          sudo iptables -L INPUT -n --line-numbers | grep -E "7880|REJECT" | head -10
+          echo "---"
+          ss -tlnp | grep 7880 || echo "nothing listening on 7880"
+          echo "---"
+          curl -s --max-time 5 http://127.0.0.1:7880/ -o /dev/null -w "%{http_code}\n" || echo "local 7880 refused"
