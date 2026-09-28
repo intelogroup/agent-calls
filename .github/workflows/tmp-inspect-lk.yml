@@ -1,0 +1,17 @@
+name: "(temporary) inspect livekit config"
+on:
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Inspect LiveKit server config and services
+        run: |
+          set -x
+          ls /opt/livekit/ 2>/dev/null || echo "no /opt/livekit"
+          find / -maxdepth 4 -name "livekit.yaml" 2>/dev/null | head -3
+          systemctl list-units --type=service --state=running | grep -i -E "livekit|sip|jett" || true
+          echo "--- oci cli ---"
+          which oci || echo "no oci cli on oracle"
+          ls ~/.oci/ 2>/dev/null || echo "no ~/.oci on oracle"
