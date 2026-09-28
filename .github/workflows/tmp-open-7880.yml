@@ -1,0 +1,27 @@
+name: "(temporary) open livekit 7880 for fly"
+on:
+  workflow_dispatch:
+jobs:
+  open-firewall:
+    runs-on: [self-hosted, oracle]
+    steps:
+      - name: Open TCP 7880 for Fly agent
+        run: |
+          set -euo pipefail
+          # Check current rules
+          sudo iptables -L INPUT -n --line-numbers | grep 7880 || echo "7880 not in rules"
+          # Insert ACCEPT for TCP 7880 (LiveKit) before the REJECT
+          # Find the REJECT line number
+          REJECT_LINE=$(sudo iptables -L INPUT -n --line-numbers | grep "REJECT" | head -1 | awk '{print $1}')
+          if [ -n "$REJECT_LINE" ]; then
+            sudo iptables -I INPUT $REJECT_LINE -p tcp --dport 7880 -j ACCEPT
+            echo "Inserted ACCEPT for TCP 7880 at line $REJECT_LINE"
+          else
+            sudo iptables -A INPUT -p tcp --dport 7880 -j ACCEPT
+            echo "Appended ACCEPT for TCP 7880"
+          fi
+          # Verify
+          sudo iptables -L INPUT -n --line-numbers | grep 7880
+          # Persist
+          sudo netfilter-persistent save || sudo iptables-save | sudo tee /etc/iptables/rules.v4
+          echo "Firewall updated"
