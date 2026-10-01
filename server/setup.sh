@@ -1,5 +1,5 @@
 #!/bin/bash
-# Provision the voice-agent VM (Ubuntu 24.04) as Jett's inbound voice proxy.
+# Provision the voice VM (Ubuntu 24.04) as Jett's SIP/RTP + prerecorded-call box.
 # Run as root (or with sudo). Idempotent: safe to re-run.
 #
 # Stack:
@@ -8,7 +8,12 @@
 #   redis-server    (shared bus for the above)
 #   python venv: livekit-agents, livekit-api, faster-whisper (tiny.en),
 #                kokoro-onnx (no torch — onnxruntime only)
-#   systemd units: livekit-server, livekit-sip, jett-proxy (the voice worker)
+#   systemd units: livekit-server, livekit-sip
+#
+# NOTE (2026-09-30): the interactive LiveKit agent worker (jett-proxy)
+# moved to Fly — Oracle keeps SIP/RTP + prerecorded calls only. Any
+# leftover jett-proxy systemd unit from the old layout is stopped,
+# disabled, and removed below.
 #
 # No local LLM anywhere: the brain is OpenRouter (model meta/muse-spark-1.3;
 # key arrives later as OPENROUTER_API_KEY, Meta direct as optional fallback).
@@ -246,7 +251,11 @@ chmod +x $AGENT_DIR/line-health.sh 2>/dev/null \
 echo OK
 
 echo "== systemd units =="
-cp $AGENT_DIR/jett-proxy.service /etc/systemd/system/jett-proxy.service
+# Remove the retired interactive-worker unit (moved to Fly 2026-09-30).
+# Idempotent: no-ops when the unit is already gone.
+systemctl stop jett-proxy.service 2>/dev/null || true
+systemctl disable jett-proxy.service 2>/dev/null || true
+rm -f /etc/systemd/system/jett-proxy.service
 cat > /etc/systemd/system/livekit-server.service <<EOF
 [Unit]
 Description=LiveKit server (voice SFU)
@@ -280,7 +289,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable livekit-server livekit-sip jett-proxy.service redis-server
+systemctl enable livekit-server livekit-sip redis-server
 echo OK
 
 echo

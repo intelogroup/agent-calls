@@ -131,11 +131,14 @@ jobs:
       - name: Restart services and show status
         timeout-minutes: 5
         run: |
+          # NOTE (2026-09-30): jett-proxy (interactive agent worker) moved to
+          # Fly — Oracle keeps SIP/RTP + prerecorded calls only. setup.sh
+          # already stopped/disabled/removed the old jett-proxy unit.
           ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'sudo systemctl restart redis-server livekit-server livekit-sip jett-proxy.service'
+            'sudo systemctl restart redis-server livekit-server livekit-sip'
           sleep 20
           ssh -i ~/.ssh/vm_key $SSH_OPTS "$VM_USER@$VM_HOST" \
-            'for s in redis-server livekit-server livekit-sip jett-proxy; do printf "%-14s %s\n" "$s" "$(sudo systemctl is-active $s)"; done; echo "--- jett-proxy logs ---"; sudo journalctl -u jett-proxy.service --no-pager -n 30'
+            'for s in redis-server livekit-server livekit-sip; do printf "%-14s %s\n" "$s" "$(sudo systemctl is-active $s)"; done; echo "--- jett-proxy unit state (expect: not-found) ---"; sudo systemctl is-active jett-proxy 2>&1 || true'
 
       - name: Create SIP trunk + dispatch rule
         timeout-minutes: 5

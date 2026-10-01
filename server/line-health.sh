@@ -1,12 +1,15 @@
 #!/bin/bash
-# Line-health check for Jett's voice proxy. Runs ON the VM (as root).
+# Line-health check for Jett's voice line. Runs ON the VM (as root).
 #
 # Checks every bottleneck in the inbound path:
-#   1. services active: redis-server, livekit-server, livekit-sip, jett-proxy
+#   1. services active: redis-server, livekit-server, livekit-sip
 #   2. SIP listeners: UDP 5060 and TCP 5060 bound (ss)
 #   3. SIP trunk 'jett' + dispatch rule 'jett' exist (LiveKit API,
 #      same patterns as setup-sip.py)
 #   4. brain resolves (imports live_agent.resolve_brain, like verify-brain.sh)
+#
+# NOTE (2026-09-30): the interactive worker (jett-proxy) moved to Fly;
+# Oracle keeps SIP/RTP + prerecorded calls only, so it is NOT checked here.
 #
 # Prints PASS/FAIL per check. Exits 0 only if all pass; on any FAIL exits
 # nonzero — each FAIL line is a one-line reason.
@@ -21,7 +24,7 @@ pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAIL=1; }
 
 echo "== services =="
-for s in redis-server livekit-server livekit-sip jett-proxy; do
+for s in redis-server livekit-server livekit-sip; do
   if [ "$(systemctl is-active "$s" 2>/dev/null)" = "active" ]; then
     pass "service $s active"
   else

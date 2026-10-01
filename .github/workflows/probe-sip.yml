@@ -1,4 +1,4 @@
-# Probe SIP reachability for Jett's voice line.
+# Probe SIP reachability for Jett's voice line (Oracle prerecorded-call path).
 #
 # Runs every 30 minutes (plus manually). ANY probe failure makes the run
 # fail loudly (nonzero exit) so a dead line is visible as a failed Actions
@@ -10,7 +10,11 @@
 #      this is the exact "no ring" bottleneck hit 2026-09-18)
 #   2. TCP 5060 answers a SIP OPTIONS
 #   3. livekit-sip is actually bound on UDP+TCP 5060 on the VM (ss)
-#   4. livekit-sip + jett-proxy services are active
+#   4. livekit-sip service is active
+#
+# NOTE (2026-09-30): the interactive LiveKit agent worker (jett-proxy)
+# moved off Oracle to Fly — Oracle keeps SIP/RTP + prerecorded calls only.
+# The probe intentionally does NOT check jett-proxy on the VM anymore.
 name: Probe SIP reachability
 on:
   workflow_dispatch:
@@ -111,6 +115,5 @@ jobs:
              sudo ss -uln | grep -q ":5060 " || { echo "FAIL: nothing bound on UDP 5060"; fail=1; }
              sudo ss -tln | grep -q ":5060 " || { echo "FAIL: nothing bound on TCP 5060"; fail=1; }
              [ "$(sudo systemctl is-active livekit-sip 2>/dev/null)" = "active" ] || { echo "FAIL: livekit-sip not active"; fail=1; }
-             [ "$(sudo systemctl is-active jett-proxy 2>/dev/null)" = "active" ] || { echo "FAIL: jett-proxy not active"; fail=1; }
              if [ "$fail" = 0 ]; then echo "VM LISTENER CHECKS: PASS"; else echo "VM LISTENER CHECKS: FAIL"; fi
              exit $fail'

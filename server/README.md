@@ -1,6 +1,10 @@
-# Jett's voice proxy — call Jett anytime
+# Jett's voice line — Oracle SIP/RTP + prerecorded calls
 
-One SIP line, one worker. Dial `sip:jett@129.159.189.244` and talk to
+> **2026-09-30:** the interactive voice worker (`jett-proxy`) moved to Fly —
+> the Oracle free tier was never a fit for the agent call. This box keeps
+> SIP/RTP (`livekit-server`, `livekit-sip`) and prerecorded calls only.
+
+One SIP line. Dial `sip:jett@129.159.189.244` and talk to
 Jett's voice proxy: real-time voice (LiveKit handles VAD / barge-in /
 turn-taking), a free OpenRouter brain (`openrouter/free` router, switchable via `JETT_BRAIN_MODEL`)
 briefed on Jett's notes (`JETT.md`), and a
@@ -27,7 +31,6 @@ which drops the question into the private `intelogroup/agent-call-bus` repo
 - `live_agent.py` — the proxy worker. Loads repo-root `JETT.md` as its brief.
 - `setup.sh` — provisioning: binaries, venv, models, systemd units, bus key.
 - `setup-sip.py` — idempotent SIP trunk + dispatch rule creation.
-- `jett-proxy.service` — systemd unit for the worker.
 - `requirements.txt` — python deps.
 - `agent.env.example` — config template.
 - `sip_server.py` — **RETIRED / superseded.** The old DIY half-duplex
@@ -56,7 +59,7 @@ SIP-only setup.
 
 ## Logs
 
-`journalctl -u jett-proxy.service -f`, `journalctl -u livekit-sip.service -f`.
+`journalctl -u livekit-sip.service -f`, `journalctl -u livekit-server.service -f`.
 
 ## Post-deploy checklist (operator)
 
@@ -71,8 +74,8 @@ SIP-only setup.
    resolves the brain from the worker module and does a free
    `GET /v1/models` auth check — no tokens burned). Until then the worker
    answers calls with a spoken "brain not connected" notice — never silence.
-3. **Verify**: `systemctl is-active` on redis/livekit-server/livekit-sip/
-   jett-proxy; place a test call to `sip:jett@129.159.189.244` from Linphone
+3. **Verify**: `systemctl is-active` on redis/livekit-server/livekit-sip;
+   place a test call to `sip:jett@129.159.189.244` from Linphone
    on cellular data (hospital Wi-Fi blocks UDP media — see root README).
 4. **Consult test**: ask something only Jett would know; watch
    `calls/live/<call-id>/in.jsonl` appear in agent-call-bus; reply in
