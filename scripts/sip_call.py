@@ -146,6 +146,7 @@ def request(method, uri, headers_extra="", body="", auth_params=None, to_tag=Non
             to_uri=None):
     stack.cseq += 1
     branch = "z9hG4bK" + rnd(12)
+    request.last_branch = branch  # CANCEL must reuse the INVITE's branch (RFC 3261 9.1)
     call_id = request.call_id
     to_line = f"To: <{to_uri or uri}>" + (f";tag={to_tag}" if to_tag else "")
     msg = (f"{method} {uri} SIP/2.0\r\n"
@@ -241,6 +242,37 @@ def stun_public_ip(server="stun.l.google.com", port=19302, timeout=5):
     raise RuntimeError("no XOR-MAPPED-ADDRESS in STUN response")
 
 
+def transact(method, uri, headers_extra="", body="", timeout=15, to_tag=None,
+             to_uri=None):
+    """Send a request and wait for its final response (one digest-auth retry).
+
+    Restored 2026-10-05: the 2026-09-25 push-binding refactor deleted this
+    helper but the BYE path still calls it -> NameError after every
+    successful call (BYE never sent, script exits 1 with a traceback).
+    """
+    cseq = request(method, uri, headers_extra, body, to_tag=to_tag, to_uri=to_uri)
+    end = time.time() + timeout
+    while time.time() < end:
+        resp = wait_response(cseq, max(0.1, end - time.time()))
+        if resp is None:
+            continue
+        first, headers, _ = resp
+        code = int(first.split()[1])
+        if code < 200:
+            continue  # provisional (e.g. 100 Trying on BYE); keep waiting
+        if code in (401, 407):
+            chal = parse_challenge(resp)
+            cseq = request(method, uri, headers_extra, body, auth_params=chal,
+                           to_tag=to_tag, to_uri=to_uri)
+            resp = wait_response(cseq, timeout)
+            if resp is None:
+                return None, None
+            first, headers, _ = resp
+            code = int(first.split()[1])
+        return code, resp
+    return None, None
+
+
 # ---------------------------------------------------------------- 1. PUBLIC IP via STUN (no REGISTER)
 print("== STUN ==", flush=True)
 try:
@@ -330,7 +362,7 @@ if trying_at is not None and not saw_push_sent and final is None:
     # tell "phone unwakeable" apart from other call failures.
     stack.send(
         f"CANCEL {DEST} SIP/2.0\r\n"
-        f"Via: SIP/2.0/TCP {LOCAL_IP}:5060;branch=z9hG4bK{rnd(12)};rport\r\n"
+        f"Via: SIP/2.0/TCP {LOCAL_IP}:5060;branch={request.last_branch};rport\r\n"
         f"Max-Forwards: 70\r\n"
         f"From: <sip:{USER}@{DOMAIN}>;tag={from_tag}\r\n"
         f"To: <{DEST}>\r\n"
