@@ -1,0 +1,27 @@
+name: SIP dry-test
+
+# Regression suite for scripts/sip_call.py. Runs against a local mock SIP
+# proxy -- no real calls are placed, no credentials needed.
+on:
+  push:
+    paths:
+      - 'scripts/**'
+  pull_request:
+    paths:
+      - 'scripts/**'
+  workflow_dispatch:
+
+jobs:
+  drytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg (8kHz test wav)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Run sip_call.py regression dry-test
+        run: python3 scripts/tests/test_sip_call.py
