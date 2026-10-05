@@ -26,6 +26,22 @@ REALM = "127.0.0.1"
 
 events = []
 ev_lock = threading.Lock()
+rtp_stats = {"packets": 0, "bad_pt": 0, "first": None}
+rtp_done_emitted = False
+
+
+def emit_rtp_done():
+    """Record the final RTP summary exactly once (dialog may end before the
+    listener's recv timeout fires)."""
+    global rtp_done_emitted
+    with ev_lock:
+        if rtp_done_emitted:
+            return
+        rtp_done_emitted = True
+        events.append({"kind": "rtp_done", "t": round(time.time(), 3),
+                       "packets": rtp_stats["packets"],
+                       "bad_pt": rtp_stats["bad_pt"],
+                       "first": rtp_stats["first"]})
 
 
 def ev(**kw):
@@ -205,6 +221,7 @@ def handle(conn):
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
         ev(kind="conn_error", err=str(e))
     finally:
+        emit_rtp_done()  # dialog over: freeze the RTP counters now
         try:
             conn.close()
         except OSError:
@@ -216,21 +233,20 @@ def handle(conn):
 
 def rtp_loop(sock):
     sock.settimeout(5)
-    n = 0
-    bad_pt = 0
     try:
         while True:
             data, _ = sock.recvfrom(2048)
             pt = data[1] & 0x7F if len(data) > 1 else -1
             if pt != 0:
-                bad_pt += 1
-            n += 1
-            if n == 1:
+                rtp_stats["bad_pt"] += 1
+            rtp_stats["packets"] += 1
+            if rtp_stats["first"] is None:
+                rtp_stats["first"] = {"size": len(data), "pt": pt}
                 ev(kind="rtp_first", size=len(data), pt=pt)
     except socket.timeout:
         pass
     finally:
-        ev(kind="rtp_done", packets=n, bad_pt=bad_pt)
+        emit_rtp_done()
         sock.close()
 
 

@@ -70,9 +70,10 @@ def make_test_copy(src):
 def make_wav():
     wav = os.path.join(TESTDIR, "test-8k.wav")
     if not os.path.exists(wav):
+        # 2s -> 200 RTP packets (2 plays x 100), comfortably above the >100 bar
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
-             "-i", "sine=frequency=440:duration=1",
+             "-i", "sine=frequency=440:duration=2",
              "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", wav],
             check=True)
     return wav
