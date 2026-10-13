@@ -1,0 +1,21 @@
+name: "(temporary) check jett-voice worker on oracle"
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Check tunnel logins and LiveKit worker registration
+        run: |
+          set -x
+          echo "--- sshd accepted publickey (last 10) ---"
+          sudo grep -a "Accepted publickey" /var/log/auth.log 2>/dev/null | tail -10 || true
+          echo "--- livekit services ---"
+          systemctl list-units --type=service --state=running | grep -i -E "livekit|sip|jett" || true
+          echo "--- livekit journal: worker lines (last 40 min) ---"
+          for svc in livekit livekit-server jett-livekit; do
+            sudo journalctl -u "$svc" --since "-40 min" --no-pager 2>/dev/null | grep -i -E "worker|agent" | tail -15 || true
+          done
+          echo "--- established ssh tunnel connections ---"
+          ss -tnp 2>/dev/null | grep -E ":22|:7880|:7881" | head -10 || true
