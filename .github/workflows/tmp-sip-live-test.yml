@@ -31,12 +31,12 @@ jobs:
           sed -e "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" -e "s|__MODPATH__|$MODPATH|g" \
               -e 's|^sip_listen.*|sip_listen\t\t0.0.0.0:5090|' \
             config/baresip.conf > ~/.baresip/config
-          grep -E '^(module_path|audio_source|audio_player|sip_listen)' ~/.baresip/config
+          printf 'video_enabled\t\tno\nlog_level\t\t2\n' >> ~/.baresip/config
+          grep -E '^(module_path|audio_source|audio_player|sip_listen|video_enabled)' ~/.baresip/config
       - name: Place test call to the live agent
         run: |
           rm -f rec.wav
-          ( sleep 3; echo 'dial sip:jett@127.0.0.1'; sleep 75; echo 'hangup'; sleep 3; echo 'quit' ) \
-            | timeout 110 baresip 2>&1 | tee baresip.log
+          ( sleep 100 ) | timeout 105 baresip -e 'dial sip:jett@127.0.0.1' 2>&1 | tee baresip.log
           echo '--- key lines ---'
           grep -aiE 'call|established|sip:|200|4[0-9][0-9]|5[0-9][0-9]|error|fail' baresip.log | head -30 || true
           ls -la rec.wav || echo 'NO rec.wav'
