@@ -1323,8 +1323,9 @@ class CallRelay:
                     continue
                 if obj.get("answered_by") != "jett-runtime":
                     log.warning("consult %s answered_by=%r (expected "
-                                "'jett-runtime')", req_id[:8],
-                                obj.get("answered_by"))
+                                "'jett-runtime') — not speaking",
+                                req_id[:8], obj.get("answered_by"))
+                    continue
                 answers.append((req_id, answer))
             out_path = os.path.join(BUS_DIR, self._live_rel, "out.jsonl")
             try:
