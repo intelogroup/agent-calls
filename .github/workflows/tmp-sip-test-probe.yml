@@ -1,0 +1,23 @@
+name: tmp-sip-test-probe
+on:
+  workflow_dispatch: {}
+jobs:
+  probe:
+    runs-on: [self-hosted, oracle]
+    steps:
+      - name: Units and SIP listeners
+        run: |
+          systemctl list-units --type=service --no-pager | grep -iE 'livekit|sip' || true
+          ss -lntup 2>/dev/null | grep -E '5060|7880|7881' || sudo ss -lntup | grep -E '5060|7880|7881' || true
+      - name: Worker registration in LiveKit journal (last 60 min)
+        run: |
+          for u in livekit-server livekit livekit-sip; do
+            echo "== unit: $u"
+            journalctl -u "$u" --since '-60 min' --no-pager 2>/dev/null | grep -iE 'worker|jett-proxy|AW_' | tail -6 || true
+          done
+      - name: SIP client tooling available
+        run: |
+          for b in pjsua baresip sipp lk livekit-cli ffmpeg espeak-ng espeak python3; do
+            printf '%s: ' "$b"; command -v "$b" || echo MISSING
+          done
+          python3 -c "import livekit; print('py-livekit OK', livekit.__version__)" 2>&1 | head -1 || true
