@@ -104,6 +104,12 @@ else:
 # max_tokens floor: free models blanked on tiny budgets in testing. This is a
 # floor, not a suggestion — resolve_brain() enforces >= 300 on every turn.
 BRAIN_MAX_TOKENS = max(300, int(os.environ.get("BRAIN_MAX_TOKENS", "300")))
+# Per-model wall-clock cap for one brain attempt. Healthy models answer in
+# 3-5s; a reasoning model once took 111.7s (2026-10-13 sandbox test), which
+# on a phone call is two minutes of dead air. Past the cap the attempt counts
+# as failed and the chain advances; if every model caps out, the guaranteed
+# fallback line still speaks. Override with BRAIN_MODEL_TIMEOUT_S.
+BRAIN_MODEL_TIMEOUT_S = float(os.environ.get("BRAIN_MODEL_TIMEOUT_S", "25"))
 # Spoken when every model returns empty output. Dead air is never acceptable.
 FALLBACK_LINE = (
     "Sorry — my brain came back empty just now. "
@@ -509,6 +515,15 @@ def _maybe_relay(chat_ctx: llm.ChatContext, text: str) -> str:
     if out is None:
         return text
     name, output = out.name, (out.output or "")
+    if output.lstrip().startswith("ERROR"):
+        # A raw tool/framework error (missing arg, exception text) is not
+        # Jett's words and not synced facts — never relay it literally as
+        # "Jett says: ...". The model's honest draft stands. (Observed
+        # 2026-10-13: "Jett says: ERROR TypeError: consult_jett() missing
+        # 1 required positional argument: 'context'".)
+        log.warning("relay guard: tool %s returned an error; keeping "
+                    "model draft instead of relaying it", name)
+        return text
     if name == "consult_jett":
         if output.startswith(("ERROR_CANT_REACH_JETT", "FILED_ASYNC")):
             return text  # honest proxy message, not Jett's words
@@ -538,8 +553,9 @@ class ResilientLLM(llm.LLM):
     """llm.LLM with per-model empty-output retry and relay post-processing.
 
     chat() returns a stream whose _run() drains each model in
-    JETT_BRAIN_MODELS in order: on empty content (or error) it advances to
-    the next model, backing off exponentially on rate limits. When the turn
+    JETT_BRAIN_MODELS in order: on empty content (or error, or the
+    BRAIN_MODEL_TIMEOUT_S per-model cap) it advances to the next model,
+    backing off exponentially on rate limits. When the turn
     relays a consult_jett/local_facts tool result, the finished text is
     rewritten through the relay guards (attribution + number validation).
     If every model comes back empty, a guaranteed fallback line is spoken —
@@ -623,7 +639,22 @@ class ResilientLLM(llm.LLM):
                     extra_kwargs=ctx._extra_kwargs,
                     **ctx._extra_kw,
                 )
-                chunks, text, has_tools = await _drain(stream)
+                chunks, text, has_tools = await asyncio.wait_for(
+                    _drain(stream), timeout=BRAIN_MODEL_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                dt = time.monotonic() - t0
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+                log_event("brain_attempt", model=model,
+                          latency_s=round(dt, 2), outcome="timeout",
+                          timeout_s=BRAIN_MODEL_TIMEOUT_S,
+                          fallback_to=models[i + 1] if i + 1 < len(models) else None)
+                log.warning("brain chat: model=%s timed out (%.0fs cap); "
+                            "trying next model", model, BRAIN_MODEL_TIMEOUT_S)
+                empty_retries += 1
+                continue
             except Exception as e:
                 dt = time.monotonic() - t0
                 if _is_rate_limit(e):
