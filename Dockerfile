@@ -42,9 +42,16 @@ RUN mkdir -p /opt/agent/models && \
       https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx && \
     curl -fL --retry 3 -o /opt/agent/models/voices-v1.0.bin \
       https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin && \
-    python3 -c "from faster_whisper import WhisperModel; \
+    for i in 1 2 3 4 5 6; do \
+      python3 -c "from faster_whisper import WhisperModel; \
 WhisperModel('tiny.en', device='cpu', compute_type='int8'); \
-print('whisper tiny.en cached')" && \
+print('whisper tiny.en cached')" && break; \
+      echo "whisper download attempt $i failed (HF 429?); retrying in 30s"; \
+      sleep 30; \
+    done; \
+    HF_HUB_OFFLINE=1 python3 -c "from faster_whisper import WhisperModel; \
+WhisperModel('tiny.en', device='cpu', compute_type='int8'); \
+print('whisper tiny.en verified from cache')" && \
     python3 -c "from kokoro_onnx import Kokoro; \
 Kokoro('/opt/agent/models/kokoro-v1.0.int8.onnx', '/opt/agent/models/voices-v1.0.bin'); \
 print('kokoro warmup OK')"
