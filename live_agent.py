@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -956,40 +957,103 @@ async def _git(args: list[str], cwd: str = BUS_DIR) -> tuple[int, str]:
     return await loop.run_in_executor(None, _run)
 
 
-async def _bus_ensure() -> bool:
-    """Clone the bus repo if missing. Returns True if usable.
+def _clear_stale_git_locks(max_age_s: float = 30.0) -> int:
+    """Remove orphaned *.lock files under the bus clone's .git.
 
-    Graceful when the VM deploy key hasn't been added to
-    intelogroup/agent-call-bus yet — consults then report unreachable
-    instead of crashing the call.
+    A git subprocess killed mid-write leaves index.lock behind and every
+    later git command fails until it is removed. Locks younger than
+    max_age_s may belong to a live operation and are left alone."""
+    gitdir = os.path.join(BUS_DIR, ".git")
+    removed = 0
+    if not os.path.isdir(gitdir):
+        return 0
+    now = time.time()
+    for root, _dirs, files in os.walk(gitdir):
+        for name in files:
+            if not name.endswith(".lock"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if now - os.path.getmtime(path) > max_age_s:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+    if removed:
+        log_event("bus_locks_swept", removed=removed)
+    return removed
+
+
+async def _bus_ensure() -> bool:
+    """Make sure the bus clone exists and git can read it. Returns True
+    if usable.
+
+    Self-healing (added 2026-10-13 after a mid-call consult died with
+    bus_ensure_failed at 19:01Z — the clone was momentarily unusable and
+    the old code gave up instantly): verify the cached clone with a cheap
+    rev-parse; on any failure sweep stale locks, quarantine the broken
+    clone, and re-clone with one retry before declaring the bus down.
+    Graceful when the deploy key hasn't been added yet — consults then
+    report unreachable instead of crashing the call.
     """
-    if os.path.isdir(os.path.join(BUS_DIR, ".git")):
-        log_event("bus_status", available=True, action="cached")
-        return True
-    try:
-        os.makedirs(BUS_DIR, exist_ok=True)
-        rc, out = await _git(["clone", BUS_REPO_SSH, BUS_DIR], cwd="/tmp")
-        if rc != 0:
-            log_event("bus_status", available=False, reason="clone_failed",
-                      detail=out[-150:])
-            log.warning("bus clone failed: %s", out[-300:])
-            return False
-        await _git(["config", "user.email", "jett-proxy@129.159.189.244"])
-        await _git(["config", "user.name", "jett-proxy"])
-        log_event("bus_status", available=True, action="cloned")
-        log.info("bus repo cloned")
-        return True
-    except Exception as e:
-        log_event("bus_status", available=False, reason="exception",
-                  error=str(e)[:120])
-        log.warning("bus ensure failed: %s", e)
-        return False
+    gitdir = os.path.join(BUS_DIR, ".git")
+    if os.path.isdir(gitdir):
+        _clear_stale_git_locks()
+        rc, _out = await _git(["rev-parse", "--git-dir"])
+        if rc == 0:
+            log_event("bus_status", available=True, action="cached")
+            return True
+        log_event("bus_status", available=False, action="repair",
+                  reason="rev_parse_failed")
+    async with _BUS_LOCK:
+        # re-check under the lock: another task may have repaired it
+        if os.path.isdir(gitdir):
+            rc, _out = await _git(["rev-parse", "--git-dir"])
+            if rc == 0:
+                log_event("bus_status", available=True, action="cached")
+                return True
+        # Clone is missing or unreadable: quarantine whatever is there
+        # (git clone refuses a non-empty target) and re-clone fresh.
+        if os.path.isdir(BUS_DIR):
+            broken = f"{BUS_DIR}.broken-{int(time.time())}"
+            try:
+                os.rename(BUS_DIR, broken)
+                log_event("bus_quarantine", path=broken)
+            except OSError as e:
+                log.warning("bus quarantine failed: %s", e)
+                return False
+        for attempt in (1, 2):
+            try:
+                os.makedirs(BUS_DIR, exist_ok=True)
+                rc, out = await _git(["clone", BUS_REPO_SSH, BUS_DIR],
+                                     cwd="/tmp")
+                if rc == 0:
+                    await _git(["config", "user.email",
+                                "jett-proxy@129.159.189.244"])
+                    await _git(["config", "user.name", "jett-proxy"])
+                    log_event("bus_status", available=True,
+                              action="cloned", attempt=attempt)
+                    log.info("bus repo cloned (attempt %d)", attempt)
+                    return True
+                log_event("bus_status", available=False,
+                          reason="clone_failed", attempt=attempt,
+                          detail=out[-150:])
+                log.warning("bus clone failed: %s", out[-300:])
+            except Exception as e:
+                log_event("bus_status", available=False,
+                          reason="exception", attempt=attempt,
+                          error=str(e)[:120])
+                log.warning("bus ensure failed: %s", e)
+            if attempt == 1:
+                await asyncio.sleep(2)
+    return False
 
 
 async def _bus_write_push_locked(relpath: str, obj: dict, msg: str) -> bool:
     """Write one JSON file into the bus repo and push immediately
     (protocol: commit + push, batch window <= 3 s).
     Caller MUST hold _BUS_LOCK (see _bus_write_push)."""
+    _clear_stale_git_locks()
     try:
         full = os.path.join(BUS_DIR, relpath)
         os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -1032,6 +1096,7 @@ async def _bus_append_lines(relpath: str, lines: list[str], msg: str) -> bool:
     the next flush (a rare double-push failure can duplicate lines —
     readers dedupe by ts+role+text)."""
     async with _BUS_LOCK:
+        _clear_stale_git_locks()
         try:
             full = os.path.join(BUS_DIR, relpath)
             os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -1092,15 +1157,26 @@ async def _bus_poll_response(req_id: str,
 
 async def file_consult_request(question: str,
                                priority: str = "normal") -> tuple[str, dict]:
-    """File a consult to Jett's async judgment queue.
+    """File a consult to Jett's judgment queue.
 
     Returns (status, payload):
       "unreachable" — bus repo unusable; payload {"error": ...}
       "filed"       — request pushed; payload {"request": req_obj}
-    The caller (consult_jett tool) then polls for a live answer; on timeout
-    the filed request is picked up by Jett's 5-minute watcher and the answer
-    is delivered afterward (voice callback / WhatsApp).
+    One transient bus failure must not kill a handoff (observed
+    2026-10-13 19:01Z: a consult died on a momentary bus_ensure_failed):
+    the ensure+file sequence is retried once after a short pause, with
+    the self-healing _bus_ensure in between.
     """
+    result = await _file_consult_once(question, priority)
+    if result[0] == "filed":
+        return result
+    log_event("consult_retry", reason=result[1].get("error", "?"))
+    await asyncio.sleep(3)
+    return await _file_consult_once(question, priority)
+
+
+async def _file_consult_once(question: str,
+                             priority: str = "normal") -> tuple[str, dict]:
     if not await _bus_ensure():
         log_event("consult_unreachable", reason="bus_ensure_failed")
         return ("unreachable",
