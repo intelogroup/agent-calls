@@ -5,9 +5,13 @@ jobs:
   j:
     runs-on: [self-hosted, oracle]
     steps:
-      - name: SIP and LiveKit journals since 18:38 UTC
+      - name: Journals and log config for the 18:47-18:53 window
         run: |
-          echo '===== livekit-sip ====='
-          journalctl -u livekit-sip --since '2026-10-13 18:38:00' --no-pager 2>/dev/null | tail -60
-          echo '===== livekit-server (jett rooms) ====='
-          journalctl -u livekit-server --since '2026-10-13 18:38:00' --no-pager 2>/dev/null | grep -aiE 'jett|sip|participant|room' | tail -40
+          systemctl cat livekit-server livekit-sip 2>/dev/null | grep -iE 'ExecStart|StandardOutput|StandardError' || true
+          ls -la /var/log/ | grep -iE 'livekit|sip' || echo 'no livekit log files in /var/log'
+          echo '===== livekit-sip 18:47-18:53 (unfiltered tail) ====='
+          journalctl -u livekit-sip --since '2026-10-13 18:47:00' --until '2026-10-13 18:53:30' --no-pager 2>/dev/null | tail -30
+          echo '===== livekit-server 18:47-18:53 room/participant lines ====='
+          journalctl -u livekit-server --since '2026-10-13 18:47:00' --until '2026-10-13 18:53:30' --no-pager 2>/dev/null | grep -aiE 'room|participant|jett|sip' | tail -30
+          echo '===== livekit-server total lines in window ====='
+          journalctl -u livekit-server --since '2026-10-13 18:47:00' --until '2026-10-13 18:53:30' --no-pager 2>/dev/null | wc -l
