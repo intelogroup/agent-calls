@@ -1,0 +1,20 @@
+# PROPOSED production config for the durable voice-worker image.
+# Derived from ~/workspace/jett-voice-image/fly.toml (dry-test) and
+# ~/workspace/fly-voice/fly.toml (Sep 28 prod). NOT yet applied.
+app = "jett-voice"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AGENT_DIR = "/opt/agent"
+  # No DRY_TEST here: production mode. Worker uses LIVEKIT_URL and
+  # TUNNEL_SSH_KEY from Fly secrets on the jett-voice app.
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+
+auto_stop_machines = false
+auto_start_machines = true
