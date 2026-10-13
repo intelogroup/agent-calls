@@ -36,7 +36,7 @@ jobs:
       - name: Place test call to the live agent
         run: |
           rm -f rec.wav
-          ( sleep 100 ) | timeout 105 baresip -e 'dial sip:jett@127.0.0.1' 2>&1 | tee baresip.log
+          ( sleep 100 ) | timeout 105 baresip -e '/dial sip:jett@127.0.0.1' 2>&1 | tee baresip.log
           echo '--- key lines ---'
           grep -aiE 'call|established|sip:|200|4[0-9][0-9]|5[0-9][0-9]|error|fail' baresip.log | head -30 || true
           ls -la rec.wav || echo 'NO rec.wav'
