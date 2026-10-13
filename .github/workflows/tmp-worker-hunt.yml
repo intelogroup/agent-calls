@@ -1,0 +1,14 @@
+name: tmp-worker-hunt
+on:
+  workflow_dispatch: {}
+jobs:
+  h:
+    runs-on: [self-hosted, oracle]
+    steps:
+      - name: Find every agent worker process on this VM
+        run: |
+          systemctl list-units --type=service --no-pager | grep -aiE 'jett|agent|proxy|python' || echo 'no matching units'
+          echo '--- processes ---'
+          ps aux | grep -aE 'live_agent|jett|python3' | grep -av grep || echo 'no matching processes'
+          echo '--- journal hits for live_agent/worker today ---'
+          journalctl --since '2026-10-13 18:40:00' --no-pager 2>/dev/null | grep -aiE 'jett-proxy|registered worker|session started' | tail -10 || echo 'none'
