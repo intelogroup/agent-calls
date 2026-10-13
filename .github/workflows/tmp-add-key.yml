@@ -9,7 +9,7 @@ jobs:
       - name: Add Fly tunnel public key to ubuntu user
         run: |
           set -x
-          PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDpEU1aiGqvTUO/F8u0dIHgzeEd05lel6bCCKtVZtAHG root@185777d4a263d8"
+          PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDHDIJw1gQIMS6VLGthkdeTigmzPamCkc7BWKoFq3B3W jett-voice-tunnel-2026-10-13"
           sudo -u ubuntu mkdir -p /home/ubuntu/.ssh
           sudo -u ubuntu chmod 700 /home/ubuntu/.ssh
           echo "$PUBKEY" | sudo -u ubuntu tee -a /home/ubuntu/.ssh/authorized_keys > /dev/null
