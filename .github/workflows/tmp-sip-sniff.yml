@@ -1,0 +1,17 @@
+name: tmp-sip-sniff
+on:
+  workflow_dispatch: {}
+jobs:
+  sniff:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Watch port 5060 for 110 seconds
+        run: |
+          if ! command -v tcpdump >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq tcpdump || echo 'tcpdump install failed'
+          fi
+          date -u +'sniff window opens %H:%M:%S UTC'
+          sudo timeout 110 tcpdump -ni any 'udp port 5060 or tcp port 5060' -c 60 -tttt 2>&1 | \
+            grep -aE 'IP |INVITE|SIP' | head -60 || true
+          date -u +'sniff window closed %H:%M:%S UTC'
