@@ -1,0 +1,70 @@
+name: tmp-sip-live-test
+on:
+  workflow_dispatch: {}
+jobs:
+  call:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools present
+        run: command -v baresip && command -v espeak-ng && command -v ffmpeg && echo TOOLS_OK
+      - name: Build caller utterance (Kokoro, espeak fallback)
+        run: |
+          MSG='Hello Jett, this is a test call. Can you hear me clearly? Please tell me what time it is in Boston right now.'
+          if python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "$MSG"; then
+            echo "kokoro utterance OK"
+          else
+            echo "kokoro failed; espeak fallback"
+            espeak-ng -v en-us -s 140 -w message.wav "$MSG"
+          fi
+          ffmpeg -y -loglevel error -i message.wav -ar 8000 -ac 1 -c:a pcm_s16le msg8k.wav
+          ffmpeg -y -loglevel error -i msg8k.wav -af "adelay=7000|7000,apad=whole_dur=18" -ar 8000 -ac 1 message-8k.wav
+          ffprobe -v error -show_entries format=duration -of csv=p=0 message-8k.wav
+      - name: Configure baresip (local account, listen 5090)
+        run: |
+          mkdir -p ~/.baresip && chmod 700 ~/.baresip
+          printf '<sip:tester@127.0.0.1>;regint=0\n' > ~/.baresip/accounts
+          chmod 600 ~/.baresip/accounts
+          MODPATH="$(dpkg -L baresip-core | grep '/stdio.so$' | xargs dirname)"
+          echo "module path: $MODPATH"
+          sed -e "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" -e "s|__MODPATH__|$MODPATH|g" \
+              -e 's|^sip_listen.*|sip_listen\t\t0.0.0.0:5090|' \
+            config/baresip.conf > ~/.baresip/config
+          grep -E '^(module_path|audio_source|audio_player|sip_listen)' ~/.baresip/config
+      - name: Place test call to the live agent
+        run: |
+          rm -f rec.wav
+          ( sleep 3; echo 'dial sip:jett@127.0.0.1'; sleep 75; echo 'hangup'; sleep 3; echo 'quit' ) \
+            | timeout 110 baresip 2>&1 | tee baresip.log
+          echo '--- key lines ---'
+          grep -aiE 'call|established|sip:|200|4[0-9][0-9]|5[0-9][0-9]|error|fail' baresip.log | head -30 || true
+          ls -la rec.wav || echo 'NO rec.wav'
+      - name: Transcribe what the agent said (faster-whisper tiny.en)
+        run: |
+          if [ -s rec.wav ]; then
+            python3 -m pip install -q --break-system-packages faster-whisper 2>&1 | tail -1 || true
+            python3 - <<'PY'
+          import subprocess
+          subprocess.run(['ffmpeg','-y','-loglevel','error','-i','rec.wav','-ar','16000','-ac','1','rec16k.wav'], check=True)
+          from faster_whisper import WhisperModel
+          m = WhisperModel('tiny.en', device='cpu', compute_type='int8')
+          segs, _ = m.transcribe('rec16k.wav')
+          print('=== AGENT AUDIO TRANSCRIPT ===')
+          for s in segs:
+              print(f'[{s.start:5.1f}-{s.end:5.1f}] {s.text}')
+          print('=== END TRANSCRIPT ===')
+          PY
+          else
+            echo 'no recording to transcribe'
+          fi
+      - name: Upload call artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sip-live-test
+          path: |
+            rec.wav
+            baresip.log
+            message-8k.wav
+          if-no-files-found: ignore
