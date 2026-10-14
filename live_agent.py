@@ -94,12 +94,14 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = "https://api.openai.com/v1"
-# Paid OpenAI brain (Jim, 2026-10-13): selected with JETT_BRAIN_PROVIDER=openai.
-# Probed 2026-10-13: gpt-4.1-mini TTFT 1.7-2.2s and consistent (no empties,
-# no stalls); gpt-4o-mini slower (2.9-3.4s) — kept as in-provider fallback.
+# Brain chain (Jim, 2026-10-13): paid OpenAI is the MAIN brain and
+# OpenRouter the fallback — ResilientLLM walks the OpenAI models first,
+# then the OpenRouter chain, then Meta direct. A provider with no key
+# set drops out of the chain. Full sweep 2026-10-13 (44 chat models,
+# proxy prompt): gpt-4.1-mini fastest complete reply (TTFT 0.91s,
+# total 1.01s); gpt-4o-mini fastest first token (0.84s).
 OPENAI_MODELS = [m.strip() for m in os.environ.get(
     "JETT_OPENAI_MODELS", "gpt-4.1-mini,gpt-4o-mini").split(",") if m.strip()]
-BRAIN_PROVIDER = os.environ.get("JETT_BRAIN_PROVIDER", "").strip().lower()
 # Brain model fallback chain (OpenRouter route:"fallback" tries them in order).
 # Override with JETT_BRAIN_MODELS (comma-sep); the legacy singular
 # JETT_BRAIN_MODEL still works as a one-model chain.
@@ -466,23 +468,28 @@ class Brain(NamedTuple):
     extra_body: dict
 
 
-def resolve_brain() -> Brain | None:
-    """Pick the LLM backend: OpenRouter first, Meta direct as fallback.
+def resolve_brains() -> list[Brain]:
+    """Build the brain chain (Jim, 2026-10-13): paid OpenAI main,
+    OpenRouter fallback, Meta direct last resort. ResilientLLM walks
+    the chain in order, across providers; a provider with no key
+    configured drops out (so without OPENAI_API_KEY on Fly the chain
+    is OpenRouter-only, exactly the pre-chain behavior).
 
-    Every OpenRouter turn carries max_tokens >= BRAIN_MAX_TOKENS (>= 300)
-    in extra_body — the floor is enforced here, not hoped for.
+    Every OpenRouter turn carries max_tokens >= BRAIN_MAX_TOKENS
+    (>= 300) in extra_body — the floor is enforced here, not hoped for.
     """
-    if BRAIN_PROVIDER == "openai" and OPENAI_API_KEY:
-        return Brain(
+    brains: list[Brain] = []
+    if OPENAI_API_KEY:
+        brains.append(Brain(
             label="openai",
             base_url=OPENAI_BASE_URL,
             api_key=OPENAI_API_KEY,
             model=OPENAI_MODELS[0],
             extra_headers={},
             extra_body={},
-        )
+        ))
     if OPENROUTER_API_KEY:
-        return Brain(
+        brains.append(Brain(
             label="openrouter",
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
@@ -496,17 +503,32 @@ def resolve_brain() -> Brain | None:
                 "route": "fallback",
                 "max_tokens": BRAIN_MAX_TOKENS,
             },
-        )
+        ))
     if META_API_KEY:
-        return Brain(
+        brains.append(Brain(
             label="meta-direct",
             base_url=META_BASE_URL,
             api_key=META_API_KEY,
             model=_discover_meta_model(),
             extra_headers={},
             extra_body={},
-        )
-    return None
+        ))
+    return brains
+
+
+def resolve_brain() -> Brain | None:
+    """Back-compat: the chain head, or None when no key is set."""
+    brains = resolve_brains()
+    return brains[0] if brains else None
+
+
+class ChainEntry(NamedTuple):
+    """One attempt in the cross-provider chain: a model on one brain,
+    plus the models that follow it within the same brain (the native
+    fallback list carried by OpenRouter attempts)."""
+    brain: Brain
+    model: str
+    remaining: list
 
 
 def _discover_meta_model() -> str:
@@ -618,8 +640,9 @@ class _ReplayStream(llm.LLMStream):
 class ResilientLLM(llm.LLM):
     """llm.LLM with per-model empty-output retry and relay post-processing.
 
-    chat() returns a stream whose _run() drains each model in
-    JETT_BRAIN_MODELS in order: on empty content (or error, or the
+    chat() returns a stream whose _run() walks the cross-provider
+    chain (OpenAI models, then OpenRouter, then Meta): on empty content
+    (or error, or the
     BRAIN_MODEL_TIMEOUT_S per-model cap) it advances to the next model,
     backing off exponentially on rate limits. When the turn
     relays a consult_jett/local_facts tool result, the finished text is
@@ -632,9 +655,12 @@ class ResilientLLM(llm.LLM):
     fallback flags are logged.
     """
 
-    def __init__(self, brain: Brain, _llm_factory=None) -> None:
+    def __init__(self, brains, _llm_factory=None) -> None:
         super().__init__()
-        self._brain = brain
+        if isinstance(brains, Brain):
+            brains = [brains]
+        self._brains = list(brains)
+        self._brain = self._brains[0]
         self._factory = _llm_factory or self._default_factory
 
     @property
@@ -643,24 +669,31 @@ class ResilientLLM(llm.LLM):
 
     @property
     def provider(self) -> str:
-        return "openrouter-resilient"
+        return "chain-resilient"
 
-    def _models(self) -> list[str]:
-        if self._brain.label == "openrouter":
-            return list(JETT_BRAIN_MODELS)
-        if self._brain.label == "openai":
-            return list(OPENAI_MODELS)
-        return [self._brain.model]
+    def _chain(self) -> list[ChainEntry]:
+        entries: list[ChainEntry] = []
+        for brain in self._brains:
+            if brain.label == "openrouter":
+                models = list(JETT_BRAIN_MODELS)
+            elif brain.label == "openai":
+                models = list(OPENAI_MODELS)
+            else:
+                models = [brain.model]
+            for i, m in enumerate(models):
+                entries.append(ChainEntry(brain, m, models[i + 1:]))
+        return entries
 
-    def _default_factory(self, model: str, remaining: list[str]):
+    def _default_factory(self, brain: Brain, model: str,
+                         remaining: list[str]):
         inner = openai_plugin.LLM(
             model=model,
-            api_key=self._brain.api_key,
-            base_url=self._brain.base_url,
-            extra_headers=self._brain.extra_headers
-            if self._brain.extra_headers else NOT_GIVEN,
+            api_key=brain.api_key,
+            base_url=brain.base_url,
+            extra_headers=brain.extra_headers
+            if brain.extra_headers else NOT_GIVEN,
             extra_body={
-                **(self._brain.extra_body or {}),
+                **(brain.extra_body or {}),
                 # OpenRouter-native fallback routing — only meaningful
                 # (and only accepted) on the OpenRouter endpoint itself.
                 # OpenRouter caps the native models array at 3 items; the
@@ -668,7 +701,7 @@ class ResilientLLM(llm.LLM):
                 # chain the uncapped array made EVERY first attempt fail
                 # with HTTP 400 — found in the mock-call logs 2026-10-13.)
                 **({"models": remaining[:3], "route": "fallback"}
-                   if self._brain.label == "openrouter" else {}),
+                   if brain.label == "openrouter" else {}),
                 "max_tokens": BRAIN_MAX_TOKENS,
             },
         )
@@ -698,12 +731,13 @@ class ResilientLLM(llm.LLM):
         )
 
     async def _attempt(self, ctx: "_ResilientStream") -> list:
-        models = self._models()
+        entries = self._chain()
         empty_retries = 0
-        for i, model in enumerate(models):
+        for i, entry in enumerate(entries):
+            brain, model = entry.brain, entry.model
             t0 = time.monotonic()
             try:
-                inner = self._factory(model, models[i:])
+                inner = self._factory(brain, model, entry.remaining)
                 stream = inner.chat(
                     chat_ctx=ctx._chat_ctx,
                     tools=ctx._tools or None,
@@ -724,7 +758,7 @@ class ResilientLLM(llm.LLM):
                 log_event("brain_attempt", model=model,
                           latency_s=round(dt, 2), outcome="timeout",
                           timeout_s=BRAIN_MODEL_TIMEOUT_S,
-                          fallback_to=models[i + 1] if i + 1 < len(models) else None)
+                          fallback_to=entries[i + 1].model if i + 1 < len(entries) else None)
                 log.warning("brain chat: model=%s timed out (%.0fs cap); "
                             "trying next model", model, BRAIN_MODEL_TIMEOUT_S)
                 empty_retries += 1
@@ -736,7 +770,7 @@ class ResilientLLM(llm.LLM):
                     log_event("brain_attempt", model=model,
                               latency_s=round(dt, 2), outcome="rate_limited",
                               backoff_s=round(delay, 1),
-                              fallback_to=models[i + 1] if i + 1 < len(models) else None)
+                              fallback_to=entries[i + 1].model if i + 1 < len(entries) else None)
                     log.warning("brain chat: model=%s rate-limited "
                                 "(%.1fs); backing off %.1fs then next model",
                                 model, dt, delay)
@@ -745,7 +779,7 @@ class ResilientLLM(llm.LLM):
                     log_event("brain_attempt", model=model,
                               latency_s=round(dt, 2), outcome="error",
                               error=str(e)[:120],
-                              fallback_to=models[i + 1] if i + 1 < len(models) else None)
+                              fallback_to=entries[i + 1].model if i + 1 < len(entries) else None)
                     log.warning("brain chat: model=%s errored (%.1fs): %.150s",
                                 model, dt, e)
                 empty_retries += 1
@@ -761,14 +795,14 @@ class ResilientLLM(llm.LLM):
             empty_retries += 1
             log_event("brain_attempt", model=model,
                       latency_s=round(dt, 2), outcome="empty",
-                      fallback_to=models[i + 1] if i + 1 < len(models) else None)
+                      fallback_to=entries[i + 1].model if i + 1 < len(entries) else None)
             log.warning("brain chat: model=%s empty content (%.1fs); "
                         "trying next model", model, dt)
         # every model empty/failed — guaranteed spoken fallback, never silence
-        log_event("brain_exhausted", models=len(models),
+        log_event("brain_exhausted", models=len(entries),
                   fallback_spoken=True)
         log.warning("brain chat: ALL %d models empty/failed; speaking fallback",
-                    len(models))
+                    len(entries))
         return [llm.ChatChunk(
             id=f"fallback-{uuid.uuid4().hex[:8]}",
             delta=llm.ChoiceDelta(content=FALLBACK_LINE, role="assistant"),
@@ -787,15 +821,16 @@ class ResilientLLM(llm.LLM):
         double-speak. The per-model cap applies to the wait for the
         first chunk, which is where the stalls live.
         """
-        models = self._models()
+        entries = self._chain()
         empty_retries = 0
-        for i, model in enumerate(models):
+        for i, entry in enumerate(entries):
+            brain, model = entry.brain, entry.model
             t0 = time.monotonic()
             yielded = False
             ttft = 0.0
             stream = None
             try:
-                inner = self._factory(model, models[i:])
+                inner = self._factory(brain, model, entry.remaining)
                 stream = inner.chat(
                     chat_ctx=ctx._chat_ctx,
                     tools=ctx._tools or None,
@@ -846,8 +881,8 @@ class ResilientLLM(llm.LLM):
                 log_event("brain_attempt", model=model,
                           latency_s=round(dt, 2),
                           outcome="timeout_first_token", stream=True,
-                          fallback_to=models[i + 1]
-                          if i + 1 < len(models) else None)
+                          fallback_to=entries[i + 1].model
+                          if i + 1 < len(entries) else None)
                 log.warning("brain chat (live): model=%s no first token "
                             "in %.0fs; trying next model",
                             model, BRAIN_MODEL_TIMEOUT_S)
@@ -868,8 +903,8 @@ class ResilientLLM(llm.LLM):
                               latency_s=round(dt, 2),
                               outcome="rate_limited", stream=True,
                               backoff_s=round(delay, 1),
-                              fallback_to=models[i + 1]
-                              if i + 1 < len(models) else None)
+                              fallback_to=entries[i + 1].model
+                              if i + 1 < len(entries) else None)
                     log.warning("brain chat (live): model=%s rate-limited "
                                 "(%.1fs); backing off %.1fs then next model",
                                 model, dt, delay)
@@ -878,8 +913,8 @@ class ResilientLLM(llm.LLM):
                     log_event("brain_attempt", model=model,
                               latency_s=round(dt, 2), outcome="error",
                               stream=True, error=str(e)[:120],
-                              fallback_to=models[i + 1]
-                              if i + 1 < len(models) else None)
+                              fallback_to=entries[i + 1].model
+                              if i + 1 < len(entries) else None)
                     log.warning("brain chat (live): model=%s errored "
                                 "(%.1fs): %.150s", model, dt, e)
                 empty_retries += 1
@@ -896,14 +931,14 @@ class ResilientLLM(llm.LLM):
             empty_retries += 1
             log_event("brain_attempt", model=model,
                       latency_s=round(dt, 2), outcome="empty", stream=True,
-                      fallback_to=models[i + 1]
-                      if i + 1 < len(models) else None)
+                      fallback_to=entries[i + 1].model
+                      if i + 1 < len(entries) else None)
             log.warning("brain chat (live): model=%s empty; trying next "
                         "model", model)
-        log_event("brain_exhausted", models=len(models),
+        log_event("brain_exhausted", models=len(entries),
                   fallback_spoken=True, stream=True)
         log.warning("brain chat (live): ALL %d models empty/failed; "
-                    "speaking fallback", len(models))
+                    "speaking fallback", len(entries))
         yield llm.ChatChunk(
             id=f"fallback-{uuid.uuid4().hex[:8]}",
             delta=llm.ChoiceDelta(content=FALLBACK_LINE, role="assistant"),
@@ -1715,18 +1750,17 @@ async def _run_no_brain(ctx: JobContext):
     await ctx.room.disconnect()
 
 
-async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
+async def _run_call(ctx: JobContext, brains: list, stats: dict):
     global _CURRENT_CALL_ID, _ACTIVE_RELAY
 
-    log.info("call brain: %s models=%s max_tokens=%s", brain.label,
-             brain.extra_body.get("models", brain.model),
-             brain.extra_body.get("max_tokens", "?"))
+    agent_llm = ResilientLLM(brains)
+    log.info("call brain chain: %s",
+             " -> ".join(f"{e.brain.label}:{e.model}"
+                         for e in agent_llm._chain()))
     stt_engine = WhisperSTT()
     stt_stream = stt.StreamAdapter(
         stt=stt_engine, vad=silero.VAD.load(min_silence_duration=0.35))
     tts_engine = KokoroTTS()
-
-    agent_llm = ResilientLLM(brain)
 
     brief = await load_brief_live()
     agent = Agent(
@@ -1860,11 +1894,11 @@ async def entrypoint(ctx: JobContext):
         log_event("call_start", call_id=call_id, room=ctx.room.name,
                   caller=caller)
         log.info("inbound call %s from %s", call_id, caller)
-        brain = resolve_brain()
-        if brain is not None:
-            log_event("brain_resolved", label=brain.label,
-                      model=brain.model, chain_len=len(JETT_BRAIN_MODELS))
-            await _run_call(ctx, brain, stats)
+        brains = resolve_brains()
+        if brains:
+            log_event("brain_resolved",
+                      chain=[f"{b.label}:{b.model}" for b in brains])
+            await _run_call(ctx, brains, stats)
         else:
             log_event("brain_missing")
             await _run_no_brain(ctx)
@@ -1887,7 +1921,8 @@ if __name__ == "__main__":
     if not (LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise SystemExit("LIVEKIT_API_KEY / LIVEKIT_API_SECRET are required")
     log_event("boot_config", agent=AGENT_NAME, livekit_url=LIVEKIT_URL,
-              brain_models=len(JETT_BRAIN_MODELS),
+              brain_models=len(JETT_BRAIN_MODELS)
+              + (len(OPENAI_MODELS) if OPENAI_API_KEY else 0),
               brain_max_tokens=BRAIN_MAX_TOKENS,
               consult_timeout_s=CONSULT_TIMEOUT_SEC,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
