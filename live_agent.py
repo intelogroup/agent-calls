@@ -1522,6 +1522,7 @@ class CallRelay:
         # confirmed; the spool file + marker are the recovery record.
         self._noted: dict[str, int] = {}
         self._pushed = 0
+        self._deferred: list[tuple[object, str, float]] = []
         self._stt_recent: list[tuple[float, str]] = []
         self._spool_path = os.path.join(TX_SPOOL_DIR, f"{call_id}.jsonl")
         self._marker_path = self._spool_path + ".pushed"
@@ -1564,6 +1565,7 @@ class CallRelay:
         and total failure is a LOUD event, never a silent re-buffer.
         Lines that still can't move stay in the on-disk spool for the
         next call's sweep."""
+        self._process_deferred()
         if not self._tx_buffer:
             return
         for attempt in (1, 2, 3):
@@ -1613,7 +1615,10 @@ class CallRelay:
             # already recorded — keep ONE copy (the STT line, with the
             # earlier timestamp). An item with no recent STT twin is
             # recorded normally, so no words are lost in either world.
-            if any(x == text and now - t <= 6.0
+            # Deferred items (streamed text that materialized late) get
+            # a longer twin window for the same check.
+            window = 25.0 if source == "deferred" else 6.0
+            if any(x == text and now - t <= window
                    for (t, x) in self._stt_recent):
                 return
         line = json.dumps(
@@ -1629,6 +1634,36 @@ class CallRelay:
                 f.write(line + "\n")
         except OSError:
             pass
+
+    def note_deferred(self, item, role: str) -> None:
+        """Park a conversation item whose text hasn't materialized yet.
+
+        Observed live 2026-10-14: on streamed turns the
+        conversation_item_added event can fire while the assistant
+        item's text_content is still empty (the reply is still
+        streaming in), so noting-or-dropping at event time loses the
+        proxy's half of the record. The item object is mutated as the
+        stream lands; _process_deferred re-reads it on later ticks and
+        notes the text when it appears."""
+        self._deferred.append((item, role, time.monotonic()))
+
+    def _process_deferred(self) -> None:
+        if not self._deferred:
+            return
+        now = time.monotonic()
+        keep: list[tuple[object, str, float]] = []
+        for item, role, t0 in self._deferred:
+            try:
+                text = (getattr(item, "text_content", "") or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                self.note_transcript(role, text, source="deferred")
+            elif now - t0 <= 25.0:
+                keep.append((item, role, t0))
+            # older than 25s with no text: the item never materialized;
+            # drop it (the STT source still covers Jim's side).
+        self._deferred = keep
 
     def _write_pushed_marker(self) -> None:
         try:
@@ -1745,6 +1780,7 @@ class CallRelay:
             log_event("relay_out_line", call_id=self.call_id,
                       text_len=len(text))
             await self._say(text)
+        self._process_deferred()
         if self._tx_buffer:
             # Flush EVERY tick, not at a 6-line threshold (2026-10-14
             # fix): short calls never reached the threshold, so their
@@ -1989,12 +2025,16 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict):
     def _on_conversation_item(ev) -> None:
         try:
             item = getattr(ev, "item", ev)
+            role = getattr(item, "role", "")
+            mapped = "jim" if role == "user" else "proxy"
             text = (getattr(item, "text_content", "") or "").strip()
             if not text:
+                # Streamed replies can fire this event before their
+                # text lands in the item — park it for the relay's
+                # deferred pass instead of dropping the line.
+                relay.note_deferred(item, mapped)
                 return
-            role = getattr(item, "role", "")
-            relay.note_transcript("jim" if role == "user" else "proxy",
-                                  text, source="item")
+            relay.note_transcript(mapped, text, source="item")
         except Exception:
             pass
 
