@@ -153,6 +153,13 @@ BUS_REPO_SSH = os.environ.get(
     "BUS_REPO_SSH", "git@github.com:intelogroup/agent-call-bus.git"
 )
 BUS_KEY = os.path.expanduser("~/.ssh/bus_key")
+# Durable on-machine spool for transcript lines (2026-10-14 fix): every
+# noted line is appended here synchronously, with a .pushed marker per
+# call counting the lines the bus has confirmed. A flush killed at
+# hangup (job teardown, deploy) no longer loses the words — the next
+# call's relay sweeps leftover spools to the bus.
+TX_SPOOL_DIR = os.environ.get(
+    "TX_SPOOL_DIR", os.path.join(AGENT_DIR, "tx-spool"))
 CONSULT_TIMEOUT_SEC = int(os.environ.get("CONSULT_TIMEOUT_SEC", "180"))
 # In-call relay: how often the background CallRelay polls the bus for
 # Jett's returned text while a call is live.
@@ -1306,20 +1313,39 @@ async def _bus_append_lines(relpath: str, lines: list[str], msg: str) -> bool:
         try:
             full = os.path.join(BUS_DIR, relpath)
             os.makedirs(os.path.dirname(full), exist_ok=True)
-            await _git(["pull", "--ff-only", "-q"])
-            with open(full, "a", encoding="utf-8") as f:
-                for ln in lines:
-                    f.write(ln + "\n")
+            # No pre-pull (2026-10-14 fix): the old `pull --ff-only`
+            # here was the one structural difference from the proven
+            # consult write path — on a diverged clone it failed
+            # silently (rc ignored) and poisoned the sequence. Mirror
+            # the proven path instead: append, commit, push, and let
+            # the rebase-retry absorb remote movement.
+            block = "".join(ln + "\n" for ln in lines)
+            already = False
+            try:
+                with open(full, encoding="utf-8") as f:
+                    already = f.read().endswith(block)
+            except OSError:
+                already = False
+            if not already:
+                # Idempotency guard: a previous attempt may have
+                # appended + committed these exact lines and only lost
+                # the push — re-appending would duplicate them on the
+                # bus. (Per-line timestamps make a false positive here
+                # negligible.)
+                with open(full, "a", encoding="utf-8") as f:
+                    f.write(block)
             if (await _git(["add", relpath]))[0] != 0:
                 return False
-            if (await _git(["commit", "-m", msg]))[0] != 0:
+            if (await _git(["commit", "-m", msg]))[0] != 0 \
+                    and not already:
                 return False
-            rc, _out = await _git(["push", "origin", "HEAD"])
+            rc, out = await _git(["push", "origin", "HEAD"])
             if rc != 0:
                 await _git(["pull", "--rebase", "--autostash"])
-                rc, _out = await _git(["push", "origin", "HEAD"])
+                rc, out = await _git(["push", "origin", "HEAD"])
             if rc != 0:
-                log_event("bus_push", relpath=relpath, ok=False)
+                log_event("bus_push", relpath=relpath, ok=False,
+                          error=out[-150:])
             return rc == 0
         except Exception as e:
             log.warning("bus append failed: %s", e)
@@ -1413,6 +1439,58 @@ async def _file_consult_once(question: str,
     return ("filed", {"request": req})
 
 
+async def sweep_tx_spool(exclude_call_id: str = "") -> None:
+    """Push transcript lines stranded in the on-disk spool (2026-10-14).
+
+    Each spool file holds every line noted for one call; its .pushed
+    marker counts the lines the bus already confirmed. Whatever remains
+    is appended to that call's bus transcript and the spool is cleared.
+    Runs at each new call's relay start — one call at a time is a hard
+    invariant of this worker, so the only spool that can be active is
+    the current call's, which is excluded."""
+    try:
+        names = sorted(os.listdir(TX_SPOOL_DIR))
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        call_id = name[:-len(".jsonl")]
+        if call_id == exclude_call_id:
+            continue
+        spool = os.path.join(TX_SPOOL_DIR, name)
+        marker = spool + ".pushed"
+        try:
+            with open(spool, encoding="utf-8") as f:
+                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+            pushed = 0
+            try:
+                with open(marker, encoding="utf-8") as f:
+                    pushed = int((f.read() or "0").strip() or 0)
+            except (OSError, ValueError):
+                pushed = 0
+            rest = lines[pushed:]
+            if rest:
+                ok = await _bus_append_lines(
+                    f"calls/live/{call_id}/transcript.jsonl", rest,
+                    f"transcript {call_id[:24]} +{len(rest)} (recovered)")
+                if not ok:
+                    log_event("transcript_sweep", call_id=call_id,
+                              ok=False, lines=len(rest))
+                    continue
+                pushed += len(rest)
+                log_event("transcript_sweep", call_id=call_id, ok=True,
+                          lines=len(rest))
+            if pushed >= len(lines):
+                for p in (spool, marker):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+        except Exception as e:
+            log.warning("tx spool sweep failed for %s: %s", name, e)
+
+
 # ------------------------------------------------------- call relay ---
 
 class CallRelay:
@@ -1438,6 +1516,15 @@ class CallRelay:
         self._tx_buffer: list[str] = []
         self._task: asyncio.Task | None = None
         self._stopped = False
+        # Transcript-delivery accounting (2026-10-14 fix): noted counts
+        # per role make a dry capture source VISIBLE in the logs instead
+        # of silently losing the call; _pushed counts lines the bus
+        # confirmed; the spool file + marker are the recovery record.
+        self._noted: dict[str, int] = {}
+        self._pushed = 0
+        self._stt_recent: list[tuple[float, str]] = []
+        self._spool_path = os.path.join(TX_SPOOL_DIR, f"{call_id}.jsonl")
+        self._marker_path = self._spool_path + ".pushed"
 
     @property
     def _live_rel(self) -> str:
@@ -1446,6 +1533,9 @@ class CallRelay:
     async def start(self) -> None:
         self._task = asyncio.create_task(self._loop())
         log_event("relay_started", call_id=self.call_id)
+        # Recover any earlier call's transcript whose final flush never
+        # landed (same machine only — spools are local disk).
+        asyncio.create_task(sweep_tx_spool(exclude_call_id=self.call_id))
 
     async def stop(self) -> None:
         self._stopped = True
@@ -1456,37 +1546,124 @@ class CallRelay:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
-        try:
-            await self.flush_transcript(final=True)
-        except Exception as e:
-            log.warning("final transcript flush failed: %s", e)
+        await self._final_flush()
         log_event("relay_stopped", call_id=self.call_id,
-                  pending_left=len(self.pending))
+                  pending_left=len(self.pending),
+                  tx_noted=sum(self._noted.values()),
+                  tx_left=len(self._tx_buffer))
+
+    async def _final_flush(self) -> None:
+        """Last-chance transcript delivery at hangup (2026-10-14 fix).
+
+        The pre-fix code made exactly ONE attempt here, and a failure
+        (or teardown cancelling the await mid-push) silently re-buffered
+        the lines into a dying process — production calls on 2026-10-13
+        lost their whole transcript this way while consult pushes over
+        the same clone landed fine. Now: up to 3 attempts, each shielded
+        so an outer cancellation can't abort the git push mid-flight,
+        and total failure is a LOUD event, never a silent re-buffer.
+        Lines that still can't move stay in the on-disk spool for the
+        next call's sweep."""
+        if not self._tx_buffer:
+            return
+        for attempt in (1, 2, 3):
+            try:
+                ok = await asyncio.shield(
+                    asyncio.ensure_future(self.flush_transcript(final=True)))
+            except asyncio.CancelledError:
+                # Outer teardown is cancelling us; the shielded flush
+                # keeps running in the background. Give it a brief
+                # moment, then stop blocking the unwind — the spool
+                # covers whatever it couldn't finish.
+                await asyncio.sleep(0.5)
+                ok = not self._tx_buffer
+            except Exception as e:
+                log.warning("final transcript flush failed: %s", e)
+                ok = False
+            if ok or not self._tx_buffer:
+                return
+            if attempt < 3:
+                await asyncio.sleep(attempt)
+        log_event("transcript_flush_failed", call_id=self.call_id,
+                  lines=len(self._tx_buffer),
+                  noted=sum(self._noted.values()))
+        log.warning("transcript for %s did NOT reach the bus "
+                    "(%d lines left in spool)", self.call_id,
+                    len(self._tx_buffer))
 
     def hand_off(self, req_id: str, question: str) -> None:
         self.pending[req_id] = question
         log_event("relay_handoff", id=req_id[:8], call_id=self.call_id)
 
-    def note_transcript(self, role: str, text: str) -> None:
+    def note_transcript(self, role: str, text: str,
+                        source: str = "item") -> None:
         text = (text or "").strip()
         if not text:
             return
-        self._tx_buffer.append(json.dumps(
+        now = time.monotonic()
+        if source == "stt":
+            # Independent capture of Jim's words straight from the STT
+            # stream (2026-10-14 fix): if conversation items ever stop
+            # carrying his text, his side of the record still lands.
+            self._stt_recent.append((now, text))
+            self._stt_recent = [(t, x) for (t, x) in self._stt_recent
+                                if now - t <= 30.0]
+        elif role == "jim":
+            # The conversation-item copy of an utterance the STT stream
+            # already recorded — keep ONE copy (the STT line, with the
+            # earlier timestamp). An item with no recent STT twin is
+            # recorded normally, so no words are lost in either world.
+            if any(x == text and now - t <= 6.0
+                   for (t, x) in self._stt_recent):
+                return
+        line = json.dumps(
             {"ts": _utcnow_z(), "role": role, "text": text},
-            ensure_ascii=False))
+            ensure_ascii=False)
+        self._tx_buffer.append(line)
+        self._noted[role] = self._noted.get(role, 0) + 1
+        # Synchronous durable spool: from this moment the line survives
+        # the process. The marker file tracks how far the bus got.
+        try:
+            os.makedirs(TX_SPOOL_DIR, exist_ok=True)
+            with open(self._spool_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
-    async def flush_transcript(self, final: bool = False) -> None:
+    def _write_pushed_marker(self) -> None:
+        try:
+            os.makedirs(TX_SPOOL_DIR, exist_ok=True)
+            with open(self._marker_path, "w", encoding="utf-8") as f:
+                f.write(str(self._pushed))
+        except OSError:
+            pass
+
+    def _clear_spool(self) -> None:
+        for p in (self._spool_path, self._marker_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    async def flush_transcript(self, final: bool = False) -> bool:
         if not self._tx_buffer:
-            return
+            if final:
+                self._clear_spool()
+            return True
         lines, self._tx_buffer = self._tx_buffer, []
         ok = await _bus_append_lines(
             f"{self._live_rel}/transcript.jsonl", lines,
             f"transcript {self.call_id[:24]} +{len(lines)}")
         if ok:
+            self._pushed += len(lines)
+            self._write_pushed_marker()
             log_event("transcript_flush", call_id=self.call_id,
                       lines=len(lines), final=final)
+            if final and not self._tx_buffer:
+                self._clear_spool()
         else:
             self._tx_buffer = lines + self._tx_buffer  # retry next flush
+        return ok
 
     async def _say(self, text: str) -> None:
         try:
@@ -1568,7 +1745,12 @@ class CallRelay:
             log_event("relay_out_line", call_id=self.call_id,
                       text_len=len(text))
             await self._say(text)
-        if len(self._tx_buffer) >= 6:
+        if self._tx_buffer:
+            # Flush EVERY tick, not at a 6-line threshold (2026-10-14
+            # fix): short calls never reached the threshold, so their
+            # whole transcript rode on the single hangup flush — and
+            # was lost with it. Lines now land within one poll cycle of
+            # being spoken; the hangup flush is only a backstop.
             await self.flush_transcript()
 
 
@@ -1812,12 +1994,41 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict):
                 return
             role = getattr(item, "role", "")
             relay.note_transcript("jim" if role == "user" else "proxy",
-                                  text)
+                                  text, source="item")
+        except Exception:
+            pass
+
+    def _on_user_transcribed(ev) -> None:
+        # Second, independent capture of Jim's words (2026-10-14 fix):
+        # final STT transcripts feed the same record. note_transcript
+        # dedupes against the conversation-item copy.
+        try:
+            if not getattr(ev, "is_final", False):
+                return
+            text = (getattr(ev, "transcript", "") or "").strip()
+            if text:
+                relay.note_transcript("jim", text, source="stt")
         except Exception:
             pass
 
     session.on("conversation_item_added", _on_conversation_item)
+    session.on("user_input_transcribed", _on_user_transcribed)
     await relay.start()
+
+    async def _shutdown_flush() -> None:
+        # Job shutdown callbacks run in their own context while the
+        # worker tears the job down — a last flush attempt that the
+        # entrypoint's own cancellation cannot abort.
+        try:
+            if relay is not None:
+                await relay.flush_transcript(final=True)
+        except Exception:
+            pass
+
+    try:
+        ctx.add_shutdown_callback(_shutdown_flush)
+    except Exception:
+        pass
 
     ended = asyncio.Event()
 
@@ -1852,6 +2063,14 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict):
                 await relay.stop()
             except Exception:
                 pass
+            # One greppable line per call stating whether the record
+            # made it — the 2026-10-13 loss was invisible precisely
+            # because no such line existed.
+            log_event("transcript_status", call_id=relay.call_id,
+                      noted_jim=relay._noted.get("jim", 0),
+                      noted_proxy=relay._noted.get("proxy", 0),
+                      pushed=relay._pushed,
+                      left=len(relay._tx_buffer))
         _CURRENT_CALL_ID = None
         wd_task.cancel()
         try:
