@@ -1541,11 +1541,13 @@ class CallRelay:
         # Watch tasks finish the bookkeeping per say; receipts for every
         # step land on the bus (relay.jsonl) — Fly logs are too lossy to
         # diagnose this leg.
-        self._speaking: set[str] = set()
         self._attempts: dict[str, int] = {}
         self._seen_answers: set[str] = set()
-        self._say_tasks: set[asyncio.Task] = set()
         self._receipts: list[str] = []
+        # Deliveries awaiting transcript confirmation (v3): key ->
+        # needle text the proxy's spoken line should contain. The key
+        # is the consult id, or "out-<n>" for free-form lines.
+        self._confirm: dict[str, str] = {}
         self._tx_buffer: list[str] = []
         self._task: asyncio.Task | None = None
         self._stopped = False
@@ -1581,6 +1583,11 @@ class CallRelay:
                 pass
             self._task = None
         await self._final_flush()
+        for key in list(self._confirm):
+            is_out = key.startswith("out-")
+            self._receipt("delivery_unconfirmed",
+                          id=None if is_out else key,
+                          kind="out" if is_out else "consult")
         self._receipt("relay_stopped", pending_left=len(self.pending),
                       spoken=sorted(self.spoken))
         await self._flush_receipts()
@@ -1639,6 +1646,7 @@ class CallRelay:
         text = (text or "").strip()
         if not text:
             return
+        self._check_confirmations(role, text)
         now = time.monotonic()
         if source == "stt":
             # Independent capture of Jim's words straight from the STT
@@ -1696,10 +1704,13 @@ class CallRelay:
                 text = ""
             if text:
                 self.note_transcript(role, text, source="deferred")
-            elif now - t0 <= 25.0:
+            else:
+                # Keep parked items for the call's whole life
+                # (2026-10-14 v3): a long turn's item can sit textless
+                # far past the old 25s window — dropping it lost lines
+                # that were spoken. _final_flush gives every parked
+                # item a last read at hangup.
                 keep.append((item, role, t0))
-            # older than 25s with no text: the item never materialized;
-            # drop it (the STT source still covers Jim's side).
         self._deferred = keep
 
     def _write_pushed_marker(self) -> None:
@@ -1739,7 +1750,12 @@ class CallRelay:
 
     # --- delivery receipts: the bus is the reliable record -----------
     def _receipt(self, event: str, **fields) -> None:
-        line = {"ts": _utcnow_z(), "event": event,
+        # seq makes every line unique: _bus_append_lines treats a block
+        # identical to the file tail as already-appended, and two
+        # same-second identical receipts (e.g. repeated speak_failed)
+        # would otherwise collapse into one (found by test_relay_v3).
+        self._rseq = getattr(self, "_rseq", 0) + 1
+        line = {"ts": _utcnow_z(), "seq": self._rseq, "event": event,
                 "call_id": self.call_id, **fields}
         self._receipts.append(json.dumps(line, ensure_ascii=False))
 
@@ -1752,60 +1768,72 @@ class CallRelay:
         if not ok:
             self._receipts = lines + self._receipts  # retry next tick
 
-    async def _watch_say(self, handle, text: str, kind: str,
-                         req_id: str | None) -> None:
-        """Finish one fired say()'s bookkeeping in its own task.
+    def _deliver(self, text: str, kind: str,
+                 req_id: str | None = None) -> bool:
+        """Return Jett's text INTO the proxy's own turn machinery.
 
-        The relay loop never waits on speech (2026-10-14 repair — see
-        __init__). Success marks the consult spoken; the answer also
-        enters the model's chat context via say's add_to_chat_ctx.
-        Failure or timeout leaves the consult pending so the tick
-        retries (attempts capped in _tick).
+        v3 of this leg (2026-10-14): session.say() proved unreliable in
+        this deployment — on the retest call, three say() attempts
+        never reached Jim's ears and never entered the proxy's context
+        (his verdict: the answer "never returned to the proxy").
+        generate_reply is the path every audible proxy line has ever
+        taken (the greeting and all LLM replies), and it writes the
+        turn into the conversation history: the model KNOWS the answer
+        was delivered (no more "no answer yet" afterward) and the
+        transcript captures it like any other proxy line. The
+        instruction demands verbatim relay with the attribution
+        prefix; _check_confirmations receipts the delivery when the
+        spoken line lands in the transcript — the closed loop the
+        say() path never had.
         """
-        async def _await_handle():
-            await handle
-
+        if kind == "consult":
+            instr = ("Jett has answered the question you handed off to "
+                     "him. Relay his answer to the caller NOW, starting "
+                     f"with '{ATTRIBUTION_PREFIX}: ' and reproducing "
+                     "his words exactly — do not add, summarize, or "
+                     "comment. His answer: " + text)
+        else:
+            instr = ("Jett just sent this update for the caller. Speak "
+                     "it NOW, word for word, without adding or "
+                     "commenting: " + text)
+        if req_id:
+            self._attempts[req_id] = self._attempts.get(req_id, 0) + 1
         try:
-            await asyncio.wait_for(_await_handle(), timeout=45)
+            self.session.generate_reply(instructions=instr)
         except Exception as e:
-            log.warning("relay say (%s) did not complete: %s", kind, e)
-            log_event("relay_say_failed", call_id=self.call_id, kind=kind,
-                      id=(req_id or "")[:8], error=str(e)[:200])
+            log.warning("relay deliver (%s) failed: %s", kind, e)
+            log_event("relay_deliver_failed", call_id=self.call_id,
+                      kind=kind, id=(req_id or "")[:8],
+                      error=str(e)[:200])
             self._receipt("speak_failed", kind=kind, id=req_id,
                           error=str(e)[:200])
-            return
-        finally:
-            if req_id:
-                self._speaking.discard(req_id)
+            return False
+        log_event("relay_injected", call_id=self.call_id, kind=kind,
+                  id=(req_id or "")[:8], text_len=len(text))
+        self._receipt("injected", kind=kind, id=req_id, text=text[:200])
+        key = req_id or f"out-{abs(hash(text)) % 99999}"
+        self._confirm[key] = " ".join(text.split())[:80]
         if req_id:
             self.spoken.add(req_id)
             self.pending.pop(req_id, None)
-        log_event("relay_spoke", call_id=self.call_id, kind=kind,
-                  id=(req_id or "")[:8], text_len=len(text))
-        self._receipt("spoke", kind=kind, id=req_id, text=text[:200])
-
-    def _start_say(self, text: str, kind: str,
-                   req_id: str | None = None) -> bool:
-        """Fire a say() WITHOUT awaiting its handle in the caller."""
-        try:
-            handle = self.session.say(text, allow_interruptions=True)
-        except Exception as e:
-            log.warning("relay say (%s) failed to start: %s", kind, e)
-            log_event("relay_say_failed", call_id=self.call_id, kind=kind,
-                      id=(req_id or "")[:8], error=f"start: {e}"[:200])
-            self._receipt("speak_failed", kind=kind, id=req_id,
-                          error=f"start: {e}"[:200])
-            return False
-        if req_id:
-            self._speaking.add(req_id)
-            self._attempts[req_id] = self._attempts.get(req_id, 0) + 1
-        self._receipt("speak_started", kind=kind, id=req_id,
-                      text=text[:200])
-        task = asyncio.create_task(self._watch_say(handle, text, kind,
-                                                   req_id))
-        self._say_tasks.add(task)
-        task.add_done_callback(self._say_tasks.discard)
         return True
+
+    def _check_confirmations(self, role: str, text: str) -> None:
+        """Receipt deliveries the transcript actually heard.
+
+        A delivery counts as confirmed when a proxy line containing
+        its needle lands in the record.
+        """
+        if role != "proxy" or not self._confirm:
+            return
+        norm = " ".join(text.split())
+        for key, needle in list(self._confirm.items()):
+            if needle and (needle in norm or norm in needle):
+                self._confirm.pop(key, None)
+                is_out = key.startswith("out-")
+                self._receipt("delivery_confirmed",
+                              id=None if is_out else key,
+                              kind="out" if is_out else "consult")
 
     async def _loop(self) -> None:
         while not self._stopped:
@@ -1834,7 +1862,7 @@ class CallRelay:
                           rc=rc)
                 self._receipt("fetch_failed", rc=rc)
             for req_id in list(self.pending):
-                if req_id in self.spoken or req_id in self._speaking:
+                if req_id in self.spoken:
                     continue
                 if self._attempts.get(req_id, 0) >= 3:
                     self.pending.pop(req_id, None)
@@ -1892,13 +1920,12 @@ class CallRelay:
         for req_id, answer in answers:
             log_event("consult_answered_live", id=req_id[:8],
                       call_id=self.call_id, answer_len=len(answer))
-            self._start_say(f"{ATTRIBUTION_PREFIX}: {answer}",
-                            kind="consult", req_id=req_id)
+            self._deliver(answer, kind="consult", req_id=req_id)
         for text in out_texts:
             log_event("relay_out_line", call_id=self.call_id,
                       text_len=len(text))
             self._receipt("out_line_seen", kind="out", text=text[:200])
-            self._start_say(text, kind="out")
+            self._deliver(text, kind="out")
         self._process_deferred()
         await self._flush_receipts()
         if self._tx_buffer:
