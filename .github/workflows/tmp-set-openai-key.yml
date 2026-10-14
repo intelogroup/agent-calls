@@ -1,0 +1,24 @@
+name: "(temporary) set OPENAI_API_KEY on jett-voice"
+on:
+  workflow_dispatch:
+jobs:
+  set-secret:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 15
+    steps:
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Set OPENAI_API_KEY secret on jett-voice
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY repo secret is empty - add it first (Settings > Secrets > Actions)"
+            exit 1
+          fi
+          echo "repo secret present (value not shown)"
+          flyctl secrets set "OPENAI_API_KEY=${OPENAI_API_KEY}" -a jett-voice
+          flyctl secrets list -a jett-voice | grep -i openai || true
+          flyctl status -a jett-voice
