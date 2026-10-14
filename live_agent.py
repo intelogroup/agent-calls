@@ -92,6 +92,14 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 META_API_KEY = os.environ.get("META_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+# Paid OpenAI brain (Jim, 2026-10-13): selected with JETT_BRAIN_PROVIDER=openai.
+# Probed 2026-10-13: gpt-4.1-mini TTFT 1.7-2.2s and consistent (no empties,
+# no stalls); gpt-4o-mini slower (2.9-3.4s) — kept as in-provider fallback.
+OPENAI_MODELS = [m.strip() for m in os.environ.get(
+    "JETT_OPENAI_MODELS", "gpt-4.1-mini,gpt-4o-mini").split(",") if m.strip()]
+BRAIN_PROVIDER = os.environ.get("JETT_BRAIN_PROVIDER", "").strip().lower()
 # Brain model fallback chain (OpenRouter route:"fallback" tries them in order).
 # Override with JETT_BRAIN_MODELS (comma-sep); the legacy singular
 # JETT_BRAIN_MODEL still works as a one-model chain.
@@ -464,6 +472,15 @@ def resolve_brain() -> Brain | None:
     Every OpenRouter turn carries max_tokens >= BRAIN_MAX_TOKENS (>= 300)
     in extra_body — the floor is enforced here, not hoped for.
     """
+    if BRAIN_PROVIDER == "openai" and OPENAI_API_KEY:
+        return Brain(
+            label="openai",
+            base_url=OPENAI_BASE_URL,
+            api_key=OPENAI_API_KEY,
+            model=OPENAI_MODELS[0],
+            extra_headers={},
+            extra_body={},
+        )
     if OPENROUTER_API_KEY:
         return Brain(
             label="openrouter",
@@ -631,6 +648,8 @@ class ResilientLLM(llm.LLM):
     def _models(self) -> list[str]:
         if self._brain.label == "openrouter":
             return list(JETT_BRAIN_MODELS)
+        if self._brain.label == "openai":
+            return list(OPENAI_MODELS)
         return [self._brain.model]
 
     def _default_factory(self, model: str, remaining: list[str]):
@@ -642,8 +661,14 @@ class ResilientLLM(llm.LLM):
             if self._brain.extra_headers else NOT_GIVEN,
             extra_body={
                 **(self._brain.extra_body or {}),
-                "models": remaining,
-                "route": "fallback",
+                # OpenRouter-native fallback routing — only meaningful
+                # (and only accepted) on the OpenRouter endpoint itself.
+                # OpenRouter caps the native models array at 3 items; the
+                # wrapper owns the chain beyond that. (With a 4-model
+                # chain the uncapped array made EVERY first attempt fail
+                # with HTTP 400 — found in the mock-call logs 2026-10-13.)
+                **({"models": remaining[:3], "route": "fallback"}
+                   if self._brain.label == "openrouter" else {}),
                 "max_tokens": BRAIN_MAX_TOKENS,
             },
         )
@@ -749,6 +774,141 @@ class ResilientLLM(llm.LLM):
             delta=llm.ChoiceDelta(content=FALLBACK_LINE, role="assistant"),
         )]
 
+    async def _attempt_live(self, ctx: "_ResilientStream"):
+        """Streaming variant of _attempt for non-relay turns.
+
+        Chunks are yielded as the model produces them, so TTS starts on
+        the first sentence instead of waiting for the full reply. Only
+        the pre-first-chunk phase is buffered: until a model yields its
+        first content/tool chunk, its failure or emptiness is invisible
+        to the caller, so the chain can still retry / fall back cleanly.
+        Once speech has started, a mid-stream failure just ends the turn
+        (the partial answer stands) — replaying from another model would
+        double-speak. The per-model cap applies to the wait for the
+        first chunk, which is where the stalls live.
+        """
+        models = self._models()
+        empty_retries = 0
+        for i, model in enumerate(models):
+            t0 = time.monotonic()
+            yielded = False
+            ttft = 0.0
+            stream = None
+            try:
+                inner = self._factory(model, models[i:])
+                stream = inner.chat(
+                    chat_ctx=ctx._chat_ctx,
+                    tools=ctx._tools or None,
+                    conn_options=ctx._conn_options,
+                    parallel_tool_calls=ctx._parallel_tool_calls,
+                    tool_choice=ctx._tool_choice,
+                    extra_kwargs=ctx._extra_kwargs,
+                    **ctx._extra_kw,
+                )
+                it = stream.__aiter__()
+                buffered: list = []
+                while True:
+                    try:
+                        if yielded:
+                            chunk = await it.__anext__()
+                        else:
+                            remaining = BRAIN_MODEL_TIMEOUT_S - (
+                                time.monotonic() - t0)
+                            if remaining <= 0:
+                                raise asyncio.TimeoutError()
+                            chunk = await asyncio.wait_for(
+                                it.__anext__(), timeout=remaining)
+                    except StopAsyncIteration:
+                        break
+                    delta = chunk.delta
+                    if not yielded:
+                        buffered.append(chunk)
+                        if delta is not None and (delta.content
+                                                  or delta.tool_calls):
+                            yielded = True
+                            ttft = time.monotonic() - t0
+                            for c in buffered:
+                                yield c
+                            buffered = []
+                    else:
+                        yield chunk
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                dt = time.monotonic() - t0
+                if stream is not None:
+                    try:
+                        await stream.aclose()
+                    except Exception:
+                        pass
+                log_event("brain_attempt", model=model,
+                          latency_s=round(dt, 2),
+                          outcome="timeout_first_token", stream=True,
+                          fallback_to=models[i + 1]
+                          if i + 1 < len(models) else None)
+                log.warning("brain chat (live): model=%s no first token "
+                            "in %.0fs; trying next model",
+                            model, BRAIN_MODEL_TIMEOUT_S)
+                empty_retries += 1
+                continue
+            except Exception as e:
+                dt = time.monotonic() - t0
+                if yielded:
+                    log_event("brain_attempt", model=model,
+                              latency_s=round(dt, 2),
+                              outcome="stream_cut", stream=True)
+                    log.warning("brain chat (live): model=%s cut "
+                                "mid-stream (%.1fs): %.150s", model, dt, e)
+                    return
+                if _is_rate_limit(e):
+                    delay = compute_backoff(i)
+                    log_event("brain_attempt", model=model,
+                              latency_s=round(dt, 2),
+                              outcome="rate_limited", stream=True,
+                              backoff_s=round(delay, 1),
+                              fallback_to=models[i + 1]
+                              if i + 1 < len(models) else None)
+                    log.warning("brain chat (live): model=%s rate-limited "
+                                "(%.1fs); backing off %.1fs then next model",
+                                model, dt, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    log_event("brain_attempt", model=model,
+                              latency_s=round(dt, 2), outcome="error",
+                              stream=True, error=str(e)[:120],
+                              fallback_to=models[i + 1]
+                              if i + 1 < len(models) else None)
+                    log.warning("brain chat (live): model=%s errored "
+                                "(%.1fs): %.150s", model, dt, e)
+                empty_retries += 1
+                continue
+            dt = time.monotonic() - t0
+            if yielded:
+                log_event("brain_attempt", model=model,
+                          latency_s=round(dt, 2), outcome="ok",
+                          stream=True, ttft_s=round(ttft, 2),
+                          empty_retries=empty_retries)
+                log.info("brain chat (live): model=%s ttft=%.1fs "
+                         "total=%.1fs", model, ttft, dt)
+                return
+            empty_retries += 1
+            log_event("brain_attempt", model=model,
+                      latency_s=round(dt, 2), outcome="empty", stream=True,
+                      fallback_to=models[i + 1]
+                      if i + 1 < len(models) else None)
+            log.warning("brain chat (live): model=%s empty; trying next "
+                        "model", model)
+        log_event("brain_exhausted", models=len(models),
+                  fallback_spoken=True, stream=True)
+        log.warning("brain chat (live): ALL %d models empty/failed; "
+                    "speaking fallback", len(models))
+        yield llm.ChatChunk(
+            id=f"fallback-{uuid.uuid4().hex[:8]}",
+            delta=llm.ChoiceDelta(content=FALLBACK_LINE, role="assistant"),
+        )
+
     def _postprocess(self, ctx, chunks: list, text: str,
                      has_tools: bool) -> list:
         if has_tools or not text.strip():
@@ -765,7 +925,13 @@ class ResilientLLM(llm.LLM):
 
 
 class _ResilientStream(llm.LLMStream):
-    """The stream AgentSession consumes; _run() does drain→retry→replay."""
+    """The stream AgentSession consumes.
+
+    Relay turns (the reply may paraphrase a consult_jett / local_facts
+    tool result) still drain → guard → replay, because the attribution
+    and number guards need the finished text. Every other turn streams
+    live through _attempt_live so TTS starts on the first sentence.
+    """
 
     def __init__(self, resilient: ResilientLLM, *, chat_ctx,
                  tools: list,
@@ -783,8 +949,13 @@ class _ResilientStream(llm.LLMStream):
         self._extra_kw = extra_kw
 
     async def _run(self) -> None:
-        chunks = await self._resilient._attempt(self)
-        for chunk in chunks:
+        if _last_tool_output(self._chat_ctx,
+                             ("consult_jett", "local_facts")) is not None:
+            chunks = await self._resilient._attempt(self)
+            for chunk in chunks:
+                self._event_ch.send_nowait(chunk)
+            return
+        async for chunk in self._resilient._attempt_live(self):
             self._event_ch.send_nowait(chunk)
 
 # ----------------------------------------------------------------- STT ---
@@ -1552,7 +1723,7 @@ async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
              brain.extra_body.get("max_tokens", "?"))
     stt_engine = WhisperSTT()
     stt_stream = stt.StreamAdapter(
-        stt=stt_engine, vad=silero.VAD.load())
+        stt=stt_engine, vad=silero.VAD.load(min_silence_duration=0.35))
     tts_engine = KokoroTTS()
 
     agent_llm = ResilientLLM(brain)
@@ -1564,10 +1735,16 @@ async def _run_call(ctx: JobContext, brain: Brain, stats: dict):
     )
     session = AgentSession(
         stt=stt_stream,
-        vad=silero.VAD.load(),
+        vad=silero.VAD.load(min_silence_duration=0.35),
         llm=agent_llm,
         tts=tts_engine,
         max_tool_steps=10,
+        # Endpointing tightened 2026-10-13 (Jim's word): less dead air
+        # after he stops talking. VAD silence 0.55→0.35s above; the turn
+        # is finalized 0.3s after the segment closes (was the ~0.5s
+        # default), and a long pause caps at 2.5s instead of ~6s.
+        min_endpointing_delay=0.3,
+        max_endpointing_delay=2.5,
     )
 
     # --- brain telemetry: per-turn model/latency via the wrapper's logs,
