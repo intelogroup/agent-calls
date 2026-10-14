@@ -2070,7 +2070,13 @@ def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
 
 
 def greeting_for(info: dict) -> str:
-    """The exact greeting line for a phone call (ignored for SIP)."""
+    """The exact greeting line for a phone call (ignored for SIP).
+
+    Tier "self" is Jim himself calling his own line from his cell —
+    he gets the normal Jett-line greeting, not the answering-service
+    script (scenario test S5 caught this, 2026-10-14)."""
+    if info.get("tier") == "self":
+        return GREETING
     if info.get("name"):
         return (f"Hi {info['name']}, this is Jett, Jim's assistant. "
                 "He can't come to the phone right now, but I can help "
@@ -2464,7 +2470,8 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
               known=bool(call_info["name"]))
 
     instructions = SYSTEM_PROMPT.format(brief=brief)
-    if call_info["channel"] == "pstn":
+    if call_info["channel"] == "pstn" \
+            and call_info["tier"] != "self":
         instructions += "\n" + PHONE_RULES
     if call_info["direction"] == "outbound":
         instructions += "\n" + OUTBOUND_RULES
