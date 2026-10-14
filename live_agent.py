@@ -138,8 +138,14 @@ BRAIN_MODEL_TIMEOUT_S = float(os.environ.get("BRAIN_MODEL_TIMEOUT_S", "25"))
 # multi-minute silences on the 2026-10-14 retest calls, which also
 # queued every injected Jett answer behind the stuck turn). Past the
 # turn budget the chain stops and the fallback speaks. Override with
-# BRAIN_TURN_TIMEOUT_S.
-BRAIN_TURN_TIMEOUT_S = float(os.environ.get("BRAIN_TURN_TIMEOUT_S", "40"))
+# BRAIN_TURN_TIMEOUT_S. The 2026-10-14 wedge fix raised the default
+# 40 -> 90 so a healthy long answer is not cut mid-thought, and added
+# BRAIN_CHUNK_STALL_S: the max gap between chunks once a turn is
+# speaking. A stream that stalls past the cap ends the turn with the
+# partial reply standing (never advance models mid-stream). Override
+# with BRAIN_CHUNK_STALL_S.
+BRAIN_TURN_TIMEOUT_S = float(os.environ.get("BRAIN_TURN_TIMEOUT_S", "90"))
+BRAIN_CHUNK_STALL_S = float(os.environ.get("BRAIN_CHUNK_STALL_S", "20"))
 # Spoken when every model returns empty output. Dead air is never acceptable.
 FALLBACK_LINE = (
     "Sorry — my brain came back empty just now. "
@@ -872,7 +878,13 @@ class ResilientLLM(llm.LLM):
                 while True:
                     try:
                         if yielded:
+                            # Wedge fix (2026-10-14): post-first-token
+                            # waits also honor the inter-chunk stall
+                            # cap, so a model dribbling a long reply
+                            # cannot hold the serial speech pipeline.
+                            # On stall the turn ends; partial stands.
                             idle_cap = min(
+                                BRAIN_CHUNK_STALL_S,
                                 BRAIN_MODEL_TIMEOUT_S,
                                 BRAIN_TURN_TIMEOUT_S
                                 - (time.monotonic() - turn_t0))
@@ -2572,6 +2584,18 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
             item = getattr(ev, "item", ev)
             role = getattr(item, "role", "")
             mapped = "jim" if role == "user" else "proxy"
+            if mapped == "proxy":
+                # LiveKit Agents 1.8.7 attaches per-message metrics to
+                # the item; surface the end-to-end latency in the log.
+                metrics = getattr(item, "metrics", None)
+                if metrics:
+                    try:
+                        e2e = metrics.get("e2e_latency")
+                    except AttributeError:
+                        e2e = getattr(metrics, "e2e_latency", None)
+                    if e2e is not None:
+                        log_event("e2e_latency", call_id=relay.call_id,
+                                  e2e_latency_s=e2e)
             text = (getattr(item, "text_content", "") or "").strip()
             if not text:
                 # Streamed replies can fire this event before their
@@ -2762,6 +2786,8 @@ if __name__ == "__main__":
               brain_models=len(JETT_BRAIN_MODELS)
               + (len(OPENAI_MODELS) if OPENAI_API_KEY else 0),
               brain_max_tokens=BRAIN_MAX_TOKENS,
+              brain_turn_timeout_s=BRAIN_TURN_TIMEOUT_S,
+              brain_chunk_stall_s=BRAIN_CHUNK_STALL_S,
               consult_timeout_s=CONSULT_TIMEOUT_SEC,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
               bus_dir=BUS_DIR,
