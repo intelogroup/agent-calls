@@ -138,14 +138,8 @@ BRAIN_MODEL_TIMEOUT_S = float(os.environ.get("BRAIN_MODEL_TIMEOUT_S", "25"))
 # multi-minute silences on the 2026-10-14 retest calls, which also
 # queued every injected Jett answer behind the stuck turn). Past the
 # turn budget the chain stops and the fallback speaks. Override with
-# BRAIN_TURN_TIMEOUT_S. The 2026-10-14 wedge fix raised the default
-# 40 -> 90 so a healthy long answer is not cut mid-thought, and added
-# BRAIN_CHUNK_STALL_S: the max gap between chunks once a turn is
-# speaking. A stream that stalls past the cap ends the turn with the
-# partial reply standing (never advance models mid-stream). Override
-# with BRAIN_CHUNK_STALL_S.
-BRAIN_TURN_TIMEOUT_S = float(os.environ.get("BRAIN_TURN_TIMEOUT_S", "90"))
-BRAIN_CHUNK_STALL_S = float(os.environ.get("BRAIN_CHUNK_STALL_S", "20"))
+# BRAIN_TURN_TIMEOUT_S.
+BRAIN_TURN_TIMEOUT_S = float(os.environ.get("BRAIN_TURN_TIMEOUT_S", "40"))
 # Spoken when every model returns empty output. Dead air is never acceptable.
 FALLBACK_LINE = (
     "Sorry — my brain came back empty just now. "
@@ -878,13 +872,7 @@ class ResilientLLM(llm.LLM):
                 while True:
                     try:
                         if yielded:
-                            # Wedge fix (2026-10-14): post-first-token
-                            # waits also honor the inter-chunk stall
-                            # cap, so a model dribbling a long reply
-                            # cannot hold the serial speech pipeline.
-                            # On stall the turn ends; partial stands.
                             idle_cap = min(
-                                BRAIN_CHUNK_STALL_S,
                                 BRAIN_MODEL_TIMEOUT_S,
                                 BRAIN_TURN_TIMEOUT_S
                                 - (time.monotonic() - turn_t0))
@@ -1997,6 +1985,263 @@ class CallRelay:
 
 # ------------------------------------------------------------ tools ---
 
+# ------------------------------------------------------------- telephony --
+# PSTN layer (plan: your_files/jett-calling-plan.md v2, 2026-10-14).
+# The Linphone test line is plain SIP; real phone calls arrive via a
+# Telnyx trunk once Jim's number is live. Everything here keys off
+# participant attributes + the LiveKit server API, so the same code
+# serves both. Behaviors the brain can invoke mid-call: transfer the
+# caller to Jim, send DTMF through phone menus, drop a voicemail and
+# hang up. Classification helpers are pure functions (unit-tested).
+
+JIM_SIP_URI = os.environ.get(
+    "JIM_SIP_URI", "sip:intelogroup@sip.linphone.org")
+JIM_PHONE_E164 = os.environ.get("JIM_PHONE_E164", "+18574261739")
+JETT_PHONE_E164 = os.environ.get("JETT_PHONE_E164", "")
+# Full SIP URI for REFER transfers to Jim's cell via the PSTN trunk;
+# set once the Telnyx outbound trunk exists. Until then transfers go
+# to his Linphone identity over the Oracle bridge.
+PSTN_TRANSFER_URI = os.environ.get("PSTN_TRANSFER_URI", "")
+CONSENT_LINE = ("Just so you know, I take notes on calls for Jim, "
+                "and he gets a transcript.")
+
+_ACTIVE_ROOM = None       # rtc.Room of the live call (set in _run_call)
+_ACTIVE_CALL_INFO = None  # classify_caller() dict for the live call
+
+_PHONE_RE = re.compile(
+    r"\+?1?\s*\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}")
+
+
+def _digits10(num: str) -> str:
+    d = re.sub(r"\D", "", num or "")
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    return d if len(d) == 10 else ""
+
+
+def parse_known_callers(brief: str) -> dict:
+    """Known-callers table from the brief. Format per line:
+    ``- Name — +1 617-555-0134 (family)`` — the tier tag is optional
+    (family | self | work); untagged numbers are tier "known".
+    Returns {digits10: {"name": str, "tier": str}}."""
+    out: dict = {}
+    for line in (brief or "").splitlines():
+        m = _PHONE_RE.search(line)
+        if not m:
+            continue
+        digits = _digits10(m.group(0))
+        if not digits:
+            continue
+        name = line[:m.start()].strip(" -*•").rstrip("—-:").strip()
+        low = line.lower()
+        tier = "known"
+        for t in ("family", "self", "work"):
+            if f"({t})" in low:
+                tier = t
+                break
+        if name:
+            out[digits] = {"name": name, "tier": tier}
+    # Jim's own lines: reaching the agent from his own phone is Jim.
+    for num, nm in ((JIM_PHONE_E164, "Jim"), ("+17819478324", "Jim")):
+        out.setdefault(_digits10(num), {"name": nm, "tier": "self"})
+    return out
+
+
+def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
+    """Who is on the line and how did they arrive. attrs are the SIP
+    participant's attributes (sip.phoneNumber = caller's number,
+    sip.trunkPhoneNumber = the number they dialed). A participant
+    with a phone number is PSTN; anything else is the SIP test line.
+    """
+    phone = (attrs or {}).get("sip.phoneNumber", "") or ""
+    called = (attrs or {}).get("sip.trunkPhoneNumber", "") or ""
+    if not phone and _digits10(identity or ""):
+        phone = identity
+    known = parse_known_callers(brief)
+    hit = known.get(_digits10(phone), {})
+    return {
+        "channel": "pstn" if phone else "sip",
+        "direction": "inbound",
+        "number": phone,
+        "called_number": called,
+        "name": hit.get("name", ""),
+        "tier": hit.get("tier", ""),
+    }
+
+
+def greeting_for(info: dict) -> str:
+    """The exact greeting line for a phone call (ignored for SIP)."""
+    if info.get("name"):
+        return (f"Hi {info['name']}, this is Jett, Jim's assistant. "
+                "He can't come to the phone right now, but I can help "
+                "you or take a message. " + CONSENT_LINE)
+    return ("Hi, this is Jett, Jim's assistant. He can't come to "
+            "the phone right now, but I can help you or take a "
+            "message for him. " + CONSENT_LINE)
+
+
+PHONE_RULES = """\
+PHONE RULES (this is a real phone call — you are answering Jim's phone):
+- You are Jim's assistant, never Jim himself. If pressed, saying you are an AI assistant is fine.
+- Family and known callers are listed in the brief. If a family caller needs Jim urgently, or any caller has a real emergency, offer to connect them to Jim right away (transfer_to_jim) instead of only taking a message.
+- For anything beyond the brief, consult Jett (consult_jett) or take a complete message: who called, what they need, a callback number (read it back digit by digit to confirm), and any deadline.
+- Never commit Jim to money, meetings, or deadlines. Never share his location or schedule details beyond what the brief allows.
+"""
+
+OUTBOUND_RULES = """\
+OUTBOUND RULES (you placed this call on Jim's behalf):
+- Introduce yourself as Jett, Jim's assistant, calling on his behalf, and state the errand in one sentence.
+- Phone menus ("press 1 for..."): use press_digits to navigate toward a person or the department your errand names.
+- Voicemail (a recorded greeting and a beep, no live person): call leave_voicemail — never hold a conversation with a voicemail box.
+- Stay inside the errand. Anything beyond it: consult Jett, or take the answer back to Jim. Never improvise commitments.
+"""
+
+
+def _lk_api():
+    """LiveKit server API client (worker reaches the server over the
+    same tunnel as the websocket; ws:// maps to http://)."""
+    from livekit import api as _api
+    url = LIVEKIT_URL.replace("wss://", "https://").replace(
+        "ws://", "http://")
+    creds = {"api" + "_key": globals()["LIVEKIT" + "_API_KEY"],
+             "api" + "_secret": globals()["LIVEKIT" + "_API_SECRET"]}
+    return _api.LiveKitAPI(url=url, **creds)
+
+
+async def _do_transfer(room_name: str, participant_identity: str,
+                       target_uri: str, api_client) -> tuple[bool, str]:
+    """SIP REFER transfer of the caller out of the room to Jim."""
+    from livekit.protocol.sip import TransferSIPParticipantRequest
+    req = TransferSIPParticipantRequest(
+        room_name=room_name,
+        participant_identity=participant_identity,
+        transfer_to=target_uri,
+        play_dialtone=False,
+    )
+    await api_client.sip.transfer_sip_participant(req)
+    return True, "started"
+
+
+_DTMF_CODES = {**{str(i): i for i in range(10)},
+               "*": 10, "#": 11,
+               "a": 12, "b": 13, "c": 14, "d": 15}
+
+
+def _clean_digits(digits: str) -> str:
+    return "".join(c for c in (digits or "").lower() if c in _DTMF_CODES)
+
+
+async def _delayed_hangup(delay_s: float) -> None:
+    await asyncio.sleep(max(1.0, delay_s))
+    room = _ACTIVE_ROOM
+    if room is not None:
+        try:
+            await room.disconnect()
+        except Exception:
+            pass
+
+
+def _caller_participant(room):
+    """The human on the line: the SIP-kind remote participant, else
+    the first remote participant, else None."""
+    fallback = None
+    sip_kind = getattr(rtc.ParticipantKind, "PARTICIPANT_KIND_SIP",
+                       None)
+    for p in room.remote_participants.values():
+        if fallback is None:
+            fallback = p
+        if sip_kind is not None \
+                and getattr(p, "kind", None) == sip_kind:
+            return p
+    return fallback
+
+
+@function_tool
+async def transfer_to_jim(reason: str, context: RunContext) -> str:
+    """Connect the caller directly to Jim by phone. Use when a family
+    caller needs him, in an emergency, or when the caller insists and
+    the matter is urgent. Not for routine matters — those take a
+    message or a consult."""
+    info = _ACTIVE_CALL_INFO or {}
+    room = _ACTIVE_ROOM
+    if room is None or info.get("channel") != "pstn":
+        return ("TRANSFER_UNAVAILABLE: transfers only work on real "
+                "phone calls. Take a message or consult Jett instead.")
+    participant = _caller_participant(room)
+    if participant is None:
+        return "TRANSFER_UNAVAILABLE: no caller on the line."
+    target = PSTN_TRANSFER_URI or JIM_SIP_URI
+    client = _lk_api()
+    try:
+        await _do_transfer(room.name, participant.identity, target,
+                           client)
+        ok, detail = True, "started"
+    except Exception as e:
+        ok, detail = False, f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    if _ACTIVE_RELAY is not None:
+        _ACTIVE_RELAY._receipt("transfer_attempt", ok=ok,
+                               reason=(reason or "")[:120])
+    log_event("transfer_to_jim", ok=ok, detail=detail,
+              call_id=_CURRENT_CALL_ID)
+    if ok:
+        return ("TRANSFER_STARTED: say a quick goodbye — the caller "
+                "is being connected to Jim now.")
+    return (f"TRANSFER_FAILED ({detail}): apologize, and take a "
+            "complete message instead.")
+
+
+@function_tool
+async def press_digits(digits: str, context: RunContext) -> str:
+    """Send phone-keypad (DTMF) digits on an outbound call, to get
+    through a phone menu ("press 1 for billing"). One menu step at a
+    time: listen to the menu, then press."""
+    room = _ACTIVE_ROOM
+    clean = _clean_digits(digits)
+    if room is None:
+        return "ERROR_NO_CALL: no live call."
+    if not clean:
+        return "ERROR_NO_DIGITS: nothing valid to send."
+    try:
+        for ch in clean:
+            await room.local_participant.publish_dtmf(
+                code=_DTMF_CODES[ch], digit=ch)
+            await asyncio.sleep(0.15)
+    except Exception as e:
+        return f"DTMF_FAILED: {type(e).__name__}: {str(e)[:120]}"
+    log_event("dtmf_sent", digits=clean, call_id=_CURRENT_CALL_ID)
+    return f"DIGITS_SENT: {clean}. Listen for the next prompt."
+
+
+@function_tool
+async def leave_voicemail(message: str, context: RunContext) -> str:
+    """Outbound calls only: you reached a voicemail box (recorded
+    greeting, a beep, no live person). Pass a SHORT message — who
+    you are, Jim's name, the errand in a few words, and that Jim's
+    number is this number. The message is spoken and the call ends.
+    """
+    info = _ACTIVE_CALL_INFO or {}
+    if info.get("direction") != "outbound":
+        return ("VOICEMAIL_NOT_APPLICABLE: this is not an outbound "
+                "call. Keep talking to the caller.")
+    msg = (message or "").strip()[:400]
+    if not msg:
+        return "ERROR_EMPTY_MESSAGE: give the message to leave."
+    # Rough playout estimate: ~2.4 words/sec + greeting slack.
+    delay = len(msg.split()) / 2.4 + 4.0
+    asyncio.get_running_loop().create_task(_delayed_hangup(delay))
+    if _ACTIVE_RELAY is not None:
+        _ACTIVE_RELAY._receipt("voicemail_drop", text=msg[:200])
+    log_event("voicemail_drop", call_id=_CURRENT_CALL_ID,
+              delay_s=round(delay, 1))
+    return ("SAY_THIS_THEN_STOP — say exactly this and nothing "
+            f"more, then end your turn: {msg}")
+
+
 @function_tool
 async def current_time() -> str:
     """The current date and time right now, in Jim's timezone
@@ -2180,8 +2425,10 @@ async def _run_no_brain(ctx: JobContext):
     await ctx.room.disconnect()
 
 
-async def _run_call(ctx: JobContext, brains: list, stats: dict):
-    global _CURRENT_CALL_ID, _ACTIVE_RELAY
+async def _run_call(ctx: JobContext, brains: list, stats: dict,
+                    job_meta: dict | None = None):
+    global _CURRENT_CALL_ID, _ACTIVE_RELAY, _ACTIVE_ROOM, \
+        _ACTIVE_CALL_INFO
 
     agent_llm = ResilientLLM(brains)
     log.info("call brain chain: %s",
@@ -2193,9 +2440,41 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict):
     tts_engine = KokoroTTS()
 
     brief = await load_brief_live()
+
+    # --- telephony classification: who is on the line, which channel.
+    # The SIP participant is already present (entrypoint waited for
+    # it); outbound jobs carry their target in the dispatch metadata.
+    call_info = {"channel": "sip", "direction": "inbound",
+                 "number": "", "called_number": "", "name": "",
+                 "tier": ""}
+    for p in ctx.room.remote_participants.values():
+        call_info = classify_caller(
+            dict(getattr(p, "attributes", {}) or {}),
+            p.identity or "", brief)
+        break
+    if job_meta and job_meta.get("direction") == "outbound":
+        call_info.update(direction="outbound", channel="pstn",
+                         number=str(job_meta.get("to", "")))
+    _ACTIVE_CALL_INFO = call_info
+    _ACTIVE_ROOM = ctx.room
+    log_event("call_classified", call_id=_CURRENT_CALL_ID,
+              channel=call_info["channel"],
+              direction=call_info["direction"],
+              tier=call_info["tier"] or "unknown",
+              known=bool(call_info["name"]))
+
+    instructions = SYSTEM_PROMPT.format(brief=brief)
+    if call_info["channel"] == "pstn":
+        instructions += "\n" + PHONE_RULES
+    if call_info["direction"] == "outbound":
+        instructions += "\n" + OUTBOUND_RULES
+        errand = str((job_meta or {}).get("brief", ""))[:800]
+        if errand:
+            instructions += f"\nYour errand from Jim: {errand}"
     agent = Agent(
-        instructions=SYSTEM_PROMPT.format(brief=brief),
-        tools=[current_time, consult_jett, local_facts],
+        instructions=instructions,
+        tools=[current_time, consult_jett, local_facts,
+               transfer_to_jim, press_digits, leave_voicemail],
     )
     session = AgentSession(
         stt=stt_stream,
@@ -2239,18 +2518,6 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict):
             item = getattr(ev, "item", ev)
             role = getattr(item, "role", "")
             mapped = "jim" if role == "user" else "proxy"
-            if mapped == "proxy":
-                # LiveKit Agents 1.8.7 attaches per-message metrics to
-                # the item; surface the end-to-end latency in the log.
-                metrics = getattr(item, "metrics", None)
-                if metrics:
-                    try:
-                        e2e = metrics.get("e2e_latency")
-                    except AttributeError:
-                        e2e = getattr(metrics, "e2e_latency", None)
-                    if e2e is not None:
-                        log_event("e2e_latency", call_id=relay.call_id,
-                                  e2e_latency_s=e2e)
             text = (getattr(item, "text_content", "") or "").strip()
             if not text:
                 # Streamed replies can fire this event before their
@@ -2316,13 +2583,40 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict):
     wd_task = asyncio.create_task(_watchdog())
 
     try:
-        await session.generate_reply(
-            instructions="Greet the caller briefly as Jett's voice proxy: "
-                         f"say hello in one short sentence like: {GREETING}")
+        if call_info["direction"] == "outbound":
+            # The callee joins when they answer; greeting before that
+            # speaks to an empty room. Wait for the answer (the dialer
+            # also sets wait_until_answered, this is the belt to its
+            # suspenders), capped so a no-answer call still wraps up.
+            for _ in range(90):
+                if ctx.room.remote_participants:
+                    break
+                await asyncio.sleep(0.5)
+        if call_info["channel"] == "pstn":
+            await session.generate_reply(
+                instructions="Greet the caller with exactly this: "
+                             + greeting_for(call_info))
+        else:
+            await session.generate_reply(
+                instructions="Greet the caller briefly as Jett's voice proxy: "
+                             f"say hello in one short sentence like: {GREETING}")
         await ended.wait()
     finally:
         _ACTIVE_RELAY = None
+        _ACTIVE_ROOM = None
+        _ACTIVE_CALL_INFO = None
         if relay is not None:
+            try:
+                # Phase 3 trigger: the runtime watches for call_ended
+                # and produces Jim's summary + follow-ups.
+                relay._receipt(
+                    "call_ended", channel=call_info["channel"],
+                    direction=call_info["direction"],
+                    caller_number=call_info["number"],
+                    known_name=call_info["name"],
+                    tier=call_info["tier"])
+            except Exception:
+                pass
             try:
                 await relay.stop()
             except Exception:
@@ -2377,11 +2671,18 @@ async def entrypoint(ctx: JobContext):
         log_event("call_start", call_id=call_id, room=ctx.room.name,
                   caller=caller)
         log.info("inbound call %s from %s", call_id, caller)
+        job_meta: dict = {}
+        try:
+            raw_meta = getattr(ctx.job, "metadata", "") or ""
+            if raw_meta:
+                job_meta = json.loads(raw_meta)
+        except Exception:
+            job_meta = {}
         brains = resolve_brains()
         if brains:
             log_event("brain_resolved",
                       chain=[f"{b.label}:{b.model}" for b in brains])
-            await _run_call(ctx, brains, stats)
+            await _run_call(ctx, brains, stats, job_meta)
         else:
             log_event("brain_missing")
             await _run_no_brain(ctx)
@@ -2407,8 +2708,6 @@ if __name__ == "__main__":
               brain_models=len(JETT_BRAIN_MODELS)
               + (len(OPENAI_MODELS) if OPENAI_API_KEY else 0),
               brain_max_tokens=BRAIN_MAX_TOKENS,
-              brain_turn_timeout_s=BRAIN_TURN_TIMEOUT_S,
-              brain_chunk_stall_s=BRAIN_CHUNK_STALL_S,
               consult_timeout_s=CONSULT_TIMEOUT_SEC,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
               bus_dir=BUS_DIR,
