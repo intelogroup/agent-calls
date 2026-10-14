@@ -132,6 +132,14 @@ BRAIN_MAX_TOKENS = max(300, int(os.environ.get("BRAIN_MAX_TOKENS", "300")))
 # as failed and the chain advances; if every model caps out, the guaranteed
 # fallback line still speaks. Override with BRAIN_MODEL_TIMEOUT_S.
 BRAIN_MODEL_TIMEOUT_S = float(os.environ.get("BRAIN_MODEL_TIMEOUT_S", "25"))
+# Overall per-turn budget across the WHOLE model chain. Without it, a
+# stalling provider burns the full per-model cap on every chain entry in
+# sequence — 25s x ~6 models of dead air before the fallback speaks (the
+# multi-minute silences on the 2026-10-14 retest calls, which also
+# queued every injected Jett answer behind the stuck turn). Past the
+# turn budget the chain stops and the fallback speaks. Override with
+# BRAIN_TURN_TIMEOUT_S.
+BRAIN_TURN_TIMEOUT_S = float(os.environ.get("BRAIN_TURN_TIMEOUT_S", "40"))
 # Spoken when every model returns empty output. Dead air is never acceptable.
 FALLBACK_LINE = (
     "Sorry — my brain came back empty just now. "
@@ -739,6 +747,7 @@ class ResilientLLM(llm.LLM):
 
     async def _attempt(self, ctx: "_ResilientStream") -> list:
         entries = self._chain()
+        turn_t0 = time.monotonic()
         empty_retries = 0
         for i, entry in enumerate(entries):
             brain, model = entry.brain, entry.model
@@ -754,8 +763,18 @@ class ResilientLLM(llm.LLM):
                     extra_kwargs=ctx._extra_kwargs,
                     **ctx._extra_kw,
                 )
+                cap = min(BRAIN_MODEL_TIMEOUT_S,
+                          BRAIN_TURN_TIMEOUT_S
+                          - (time.monotonic() - turn_t0))
+                if cap <= 0:
+                    log_event("brain_turn_timeout", path="drained",
+                              models_tried=i)
+                    log.warning("brain chat: turn budget %.0fs exhausted "
+                                "after %d models; speaking fallback",
+                                BRAIN_TURN_TIMEOUT_S, i)
+                    break
                 chunks, text, has_tools = await asyncio.wait_for(
-                    _drain(stream), timeout=BRAIN_MODEL_TIMEOUT_S)
+                    _drain(stream), timeout=cap)
             except asyncio.TimeoutError:
                 dt = time.monotonic() - t0
                 try:
@@ -764,10 +783,10 @@ class ResilientLLM(llm.LLM):
                     pass
                 log_event("brain_attempt", model=model,
                           latency_s=round(dt, 2), outcome="timeout",
-                          timeout_s=BRAIN_MODEL_TIMEOUT_S,
+                          timeout_s=round(cap, 1),
                           fallback_to=entries[i + 1].model if i + 1 < len(entries) else None)
                 log.warning("brain chat: model=%s timed out (%.0fs cap); "
-                            "trying next model", model, BRAIN_MODEL_TIMEOUT_S)
+                            "trying next model", model, cap)
                 empty_retries += 1
                 continue
             except Exception as e:
@@ -829,6 +848,7 @@ class ResilientLLM(llm.LLM):
         first chunk, which is where the stalls live.
         """
         entries = self._chain()
+        turn_t0 = time.monotonic()
         empty_retries = 0
         for i, entry in enumerate(entries):
             brain, model = entry.brain, entry.model
@@ -852,10 +872,19 @@ class ResilientLLM(llm.LLM):
                 while True:
                     try:
                         if yielded:
-                            chunk = await it.__anext__()
+                            idle_cap = min(
+                                BRAIN_MODEL_TIMEOUT_S,
+                                BRAIN_TURN_TIMEOUT_S
+                                - (time.monotonic() - turn_t0))
+                            if idle_cap <= 0:
+                                raise asyncio.TimeoutError()
+                            chunk = await asyncio.wait_for(
+                                it.__anext__(), timeout=idle_cap)
                         else:
-                            remaining = BRAIN_MODEL_TIMEOUT_S - (
-                                time.monotonic() - t0)
+                            now = time.monotonic()
+                            remaining = min(
+                                BRAIN_MODEL_TIMEOUT_S - (now - t0),
+                                BRAIN_TURN_TIMEOUT_S - (now - turn_t0))
                             if remaining <= 0:
                                 raise asyncio.TimeoutError()
                             chunk = await asyncio.wait_for(
@@ -880,6 +909,23 @@ class ResilientLLM(llm.LLM):
                     pass
             except asyncio.TimeoutError:
                 dt = time.monotonic() - t0
+                if yielded:
+                    # Speech started, then the provider stalled
+                    # mid-stream: end the turn with the partial reply
+                    # rather than hanging the session (and every
+                    # queued delivery behind it) indefinitely.
+                    if stream is not None:
+                        try:
+                            await stream.aclose()
+                        except Exception:
+                            pass
+                    log_event("brain_attempt", model=model,
+                              latency_s=round(dt, 2),
+                              outcome="stream_stalled", stream=True)
+                    log.warning("brain chat (live): model=%s stalled "
+                                "mid-stream (%.1fs); ending turn",
+                                model, dt)
+                    return
                 if stream is not None:
                     try:
                         await stream.aclose()
