@@ -7,18 +7,21 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Probe live jett-voice machine code and packages
+      - name: Probe app machine 83e133a7d9d178
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
         run: |
-          echo "=== machines ==="
-          flyctl machine list -a jett-voice 2>&1 | head -20 || true
-          MID=$(flyctl machine list -a jett-voice --json 2>/dev/null | python3 -c "import json,sys; ms=json.load(sys.stdin); print([m['id'] for m in ms if m.get('state')=='started'][0])" 2>/dev/null || true)
-          echo "started machine: $MID"
-          echo "=== installed livekit versions (PROBE_A) ==="
-          flyctl machine exec "$MID" "python3 -c \"import livekit, livekit.agents; print('livekit', livekit.__version__); print('agents_file', livekit.agents.__file__)\"" -a jett-voice 2>&1 | tail -5 || true
-          flyctl machine exec "$MID" "pip show livekit-agents livekit 2>/dev/null | grep -E 'Name|Version'" -a jett-voice 2>&1 | tail -8 || true
-          echo "=== deployed live_agent.py bounds (PROBE_B) ==="
-          flyctl machine exec "$MID" "grep -nE 'BRAIN_TURN_TIMEOUT_S|BRAIN_CHUNK_STALL_S|brain_turn_timeout_s|brain_chunk_stall_s|e2e_latency' /app/live_agent.py | head -20" -a jett-voice 2>&1 | tail -25 || true
-          echo "=== md5 of deployed live_agent.py (PROBE_C) ==="
-          flyctl machine exec "$MID" "md5sum /app/live_agent.py; wc -c /app/live_agent.py" -a jett-voice 2>&1 | tail -4 || true
+          MID=83e133a7d9d178
+          echo "=== pip show livekit-agents ==="
+          flyctl machine exec "$MID" "pip show livekit-agents" -a jett-voice 2>&1 | tail -6 || true
+          echo "=== pip show livekit ==="
+          flyctl machine exec "$MID" "pip show livekit" -a jett-voice 2>&1 | tail -6 || true
+          echo "=== ls /app ==="
+          flyctl machine exec "$MID" "ls /app" -a jett-voice 2>&1 | tail -12 || true
+          echo "=== bounds grep ==="
+          flyctl machine exec "$MID" "grep -nE BRAIN_TURN_TIMEOUT_S /app/live_agent.py" -a jett-voice 2>&1 | tail -8 || true
+          flyctl machine exec "$MID" "grep -c BRAIN_CHUNK_STALL_S /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
+          flyctl machine exec "$MID" "grep -c e2e_latency /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
+          echo "=== md5 ==="
+          flyctl machine exec "$MID" "md5sum /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
+          flyctl machine exec "$MID" "wc -c /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
