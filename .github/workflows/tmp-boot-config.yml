@@ -1,0 +1,22 @@
+name: tmp-boot-config
+on:
+  workflow_dispatch: {}
+jobs:
+  logs:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 6
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Boot config lines from jett-voice logs
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
+        run: |
+          timeout 60 flyctl logs -a jett-voice --no-tail 2>&1 | tail -3000 > flylogs.txt || true
+          echo "=== total lines captured ==="
+          wc -l flylogs.txt
+          echo "=== boot_config lines ==="
+          grep -a 'boot_config' flylogs.txt | tail -10 || true
+          echo "=== worker registration lines ==="
+          grep -aiE 'registered worker|worker registered|AW_' flylogs.txt | tail -10 || true
+          echo "=== first 5 lines captured (oldest in window) ==="
+          head -5 flylogs.txt || true
