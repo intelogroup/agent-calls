@@ -7,21 +7,19 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Probe app machine 83e133a7d9d178
+      - name: Probe app machine 83e133a7d9d178 at /opt/agent
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
         run: |
           MID=83e133a7d9d178
-          echo "=== pip show livekit-agents ==="
-          flyctl machine exec "$MID" "pip show livekit-agents" -a jett-voice 2>&1 | tail -6 || true
-          echo "=== pip show livekit ==="
-          flyctl machine exec "$MID" "pip show livekit" -a jett-voice 2>&1 | tail -6 || true
-          echo "=== ls /app ==="
-          flyctl machine exec "$MID" "ls /app" -a jett-voice 2>&1 | tail -12 || true
-          echo "=== bounds grep ==="
-          flyctl machine exec "$MID" "grep -nE BRAIN_TURN_TIMEOUT_S /app/live_agent.py" -a jett-voice 2>&1 | tail -8 || true
-          flyctl machine exec "$MID" "grep -c BRAIN_CHUNK_STALL_S /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
-          flyctl machine exec "$MID" "grep -c e2e_latency /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
-          echo "=== md5 ==="
-          flyctl machine exec "$MID" "md5sum /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
-          flyctl machine exec "$MID" "wc -c /app/live_agent.py" -a jett-voice 2>&1 | tail -3 || true
+          echo "=== pip versions ==="
+          flyctl machine exec "$MID" "pip show livekit-agents livekit" -a jett-voice 2>&1 | grep -E "^(Name|Version)" || true
+          echo "=== bounds in deployed code ==="
+          flyctl machine exec "$MID" "grep -n BRAIN_TURN_TIMEOUT_S /opt/agent/live_agent.py" -a jett-voice 2>&1 | tail -8 || true
+          echo "chunk_stall_count:"
+          flyctl machine exec "$MID" "grep -c BRAIN_CHUNK_STALL_S /opt/agent/live_agent.py" -a jett-voice 2>&1 | tail -2 || true
+          echo "e2e_latency_count:"
+          flyctl machine exec "$MID" "grep -c e2e_latency /opt/agent/live_agent.py" -a jett-voice 2>&1 | tail -2 || true
+          echo "=== md5 and size ==="
+          flyctl machine exec "$MID" "md5sum /opt/agent/live_agent.py" -a jett-voice 2>&1 | tail -2 || true
+          flyctl machine exec "$MID" "wc -c /opt/agent/live_agent.py" -a jett-voice 2>&1 | tail -2 || true
