@@ -1170,6 +1170,26 @@ async def _git(args: list[str], cwd: str = BUS_DIR) -> tuple[int, str]:
     return await loop.run_in_executor(None, _run)
 
 
+async def _git_show(revspec: str) -> str | None:
+    """Full stdout of `git show <revspec>`, or None if the path is absent.
+
+    _git truncates+strips its output (fine for status checks, wrong for
+    file contents). The relay reads Jett's returns through this so the
+    bytes are exact and the working tree's freshness is irrelevant —
+    the fetched origin/main ref is the source of truth (2026-10-14).
+    """
+    loop = asyncio.get_running_loop()
+
+    def _run() -> tuple[int, str]:
+        p = subprocess.run(["git", "-C", BUS_DIR, "show", revspec],
+                           env=_git_env(), capture_output=True, text=True,
+                           timeout=30)
+        return p.returncode, p.stdout
+
+    rc, out = await loop.run_in_executor(None, _run)
+    return out if rc == 0 else None
+
+
 def _clear_stale_git_locks(max_age_s: float = 30.0) -> int:
     """Remove orphaned *.lock files under the bus clone's .git.
 
@@ -1513,6 +1533,19 @@ class CallRelay:
         self.pending: dict[str, str] = {}
         self.spoken: set[str] = set()
         self._out_offset = 0
+        # In-call delivery repair (2026-10-14): speaking is fire-and-
+        # forget — a SpeechHandle is NEVER awaited inside the tick. On
+        # Jim's 11:55Z call an interrupted say() handle never resolved,
+        # the relay loop froze at ~11:59:38Z, and both of Jett's answers
+        # sat unspoken while transcript flushes (same loop) stopped too.
+        # Watch tasks finish the bookkeeping per say; receipts for every
+        # step land on the bus (relay.jsonl) — Fly logs are too lossy to
+        # diagnose this leg.
+        self._speaking: set[str] = set()
+        self._attempts: dict[str, int] = {}
+        self._seen_answers: set[str] = set()
+        self._say_tasks: set[asyncio.Task] = set()
+        self._receipts: list[str] = []
         self._tx_buffer: list[str] = []
         self._task: asyncio.Task | None = None
         self._stopped = False
@@ -1548,6 +1581,9 @@ class CallRelay:
                 pass
             self._task = None
         await self._final_flush()
+        self._receipt("relay_stopped", pending_left=len(self.pending),
+                      spoken=sorted(self.spoken))
+        await self._flush_receipts()
         log_event("relay_stopped", call_id=self.call_id,
                   pending_left=len(self.pending),
                   tx_noted=sum(self._noted.values()),
@@ -1596,6 +1632,7 @@ class CallRelay:
     def hand_off(self, req_id: str, question: str) -> None:
         self.pending[req_id] = question
         log_event("relay_handoff", id=req_id[:8], call_id=self.call_id)
+        self._receipt("handoff", id=req_id, question=question[:200])
 
     def note_transcript(self, role: str, text: str,
                         source: str = "item") -> None:
@@ -1700,13 +1737,75 @@ class CallRelay:
             self._tx_buffer = lines + self._tx_buffer  # retry next flush
         return ok
 
-    async def _say(self, text: str) -> None:
+    # --- delivery receipts: the bus is the reliable record -----------
+    def _receipt(self, event: str, **fields) -> None:
+        line = {"ts": _utcnow_z(), "event": event,
+                "call_id": self.call_id, **fields}
+        self._receipts.append(json.dumps(line, ensure_ascii=False))
+
+    async def _flush_receipts(self) -> None:
+        if not self._receipts:
+            return
+        lines, self._receipts = self._receipts, []
+        ok = await _bus_append_lines(f"{self._live_rel}/relay.jsonl",
+                                     lines, f"relay {self.call_id}")
+        if not ok:
+            self._receipts = lines + self._receipts  # retry next tick
+
+    async def _watch_say(self, handle, text: str, kind: str,
+                         req_id: str | None) -> None:
+        """Finish one fired say()'s bookkeeping in its own task.
+
+        The relay loop never waits on speech (2026-10-14 repair — see
+        __init__). Success marks the consult spoken; the answer also
+        enters the model's chat context via say's add_to_chat_ctx.
+        Failure or timeout leaves the consult pending so the tick
+        retries (attempts capped in _tick).
+        """
+        async def _await_handle():
+            await handle
+
         try:
-            await self.session.say(text, allow_interruptions=True)
-            log_event("relay_spoke", call_id=self.call_id,
-                      text_len=len(text))
+            await asyncio.wait_for(_await_handle(), timeout=45)
         except Exception as e:
-            log.warning("relay say failed: %s", e)
+            log.warning("relay say (%s) did not complete: %s", kind, e)
+            log_event("relay_say_failed", call_id=self.call_id, kind=kind,
+                      id=(req_id or "")[:8], error=str(e)[:200])
+            self._receipt("speak_failed", kind=kind, id=req_id,
+                          error=str(e)[:200])
+            return
+        finally:
+            if req_id:
+                self._speaking.discard(req_id)
+        if req_id:
+            self.spoken.add(req_id)
+            self.pending.pop(req_id, None)
+        log_event("relay_spoke", call_id=self.call_id, kind=kind,
+                  id=(req_id or "")[:8], text_len=len(text))
+        self._receipt("spoke", kind=kind, id=req_id, text=text[:200])
+
+    def _start_say(self, text: str, kind: str,
+                   req_id: str | None = None) -> bool:
+        """Fire a say() WITHOUT awaiting its handle in the caller."""
+        try:
+            handle = self.session.say(text, allow_interruptions=True)
+        except Exception as e:
+            log.warning("relay say (%s) failed to start: %s", kind, e)
+            log_event("relay_say_failed", call_id=self.call_id, kind=kind,
+                      id=(req_id or "")[:8], error=f"start: {e}"[:200])
+            self._receipt("speak_failed", kind=kind, id=req_id,
+                          error=f"start: {e}"[:200])
+            return False
+        if req_id:
+            self._speaking.add(req_id)
+            self._attempts[req_id] = self._attempts.get(req_id, 0) + 1
+        self._receipt("speak_started", kind=kind, id=req_id,
+                      text=text[:200])
+        task = asyncio.create_task(self._watch_say(handle, text, kind,
+                                                   req_id))
+        self._say_tasks.add(task)
+        task.add_done_callback(self._say_tasks.discard)
+        return True
 
     async def _loop(self) -> None:
         while not self._stopped:
@@ -1724,15 +1823,31 @@ class CallRelay:
         answers: list[tuple[str, str]] = []
         out_texts: list[str] = []
         async with _BUS_LOCK:
-            await _git(["pull", "--ff-only", "-q"])
+            # Read Jett's returns from the FETCHED remote ref, never the
+            # working tree (2026-10-14 repair): tree freshness depended
+            # on the append path's push/rebase cycle — one more silent
+            # way for this leg to see nothing. git show on origin/main
+            # is exact and read-only.
+            rc, _ = await _git(["fetch", "origin", "-q"])
+            if rc != 0:
+                log_event("relay_fetch_failed", call_id=self.call_id,
+                          rc=rc)
+                self._receipt("fetch_failed", rc=rc)
             for req_id in list(self.pending):
-                if req_id in self.spoken:
+                if req_id in self.spoken or req_id in self._speaking:
                     continue
-                path = os.path.join(BUS_DIR, "responses", f"{req_id}.json")
+                if self._attempts.get(req_id, 0) >= 3:
+                    self.pending.pop(req_id, None)
+                    log_event("relay_gave_up", id=req_id[:8],
+                              call_id=self.call_id)
+                    self._receipt("gave_up", kind="consult", id=req_id)
+                    continue
+                raw = await _git_show(f"origin/main:responses/{req_id}.json")
+                if raw is None:
+                    continue
                 try:
-                    with open(path, encoding="utf-8") as f:
-                        obj = json.load(f)
-                except (OSError, ValueError):
+                    obj = json.loads(raw)
+                except ValueError:
                     continue
                 if obj.get("id") != req_id:
                     continue
@@ -1743,44 +1858,49 @@ class CallRelay:
                     log.warning("consult %s answered_by=%r (expected "
                                 "'jett-runtime') — not speaking",
                                 req_id[:8], obj.get("answered_by"))
+                    self._receipt("answer_rejected", id=req_id,
+                                  answered_by=str(obj.get("answered_by")))
+                    self.pending.pop(req_id, None)
                     continue
+                if req_id not in self._seen_answers:
+                    self._seen_answers.add(req_id)
+                    self._receipt("answer_seen", kind="consult",
+                                  id=req_id, answer=answer[:200])
                 answers.append((req_id, answer))
-            out_path = os.path.join(BUS_DIR, self._live_rel, "out.jsonl")
-            try:
-                with open(out_path, "rb") as f:
-                    f.seek(0, os.SEEK_END)
-                    if f.tell() < self._out_offset:
-                        self._out_offset = 0  # file replaced; start over
-                    f.seek(self._out_offset)
-                    chunk = f.read()
+            raw_out = await _git_show(
+                f"origin/main:{self._live_rel}/out.jsonl")
+            if raw_out:
+                data = raw_out.encode("utf-8")
+                if len(data) < self._out_offset:
+                    self._out_offset = 0  # file replaced; start over
+                chunk = data[self._out_offset:]
                 last_nl = chunk.rfind(b"\n")
                 if last_nl >= 0:
                     complete = chunk[:last_nl]
                     self._out_offset += last_nl + 1
-                    for raw in complete.split(b"\n"):
-                        raw = raw.strip()
-                        if not raw:
+                    for raw_line in complete.split(b"\n"):
+                        raw_line = raw_line.strip()
+                        if not raw_line:
                             continue
                         try:
-                            line = json.loads(raw.decode("utf-8"))
+                            line = json.loads(raw_line.decode("utf-8"))
                         except (ValueError, UnicodeDecodeError):
                             continue
                         text = (line.get("text") or "").strip()
                         if text:
                             out_texts.append(text)
-            except OSError:
-                pass
         for req_id, answer in answers:
-            self.spoken.add(req_id)
-            self.pending.pop(req_id, None)
             log_event("consult_answered_live", id=req_id[:8],
                       call_id=self.call_id, answer_len=len(answer))
-            await self._say(f"{ATTRIBUTION_PREFIX}: {answer}")
+            self._start_say(f"{ATTRIBUTION_PREFIX}: {answer}",
+                            kind="consult", req_id=req_id)
         for text in out_texts:
             log_event("relay_out_line", call_id=self.call_id,
                       text_len=len(text))
-            await self._say(text)
+            self._receipt("out_line_seen", kind="out", text=text[:200])
+            self._start_say(text, kind="out")
         self._process_deferred()
+        await self._flush_receipts()
         if self._tx_buffer:
             # Flush EVERY tick, not at a 6-line threshold (2026-10-14
             # fix): short calls never reached the threshold, so their
@@ -1834,9 +1954,16 @@ async def consult_jett(question: str, context: RunContext,
                 "CONVERSATION GOING. Do NOT wait, guess, or invent his "
                 "answer.")
     # No relay active (not the served path): fall back to the original
-    # blocking poll so the caller can still get a live answer.
+    # blocking poll so the caller can still get a live answer. Loud on
+    # purpose (2026-10-14): this branch firing mid-call means the
+    # relay registration diverged from the served path — it must never
+    # be silent again.
+    log_event("consult_no_relay", id=req["id"][:8],
+              call_id=_CURRENT_CALL_ID)
     try:
-        await context.session.say(
+        # Fire-and-forget: awaiting a SpeechHandle can hang on
+        # interruption (the 2026-10-14 relay freeze) — never await one.
+        context.session.say(
             "Let me check with Jett on that — one moment…",
             allow_interruptions=True,
         )
