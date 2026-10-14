@@ -42,6 +42,19 @@ EOF
   echo "[entrypoint] dry-test agent name: jett-proxy-drytest"
 fi
 
+# --- agent-call-bus deploy key (production; skipped in dry-test) ---
+# live_agent.py reads the key from ~/.ssh/bus_key (BUS_KEY). The Fly
+# secret BUS_KEY_PEM has existed on the app since the durable-image
+# work, but nothing ever materialized it to that path — so on every
+# fresh-image machine the bus clone failed SSH auth and ALL bus writes
+# (consults + transcripts) silently died (found 2026-10-14).
+if [ -n "${BUS_KEY_PEM:-}" ] && [ "${DRY_TEST:-0}" != "1" ]; then
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  printf '%s\n' "$BUS_KEY_PEM" > /root/.ssh/bus_key
+  chmod 600 /root/.ssh/bus_key
+  echo "[entrypoint] bus deploy key materialized at /root/.ssh/bus_key"
+fi
+
 # --- production Oracle tunnel (skipped in dry-test) ---
 if [ -n "${TUNNEL_SSH_KEY:-}" ] && [ "${DRY_TEST:-0}" != "1" ]; then
   echo "[entrypoint] starting Oracle SSH tunnel (7880/7881)"

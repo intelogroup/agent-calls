@@ -22,8 +22,12 @@ ENV AGENT_DIR=/opt/agent \
 
 # libsndfile1: soundfile wheel needs it. curl: model downloads.
 # openssh-client: optional Oracle tunnel at runtime. ca-certificates: TLS.
+# git: the agent-call-bus layer shells out to git for EVERY bus write
+# (consults, transcripts) — it was missing from this image, which left
+# every durable-image worker unable to reach the bus at all (found
+# 2026-10-14, after production transcripts were lost to it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libsndfile1 curl openssh-client ca-certificates \
+      libsndfile1 curl openssh-client ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/agent
