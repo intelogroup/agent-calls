@@ -1,11 +1,11 @@
 # Jett voice proxy stack (no local LLM — brain is the Meta Model API).
 # Pinned to the versions integration-tested on 2026-09-18.
-livekit-agents==1.8.3
+livekit-agents==1.8.7
 livekit-api==1.2.1
-livekit==1.1.18
+livekit==1.1.20
 livekit-protocol==1.1.27
-livekit-plugins-openai==1.8.3
-livekit-plugins-silero==1.8.3
+livekit-plugins-openai==1.8.7
+livekit-plugins-silero==1.8.7
 faster-whisper==1.2.1
 onnxruntime==1.30.0
 kokoro-onnx==0.6.1
@@ -13,3 +13,5 @@ tzdata>=2024.1
 soundfile>=0.12.0
 numpy>=1.26.0
 huggingface_hub>=0.20.0
+openai>=3.19,<4
+websockets>=17.1,<17.2
