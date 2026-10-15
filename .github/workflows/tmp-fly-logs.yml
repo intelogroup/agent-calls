@@ -1,16 +1,14 @@
-name: tmp-fly-logs
+name: "(temporary) jett-voice fly logs"
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 jobs:
   logs:
     runs-on: [self-hosted, oracle]
-    timeout-minutes: 6
+    timeout-minutes: 3
     steps:
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Recent jett-voice worker logs
+      - name: Tail fly logs
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
         run: |
-          timeout 45 flyctl logs -a jett-voice --no-tail 2>&1 | tail -400 > flylogs.txt || true
-          echo "=== session/brain/stt/tts lines ==="
-          grep -aiE 'session started|call brain|brain usage|brain_attempt|brain_exhausted|stt_|tts_|caller hung|room |registered worker|speaking|listening|consult_' flylogs.txt | tail -60 || true
+          curl -sL https://github.com/superfly/flyctl/releases/download/v0.3.248/flyctl_0.3.248_Linux_x86_64.tar.gz | tar xz -C /tmp flyctl
+          /tmp/flyctl logs -a jett-voice --no-tail 2>/dev/null | grep -aE '"event": "(boot_config|bridge_boot|registered|call_classified)"' | tail -4
