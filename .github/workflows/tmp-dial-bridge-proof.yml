@@ -17,10 +17,13 @@ jobs:
         with:
           ref: tmp/bridge-outbound
           path: tree
-      - name: Install LiveKit Python SDK into /tmp/probe-libs
+      - name: Install LiveKit Python SDK into a FRESH /tmp/dial-libs
         run: |
-          python3 -m pip install --target=/tmp/probe-libs "livekit==1.1.20" "livekit-api==1.2.1"
-          ls /tmp/probe-libs | head -5
+          rm -rf /tmp/dial-libs
+          python3 -m pip install --target=/tmp/dial-libs "livekit==1.1.20" "livekit-api==1.2.1"
+          ls /tmp/dial-libs | head -8
+          ls /tmp/dial-libs/livekit | head -8
+          PYTHONPATH=/tmp/dial-libs python3 -c "from livekit import api; print('livekit.api import OK')"
       - name: Load LiveKit dialer env from the server config (values never printed)
         run: |
           python3 - <<'PYEOF'
@@ -56,13 +59,13 @@ jobs:
           PYEOF
       - name: Dry-run plan first (no call placed)
         run: |
-          PYTHONPATH=/tmp/probe-libs python3 tree/dial.py \
+          PYTHONPATH=/tmp/dial-libs python3 tree/dial.py \
             --to +19787156903 --engine deepgram --name Beckendy \
             --brief "Check in on Beckendy for Jim: Jim asked you to ask if he is feeling well after his flu shot. Be warm and keep it short. Listen to his answer, respond to what he says, wish him well, and end the call politely." \
             --dry-run
       - name: Place the ONE proof call
         run: |
-          PYTHONPATH=/tmp/probe-libs python3 tree/dial.py \
+          PYTHONPATH=/tmp/dial-libs python3 tree/dial.py \
             --to +19787156903 --engine deepgram --name Beckendy \
             --brief "Check in on Beckendy for Jim: Jim asked you to ask if he is feeling well after his flu shot. Be warm and keep it short. Listen to his answer, respond to what he says, wish him well, and end the call politely."
       - name: Let the call play out
