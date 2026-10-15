@@ -20,5 +20,3 @@ primary_region = "iad"
 auto_stop_machines = false
 auto_start_machines = true
 
-[deploy]
-  release_command = "HF_HUB_OFFLINE=1 timeout 200 python3 /opt/agent/bench_fly.py || true"
