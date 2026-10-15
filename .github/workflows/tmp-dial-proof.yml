@@ -45,7 +45,7 @@ jobs:
           export LIVEKIT_URL=http://localhost:7880
           export LIVEKIT_SIP_OUTBOUND_TRUNK_ID=ST_NqGc4EfiT8mZ
           export JETT_PHONE_E164=+16176556805
-          pip3 install --user --quiet "livekit>=0.18" || pip3 install --user --quiet --break-system-packages "livekit>=0.18"
+          python3 -m pip install --user --quiet "livekit>=0.18" || python3 -m pip install --user --quiet --break-system-packages "livekit>=0.18"
           DIAL=$(find . -name dial.py | head -1)
           echo "dialer: $DIAL"
           python3 "$DIAL" --to +18574261739 --brief "Outbound proof call on Jim's new Telnyx line. Greet Jim warmly, confirm he can hear you clearly, and ask him to confirm the caller ID on his phone showed 617-655-6805. Keep it short and friendly, then wrap up and say goodbye."
