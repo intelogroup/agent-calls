@@ -191,6 +191,12 @@ AGENT_NAME = "jett-proxy"
 # one call at a time; a second caller gets a polite busy message
 _CALL_LOCK = threading.Lock()
 _ACTIVE_CALL: str | None = None
+# The ring-first wait currently in progress, if any:
+# {"call_id", "caller_digits", "abort": threading.Event}. Jobs run
+# in separate threads/loops, so the cross-job signal (Jim's cell
+# forwarding our own ring leg back) travels on a threading.Event.
+_RING_WAIT: dict | None = None
+_RING_WAIT_LOCK = threading.Lock()
 # call id of the call currently being served (for consult context)
 _CURRENT_CALL_ID: str | None = None
 # Serializes git operations on the shared bus clone (consult filings,
@@ -2684,6 +2690,20 @@ PSTN_TRANSFER_URI = os.environ.get("PSTN_TRANSFER_URI", "")
 CONSENT_LINE = ("Just so you know, I take notes on calls for Jim, "
                 "and he gets a transcript.")
 
+# --- ring-me-first (Jim, 2026-10-15): an inbound PSTN call rings
+# Jim's cell FIRST; the agent answers only if he doesn't pick up
+# within the window. Gated by env RING_FIRST=1 (set in fly.toml
+# [env]); unset = the agent answers immediately, exactly as before.
+# Jim's own calls (tier "self") never ring-first — he's calling his
+# agent on purpose. Quiet hours (22:00-08:00 ET, Jim's standing rule
+# for this system ringing his phone) skip the ring: the agent
+# answers directly and the skip is logged, never silent.
+RING_FIRST = os.environ.get("RING_FIRST", "0") == "1"
+RING_FIRST_WINDOW_S = float(os.environ.get("RING_FIRST_WINDOW_S", "10"))
+# Outbound trunk used to originate Jim's leg — the same trunk the
+# dialer uses (LIVEKIT_SIP_OUTBOUND_TRUNK_ID is a Fly secret).
+SIP_OUTBOUND_TRUNK_ID = os.environ.get("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "")
+
 _ACTIVE_ROOM = None       # rtc.Room of the live call (set in _run_call)
 _ACTIVE_CALL_INFO = None  # classify_caller() dict for the live call
 
@@ -2737,6 +2757,110 @@ SELF_SIP_IDENTITIES = {
 }
 
 
+_DIV_URI_RE = re.compile(r"<(?:sip|tel):([^@;>]+)(?:@[^>]+)?>")
+_DIV_REASON_RE = re.compile(r"reason=([a-z-]+)")
+_HI_CAUSE_RE = re.compile(r"cause\s*(?:=|:|%3D|%3A)\s*(\d+)", re.I)
+_HI_CAUSE_MAP = {"408": "no-answer", "486": "busy",
+                 "480": "unavailable", "302": "unconditional"}
+
+
+def _attr(attrs: dict, *keys: str) -> str:
+    """First non-empty attribute among key spellings. The trunk maps
+    Diversion / History-Info / P-Asserted-Identity to canonical
+    attribute names (headers_to_attributes) and also includes all
+    headers (include_headers=SIP_ALL_HEADERS -> sip.h.*), so accept
+    both spellings of each."""
+    for k in keys:
+        v = (attrs or {}).get(k)
+        if v:
+            return v
+    return ""
+
+
+def parse_diversion(attrs: dict) -> dict:
+    """Was this call diverted (forwarded) to the agent line, and by
+    whom? Sources, in order: the Diversion header (RFC 5806 — the
+    redirecting party + reason) and History-Info (RFC 7044 — first
+    entry is the originally-called URI; a retarget shows up as a
+    later entry, its embedded Reason cause gives the why).
+
+    Returns {"diverted", "from", "from_digits", "reason", "source"}.
+    Standards-based: the header->attribute plumbing is configured on
+    the inbound trunk, but no live forwarded call has been observed
+    yet (Jim enables cell forwarding after this ships)."""
+    out = {"diverted": False, "from": "", "from_digits": "",
+           "reason": "", "source": ""}
+    div = _attr(attrs, "sip.diversion", "sip.h.diversion")
+    if div:
+        uris = list(_DIV_URI_RE.finditer(div))
+        if uris:
+            first = uris[0]
+            tail = div[first.end():]
+            nxt = tail.find("<")
+            if nxt >= 0:
+                tail = tail[:nxt]
+            m = _DIV_REASON_RE.search(tail)
+            out.update(diverted=True, source="diversion",
+                       reason=m.group(1) if m else "")
+            out["from"] = first.group(1)
+            out["from_digits"] = _digits10(first.group(1))
+            return out
+    hist = _attr(attrs, "sip.history_info", "sip.h.history-info",
+                 "sip.history-info")
+    if hist:
+        uris = list(_DIV_URI_RE.finditer(hist))
+        if len(uris) >= 2:
+            cause = ""
+            m = _HI_CAUSE_RE.search(hist)
+            if m:
+                cause = _HI_CAUSE_MAP.get(m.group(1), "")
+            out.update(diverted=True, source="history-info",
+                       reason=cause)
+            out["from"] = uris[0].group(1)
+            out["from_digits"] = _digits10(uris[0].group(1))
+            return out
+    return out
+
+
+def pai_number(attrs: dict) -> str:
+    """The network-asserted originator (P-Asserted-Identity), when
+    the trunk passed it through. More trustworthy than From on a
+    diverted call, where From may be rewritten to the redirector."""
+    pai = _attr(attrs, "sip.p_asserted_identity",
+                "sip.h.p-asserted-identity")
+    if not pai:
+        return ""
+    m = _DIV_URI_RE.search(pai)
+    return m.group(1) if m else pai.strip()
+
+
+def diversion_probe(attrs: dict) -> dict:
+    """Lightweight diversion view for call-path checks that don't
+    need the brief: was it diverted, from which number, and who is
+    the original caller (PAI wins, else sip.phoneNumber)."""
+    div = parse_diversion(attrs)
+    caller = pai_number(attrs) or (attrs or {}).get(
+        "sip.phoneNumber", "") or ""
+    return {"diverted": div["diverted"],
+            "from_digits": div["from_digits"],
+            "caller_digits": _digits10(caller),
+            "reason": div["reason"]}
+
+
+def loop_leg_match(probe: dict, ring_wait: dict | None,
+                   jim_digits: str) -> bool:
+    """True when an inbound diverted call is our own ring-first leg
+    coming back: it was diverted FROM Jim's cell (his conditional
+    forwarding fired on the leg we originated) and its original
+    caller is the caller the active ring wait is serving."""
+    if not ring_wait or not probe.get("diverted"):
+        return False
+    if probe.get("from_digits") != jim_digits:
+        return False
+    return bool(ring_wait.get("caller_digits")) and \
+        probe.get("caller_digits") == ring_wait["caller_digits"]
+
+
 def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
     """Who is on the line and how did they arrive. attrs are the SIP
     participant's attributes (sip.phoneNumber = caller's number,
@@ -2748,12 +2872,23 @@ def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
     "intelogroup", matched no known caller, and was classified a
     stranger on his own line — tier gates and the speculative feed
     never engaged). Jim's own SIP usernames are tier "self".
+
+    Diverted (forwarded) calls — e.g. Jim's cell conditionally
+    forwarding an unanswered call to the agent line — are classified
+    by the REAL (pre-diversion) caller, recovered from
+    P-Asserted-Identity when From was rewritten to the redirector.
+    HARD RULE: a diverted call is NEVER tier "self", even when a
+    header carries Jim's number — orders mode requires an undiverted
+    call from his cell.
     """
     phone = (attrs or {}).get("sip.phoneNumber", "") or ""
     called = (attrs or {}).get("sip.trunkPhoneNumber", "") or ""
     if not phone and _digits10(identity or ""):
         phone = identity
     raw_id = phone or (identity or "")
+    base = {"diverted": False, "diverted_from": "",
+            "diverted_from_digits": "", "diversion_reason": "",
+            "diversion_source": "", "forwarded_from_cell": False}
     if raw_id and not _digits10(raw_id):
         user = raw_id.strip().lower()
         if user.startswith("sip:"):
@@ -2767,16 +2902,41 @@ def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
             "called_number": called,
             "name": "Jim" if is_self else "",
             "tier": "self" if is_self else "",
+            **base,
         }
+    div = parse_diversion(attrs)
+    number = phone
+    if div["diverted"]:
+        pai = pai_number(attrs)
+        if _digits10(pai) and (not _digits10(phone)
+                               or _digits10(phone)
+                               == div["from_digits"]):
+            number = pai  # From was the redirector; PAI is the caller
+        elif _digits10(phone) == div["from_digits"]:
+            # From rewritten to the redirector and no PAI: the real
+            # originator is unrecoverable — classify as unknown,
+            # never as the redirector (who may be Jim).
+            number = ""
     known = parse_known_callers(brief)
-    hit = known.get(_digits10(phone), {})
+    hit = known.get(_digits10(number), {})
+    tier = hit.get("tier", "")
+    if div["diverted"] and tier == "self":
+        tier = ""  # HARD RULE: diverted calls never reach orders mode
     return {
         "channel": "pstn" if phone else "sip",
         "direction": "inbound",
-        "number": phone,
+        "number": number,
         "called_number": called,
         "name": hit.get("name", ""),
-        "tier": hit.get("tier", ""),
+        "tier": tier,
+        "diverted": div["diverted"],
+        "diverted_from": div["from"],
+        "diverted_from_digits": div["from_digits"],
+        "diversion_reason": div["reason"],
+        "diversion_source": div["source"],
+        "forwarded_from_cell": bool(
+            div["diverted"]
+            and div["from_digits"] == _digits10(JIM_PHONE_E164)),
     }
 
 
@@ -2788,6 +2948,18 @@ def greeting_for(info: dict) -> str:
     script (scenario test S5 caught this, 2026-10-14)."""
     if info.get("tier") == "self":
         return GREETING
+    if info.get("forwarded_from_cell"):
+        # The call reached the agent because Jim's cell rang
+        # unanswered and forwarded it — say so, don't pretend the
+        # caller dialed the agent line.
+        if info.get("name"):
+            return (f"Hi {info['name']}, this is Jett, Jim's "
+                    "assistant. Jim couldn't pick up just now, but "
+                    "I can help you or take a message. "
+                    + CONSENT_LINE)
+        return ("Hi, this is Jett, Jim's assistant. Jim couldn't "
+                "pick up just now, but I can help you or take a "
+                "message for him. " + CONSENT_LINE)
     if info.get("name"):
         return (f"Hi {info['name']}, this is Jett, Jim's assistant. "
                 "He can't come to the phone right now, but I can help "
@@ -2857,6 +3029,287 @@ async def _do_transfer(room_name: str, participant_identity: str,
     )
     await api_client.sip.transfer_sip_participant(req)
     return True, "started"
+
+
+# ------------------------------------------------------- ring-first --
+
+def in_quiet_hours(now: datetime) -> bool:
+    """Jim's standing quiet hours for this system ringing his phone:
+    22:00-08:00 in his timezone. `now` must be tz-aware."""
+    h = now.hour
+    return h >= 22 or h < 8
+
+
+def ring_first_decision(info: dict, *, enabled: bool, quiet: bool,
+                        trunk_id: str) -> str:
+    """Pure gate for ring-me-first. Returns one of:
+    "off" (flag unset), "skip" (not an inbound PSTN call, or Jim
+    himself calling), "quiet_hours", "no_trunk", "ring"."""
+    if not enabled:
+        return "off"
+    if info.get("channel") != "pstn" \
+            or info.get("direction") != "inbound":
+        return "skip"
+    if info.get("tier") == "self":
+        return "skip"
+    if info.get("diverted"):
+        # Forwarded call: a phone already rang unanswered (Jim's
+        # cell, in the forwarding setup) — answer immediately, and
+        # never ring his cell about a call that came FROM his cell.
+        return "skip"
+    if quiet:
+        return "quiet_hours"
+    if not trunk_id:
+        return "no_trunk"
+    return "ring"
+
+
+def build_ring_request(room_name: str, identity: str, *,
+                       trunk_id: str, call_to: str,
+                       from_number: str = ""):
+    """The CreateSIPParticipantRequest that rings Jim's cell into
+    this room. wait_until_answered=True is the proven dialer shape:
+    the RPC resolves when Jim picks up and raises on busy/decline/
+    no-route, which is what makes the ring race below decidable."""
+    from livekit.protocol.sip import CreateSIPParticipantRequest
+    kw = dict(
+        sip_trunk_id=trunk_id,
+        sip_call_to=call_to,
+        room_name=room_name,
+        participant_identity=identity,
+        participant_name="Jim",
+        wait_until_answered=True,
+        krisp_enabled=True,
+    )
+    if from_number:
+        kw["sip_number"] = from_number
+    return CreateSIPParticipantRequest(**kw)
+
+
+async def _ring_race(*, create, cleanup, window_s: float,
+                     caller_gone: asyncio.Event,
+                     loop_abort: "threading.Event | None" = None,
+                     now=time.monotonic) -> tuple[str, float, str]:
+    """Race Jim's answer against the ring window and the caller
+    hanging up. `create` is an async callable that resolves when Jim
+    answers and raises when his leg fails (decline/busy); `cleanup`
+    is an async callable taking the create task, invoked for every
+    outcome except "taken" to stop Jim's phone ringing.
+
+    `loop_abort` is a threading.Event set by another job when Jim's
+    cell forwards our own ring leg back to the agent line: that
+    forwarded leg IS the no-answer signal, so the race ends as
+    "loop" and the agent answers the original call itself.
+
+    Returns (outcome, elapsed_s, detail): outcome is "taken",
+    "declined", "no_answer", "caller_gone", or "loop"."""
+    t0 = now()
+    create_task = asyncio.ensure_future(create())
+    timer_task = asyncio.ensure_future(asyncio.sleep(window_s))
+    gone_task = asyncio.ensure_future(caller_gone.wait())
+    abort_task = None
+    if loop_abort is not None:
+        async def _poll_abort():
+            while not loop_abort.is_set():
+                await asyncio.sleep(0.05)
+        abort_task = asyncio.ensure_future(_poll_abort())
+    racers = {create_task, timer_task, gone_task}
+    if abort_task is not None:
+        racers.add(abort_task)
+    outcome, detail = "no_answer", ""
+    try:
+        done, _ = await asyncio.wait(
+            racers, return_when=asyncio.FIRST_COMPLETED)
+        if create_task in done:
+            if create_task.cancelled():
+                outcome, detail = "declined", "cancelled"
+            elif create_task.exception() is not None:
+                e = create_task.exception()
+                outcome = "declined"
+                detail = f"{type(e).__name__}: {str(e)[:120]}"
+            else:
+                outcome = "taken"
+        elif gone_task in done:
+            outcome = "caller_gone"
+        elif abort_task is not None and abort_task in done:
+            outcome, detail = "loop", "own ring leg forwarded back"
+    finally:
+        for t in (timer_task, gone_task, abort_task):
+            if t is not None:
+                t.cancel()
+    if outcome != "taken":
+        try:
+            await cleanup(create_task)
+        except Exception:
+            pass
+    return outcome, round(now() - t0, 2), detail
+
+
+class _RingbackTone:
+    """US ringback (440+480 Hz, 2 s on / 4 s off) published into the
+    room while Jim's cell rings, so the caller hears ringing — not
+    silence, and not the agent. The inbound SIP leg is answered by
+    the LiveKit SIP service when the room is created, so without
+    this the caller would hear dead air for the whole window."""
+
+    def __init__(self, room, sample_rate: int = 24000) -> None:
+        self._room = room
+        self._sr = sample_rate
+        self._source = None
+        self._track = None
+        self._task: asyncio.Task | None = None
+
+    def _cycle_pcm(self) -> bytes:
+        sr = self._sr
+        t = np.arange(sr * 6) / sr  # one full 6 s ring cycle
+        tone = (np.sin(2 * np.pi * 440 * t)
+                + np.sin(2 * np.pi * 480 * t)) * 0.12
+        tone[int(sr * 2):] = 0.0
+        return (np.clip(tone, -1.0, 1.0) * 32767).astype(
+            np.int16).tobytes()
+
+    async def start(self) -> None:
+        try:
+            self._source = rtc.AudioSource(self._sr, 1)
+            self._track = rtc.LocalAudioTrack.create_audio_track(
+                "ringback", self._source)
+            await self._room.local_participant.publish_track(self._track)
+            self._task = asyncio.ensure_future(self._pump())
+        except Exception as e:
+            self._task = None
+            log_event("ringback_failed",
+                      error=f"{type(e).__name__}: {str(e)[:120]}")
+
+    async def _pump(self) -> None:
+        pcm = self._cycle_pcm()
+        frame_bytes = (self._sr // 50) * 2  # 20 ms of int16 mono
+        try:
+            while True:
+                for i in range(0, len(pcm), frame_bytes):
+                    chunk = pcm[i:i + frame_bytes]
+                    if len(chunk) < frame_bytes:
+                        chunk += b"\x00" * (frame_bytes - len(chunk))
+                    await self._source.capture_frame(rtc.AudioFrame(
+                        data=chunk, num_channels=1,
+                        samples_per_channel=self._sr // 50,
+                        sample_rate=self._sr))
+                    await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
+        if self._track is not None:
+            try:
+                await self._room.local_participant.unpublish_track(
+                    self._track.sid)
+            except Exception:
+                pass
+            self._track = None
+
+
+async def _ring_receipt(call_id: str, event: str,
+                        via: str = "ring_first", **fields) -> None:
+    """One ring-first / forwarding outcome: structured log line + a
+    receipt on the bus (calls/live/<id>/relay.jsonl, the same file
+    the call relay's receipts use — Fly logs are too lossy to be
+    the record). Best-effort and time-bounded: a slow bus must
+    never hold a call hostage."""
+    log_event(event, call_id=call_id, **fields)
+    line = {"ts": _utcnow_z(), "via": via, "event": event,
+            "call_id": call_id, **fields}
+    try:
+        await asyncio.wait_for(
+            _bus_append_lines(
+                f"calls/live/{call_id}/relay.jsonl",
+                [json.dumps(line, ensure_ascii=False)],
+                f"ring-first {call_id}"),
+            timeout=8)
+    except Exception:
+        pass
+
+
+async def _ring_first(ctx: JobContext, caller_identity: str,
+                      call_id: str, caller_number: str,
+                      ) -> tuple[str, float, str]:
+    """Originate Jim's cell into the room and race the outcomes.
+    Returns _ring_race's (outcome, elapsed_s, detail). On "taken"
+    Jim and the caller are both live in the room and the caller can
+    hear Jim the moment the ringback stops."""
+    global _RING_WAIT
+    from livekit.protocol.room import RemoveParticipantRequest
+    room = ctx.room
+    jim_identity = f"jim-ring-{call_id}"
+    gone = asyncio.Event()
+    if caller_identity and \
+            caller_identity not in room.remote_participants:
+        gone.set()
+
+    def _on_disc(p) -> None:
+        if p.identity == caller_identity:
+            gone.set()
+
+    try:
+        room.on("participant_disconnected", _on_disc)
+    except Exception:
+        pass
+
+    client = _lk_api()
+
+    async def create():
+        req = build_ring_request(
+            room.name, jim_identity, trunk_id=SIP_OUTBOUND_TRUNK_ID,
+            call_to=JIM_PHONE_E164, from_number=JETT_PHONE_E164)
+        return await client.sip.create_sip_participant(req)
+
+    async def cleanup(create_task) -> None:
+        if not create_task.done():
+            create_task.cancel()
+            try:
+                await create_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await client.room.remove_participant(
+                RemoveParticipantRequest(room=room.name,
+                                         identity=jim_identity))
+        except Exception:
+            pass  # leg may never have existed server-side
+
+    ringback = _RingbackTone(room)
+    await ringback.start()
+    log_event("ring_first_start", call_id=call_id,
+              window_s=RING_FIRST_WINDOW_S, identity=jim_identity)
+    # Publish the wait so a second job can recognize Jim's cell
+    # forwarding this very leg back to the agent line (loop guard).
+    abort_ev = threading.Event()
+    with _RING_WAIT_LOCK:
+        _RING_WAIT = {"call_id": call_id,
+                      "caller_digits": _digits10(caller_number),
+                      "abort": abort_ev}
+    try:
+        return await _ring_race(
+            create=create, cleanup=cleanup,
+            window_s=RING_FIRST_WINDOW_S, caller_gone=gone,
+            loop_abort=abort_ev)
+    finally:
+        with _RING_WAIT_LOCK:
+            if _RING_WAIT is not None \
+                    and _RING_WAIT.get("call_id") == call_id:
+                _RING_WAIT = None
+        await ringback.stop()
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 _DTMF_CODES = {**{str(i): i for i in range(10)},
@@ -3204,8 +3657,12 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # it); outbound jobs carry their target in the dispatch metadata.
     call_info = {"channel": "sip", "direction": "inbound",
                  "number": "", "called_number": "", "name": "",
-                 "tier": ""}
+                 "tier": "", "diverted": False, "diverted_from": "",
+                 "diverted_from_digits": "", "diversion_reason": "",
+                 "diversion_source": "", "forwarded_from_cell": False}
+    caller_identity = ""
     for p in ctx.room.remote_participants.values():
+        caller_identity = p.identity or ""
         call_info = classify_caller(
             dict(getattr(p, "attributes", {}) or {}),
             p.identity or "", brief)
@@ -3215,11 +3672,72 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                          number=str(job_meta.get("to", "")))
     _ACTIVE_CALL_INFO = call_info
     _ACTIVE_ROOM = ctx.room
-    log_event("call_classified", call_id=_CURRENT_CALL_ID,
+    # Captured once: another job (e.g. a loop-leg probe) can clobber
+    # the module globals while this call runs; ring-first receipts
+    # must carry THIS call's id regardless.
+    call_id = _CURRENT_CALL_ID
+    log_event("call_classified", call_id=call_id,
               channel=call_info["channel"],
               direction=call_info["direction"],
               tier=call_info["tier"] or "unknown",
-              known=bool(call_info["name"]))
+              known=bool(call_info["name"]),
+              diverted=bool(call_info.get("diverted")),
+              forwarded_from_cell=bool(
+                  call_info.get("forwarded_from_cell")))
+    if call_info.get("diverted"):
+        # On the record from the start (fire-and-forget; the call
+        # proceeds in parallel): the summary for this call must show
+        # it arrived via diversion — above all when it came from
+        # Jim's own cell forwarding an unanswered call.
+        asyncio.ensure_future(_ring_receipt(
+            call_id, "call_forwarded", via="forwarding",
+            forwarded_from_cell=bool(
+                call_info.get("forwarded_from_cell")),
+            diverted_from=call_info.get("diverted_from", ""),
+            diversion_reason=call_info.get("diversion_reason", ""),
+            diversion_source=call_info.get("diversion_source", ""),
+            caller_number=call_info.get("number", ""),
+            tier=call_info.get("tier") or "unknown"))
+
+    # --- ring-me-first (RING_FIRST, Jim 2026-10-15): before any
+    # agent media or greeting, ring Jim's cell into the room. If he
+    # answers inside the window he and the caller are simply live
+    # together and the agent leaves; if he declines or the window
+    # lapses, the call falls through to the agent answering exactly
+    # as it does today (bridge primary, local fallback). Self-tier
+    # calls and quiet hours skip the ring (see ring_first_decision).
+    _rf = ring_first_decision(
+        call_info, enabled=RING_FIRST,
+        quiet=in_quiet_hours(datetime.now(JIM_TZ)),
+        trunk_id=SIP_OUTBOUND_TRUNK_ID)
+    if _rf == "quiet_hours":
+        await _ring_receipt(call_id, "ring_first_quiet_hours")
+    elif _rf == "no_trunk":
+        log_event("ring_first_unavailable", call_id=call_id,
+                  reason="no_outbound_trunk")
+    elif _rf == "ring":
+        _outcome, _elapsed, _detail = await _ring_first(
+            ctx, caller_identity, call_id, call_info.get("number", ""))
+        _ev = {"taken": "ring_first_taken",
+               "no_answer": "ring_first_no_answer",
+               "declined": "ring_first_declined",
+               "caller_gone": "ring_first_caller_gone",
+               "loop": "ring_first_loop_forward"}[_outcome]
+        await _ring_receipt(call_id, _ev,
+                            elapsed_s=_elapsed,
+                            **({"detail": _detail} if _detail else {}))
+        if _outcome in ("taken", "caller_gone"):
+            # Jim has the call (or nobody is left to answer): stand
+            # down completely. On "taken" the two SIP legs stay in
+            # the room together; only the agent leaves.
+            _ACTIVE_ROOM = None
+            _ACTIVE_CALL_INFO = None
+            if _outcome == "taken":
+                try:
+                    await ctx.room.disconnect()
+                except Exception:
+                    pass
+            return
 
     # --- Deepgram bridge (2026-10-15): PRIMARY engine for agent
     # calls (Jim's word) — every inbound call, plus outbound calls
@@ -3468,7 +3986,12 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                     direction=call_info["direction"],
                     caller_number=call_info["number"],
                     known_name=call_info["name"],
-                    tier=call_info["tier"])
+                    tier=call_info["tier"],
+                    forwarded_from_cell=bool(
+                        call_info.get("forwarded_from_cell")),
+                    diverted_from=call_info.get("diverted_from", ""),
+                    diversion_reason=call_info.get(
+                        "diversion_reason", ""))
             except Exception:
                 pass
             try:
@@ -3491,15 +4014,52 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
             pass
 
 
+async def _end_if_loop_leg(ctx: JobContext, new_call_id: str) -> bool:
+    """Busy-path probe: is this 'second call' actually Jim's cell
+    forwarding our own ring-first leg back to the agent line? Then
+    it is not a call to answer at all — it is the no-answer signal
+    for the waiting call. End the leg cleanly (no busy message:
+    nobody human is listening on it), release the waiting call to
+    agent-answer via its abort event, and return True."""
+    probe: dict = {}
+    for _ in range(8):
+        for p in ctx.room.remote_participants.values():
+            probe = diversion_probe(
+                dict(getattr(p, "attributes", {}) or {}))
+            break
+        if probe:
+            break
+        await asyncio.sleep(0.4)
+    with _RING_WAIT_LOCK:
+        wait = _RING_WAIT
+    if not loop_leg_match(probe, wait, _digits10(JIM_PHONE_E164)):
+        return False
+    wait["abort"].set()
+    log_event("ring_loop_leg_ended", call_id=new_call_id,
+              waiting_call=wait.get("call_id"),
+              caller=probe.get("caller_digits"))
+    await _ring_receipt(new_call_id, "ring_loop_leg_ended",
+                        via="forwarding",
+                        waiting_call=wait.get("call_id") or "",
+                        caller_number=probe.get("caller_digits", ""))
+    try:
+        await ctx.room.disconnect()
+    except Exception:
+        pass
+    return True
+
+
 async def entrypoint(ctx: JobContext):
     global _ACTIVE_CALL, _CURRENT_CALL_ID
     call_id = ctx.room.name.replace("jett-", "", 1) or uuid.uuid4().hex[:8]
 
     with _CALL_LOCK:
         if _ACTIVE_CALL is not None:
+            await ctx.connect()
+            if await _end_if_loop_leg(ctx, call_id):
+                return
             log_event("call_rejected_busy", room=ctx.room.name)
             log.info("busy; rejecting second call %s", ctx.room.name)
-            await ctx.connect()
             engine = KokoroTTS()
             samples, _ = await asyncio.get_running_loop().run_in_executor(
                 None, engine._synth,
@@ -3565,6 +4125,8 @@ if __name__ == "__main__":
               brain_turn_timeout_s=BRAIN_TURN_TIMEOUT_S,
               brain_chunk_stall_s=BRAIN_CHUNK_STALL_S,
               consult_timeout_s=CONSULT_TIMEOUT_SEC,
+              ring_first=RING_FIRST,
+              ring_first_window_s=RING_FIRST_WINDOW_S,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
               bus_dir=BUS_DIR, stt_streaming=STREAMING_STT,
               bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
