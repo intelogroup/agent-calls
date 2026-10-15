@@ -1058,6 +1058,265 @@ class _ResilientStream(llm.LLMStream):
         async for chunk in self._resilient._attempt_live(self):
             self._event_ch.send_nowait(chunk)
 
+
+
+# ------------------------------------------------- speculative feed (spike)
+# SPECULATIVE_FEED=1 (Jim's design, 2026-10-15): Whisper transcribes
+# incrementally while the caller is still talking; interim transcripts
+# start a tool-free draft reply from the brain chain; when the final
+# transcript matches the draft's basis, the draft is spoken immediately
+# instead of paying full generation latency after the caller stops.
+# Deliberately narrow spike policy: drafts run only on Jim's own calls
+# (tier "self"), and a draft is spoken only if it is a self-contained
+# conversational answer — no digits (facts take the proven path) and no
+# deferral phrasing (a draft cannot promise an action it never took).
+# Every decision is logged (spec_*) so a test call shows exactly what
+# the layer did.
+SPECULATIVE_FEED = os.environ.get("SPECULATIVE_FEED") == "1"
+SPEC_MIN_WORDS = int(os.environ.get("SPEC_MIN_WORDS", "3"))
+SPEC_SETTLE_S = float(os.environ.get("SPEC_SETTLE_S", "0.25"))
+SPEC_DRAFT_WAIT_S = float(os.environ.get("SPEC_DRAFT_WAIT_S", "1.5"))
+SPEC_STREAM_INTERVAL_S = float(
+    os.environ.get("SPEC_STREAM_INTERVAL_S", "0.35"))
+
+_SPEC_DEFERRALS = (
+    "let me check", "let me look", "let me ask", "let me find",
+    "let me see", "one moment", "one second", "just a moment",
+    "hold on", "i'll check", "i will check", "i'll look", "i'll find",
+    "checking on", "give me a moment", "give me a second",
+)
+
+
+def _norm_text(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9' ]", " ",
+                           (text or "").lower()).split())
+
+
+def texts_compatible(basis: str, final: str) -> bool:
+    """A draft may be used only for the sentence it was drafted from:
+    equal after normalization, one a prefix of the other, or nearly
+    identical (the last words of a sentence rarely change its ask)."""
+    a, b = _norm_text(basis), _norm_text(final)
+    if not a or not b:
+        return False
+    if a == b or a.startswith(b) or b.startswith(a):
+        return True
+    import difflib
+
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
+def draft_is_speakable(text: str) -> bool:
+    """Safety screen for speculative replies: conversational answers
+    only. Digits imply a fact (time, amount, date) the draft invented
+    without tools; deferrals promise work that will never happen
+    because the real turn is being skipped."""
+    t = (text or "").strip()
+    if len(t) < 10 or len(t) > 500:
+        return False
+    if any(ch.isdigit() for ch in t):
+        return False
+    low = t.lower()
+    if any(marker in low for marker in _SPEC_DEFERRALS):
+        return False
+    return len(t.split()) >= 2
+
+
+class SpeculativeDrafter:
+    """Owns the draft lifecycle: observe() feeds interim transcripts,
+    a worker debounces (SPEC_SETTLE_S) then generates one draft at a
+    time from the latest basis; take() is called by the LLM wrapper
+    with the final transcript and returns the draft text or None."""
+
+    def __init__(self, generate) -> None:
+        self._generate = generate  # async (basis_text) -> reply text
+        self._pending: str | None = None
+        self._current_basis: str | None = None
+        self._result: tuple[str, str] | None = None
+        self._result_event = asyncio.Event()
+        self._worker: asyncio.Task | None = None
+
+    def observe(self, text: str) -> None:
+        text = " ".join(str(text or "").split())
+        if not text or len(text.split()) < SPEC_MIN_WORDS:
+            return
+        if text in (self._pending, self._current_basis):
+            return
+        if self._result and text == self._result[0]:
+            return
+        self._pending = text
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.ensure_future(self._work())
+
+    async def _work(self) -> None:
+        while self._pending is not None:
+            basis = self._pending
+            self._pending = None
+            await asyncio.sleep(SPEC_SETTLE_S)
+            if self._pending is not None:
+                continue  # a newer interim arrived; draft the latest
+            self._current_basis = basis
+            log_event("spec_draft_start", basis=basis[:80])
+            try:
+                text = await self._generate(basis)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # a failed draft costs nothing
+                log_event("spec_draft_error", error=str(e)[:120])
+                text = ""
+            self._current_basis = None
+            if text:
+                self._result = (basis, text)
+                self._result_event.set()
+                log_event("spec_draft_ready", basis=basis[:80],
+                          chars=len(text))
+
+    async def take(self, final_text: str) -> str | None:
+        final_text = " ".join(str(final_text or "").split())
+        res, self._result = self._result, None
+        if res and texts_compatible(res[0], final_text):
+            return self._accept(res, final_text)
+        basis = self._current_basis or self._pending
+        if basis and texts_compatible(basis, final_text):
+            try:
+                await asyncio.wait_for(self._wait_result(),
+                                       SPEC_DRAFT_WAIT_S)
+            except asyncio.TimeoutError:
+                log_event("spec_reject", reason="draft_timeout",
+                          basis=basis[:80])
+                return None
+            res, self._result = self._result, None
+            if res and texts_compatible(res[0], final_text):
+                return self._accept(res, final_text)
+        if res or basis:
+            log_event("spec_reject", reason="basis_mismatch",
+                      basis=(basis or (res[0] if res else ""))[:80],
+                      final=final_text[:80])
+        return None
+
+    async def _wait_result(self) -> None:
+        if self._result:
+            return
+        self._result_event.clear()
+        await self._result_event.wait()
+
+    @staticmethod
+    def _accept(res: tuple[str, str], final_text: str) -> str | None:
+        if draft_is_speakable(res[1]):
+            log_event("spec_accept", basis=res[0][:80],
+                      final=final_text[:80])
+            return res[1]
+        log_event("spec_reject", reason="unspeakable", basis=res[0][:80])
+        return None
+
+
+def _last_user_text(chat_ctx) -> str:
+    for item in reversed(list(getattr(chat_ctx, "items", []) or [])):
+        if getattr(item, "role", "") == "user":
+            text = (getattr(item, "text_content", "") or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _make_draft_generator(brain_llm, instructions: str, history_fn):
+    """Drafts are generated by the real brain chain with NO tools: the
+    model can answer from the brief and the conversation, but it cannot
+    act on a sentence the caller hasn't finished yet."""
+
+    async def generate(basis_text: str) -> str:
+        items = [llm.ChatMessage(role="system", content=[instructions])]
+        for role, text in history_fn():
+            items.append(llm.ChatMessage(role=role, content=[text]))
+        items.append(llm.ChatMessage(role="user", content=[basis_text]))
+        stream = brain_llm.chat(chat_ctx=llm.ChatContext(items=items),
+                                tools=[])
+        parts: list[str] = []
+        async for chunk in stream:
+            delta = getattr(chunk, "delta", None)
+            content = getattr(delta, "content", None) if delta else None
+            if content:
+                parts.append(content)
+        return "".join(parts).strip()
+
+    return generate
+
+
+class SpeculativeLLM(llm.LLM):
+    """LLM wrapper: replays an accepted speculative draft instantly;
+    on any miss, delegates to the wrapped brain chain untouched."""
+
+    def __init__(self, inner, drafter: SpeculativeDrafter) -> None:
+        super().__init__()
+        self._inner = inner
+        self._drafter = drafter
+        inner.on("metrics_collected",
+                 lambda m: self.emit("metrics_collected", m))
+
+    @property
+    def model(self) -> str:
+        return self._inner.model
+
+    @property
+    def provider(self) -> str:
+        return "speculative+" + self._inner.provider
+
+    def chat(self, *, chat_ctx: llm.ChatContext,
+             tools: list | None = None,
+             conn_options=DEFAULT_API_CONNECT_OPTIONS,
+             parallel_tool_calls=NOT_GIVEN,
+             tool_choice=NOT_GIVEN,
+             extra_kwargs=NOT_GIVEN,
+             **kwargs) -> llm.LLMStream:
+        return _SpeculativeStream(
+            self, chat_ctx=chat_ctx, tools=tools or [],
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice, extra_kwargs=extra_kwargs,
+            extra_kw=kwargs)
+
+
+class _SpeculativeStream(llm.LLMStream):
+    def __init__(self, spec: SpeculativeLLM, *, chat_ctx, tools,
+                 conn_options, parallel_tool_calls, tool_choice,
+                 extra_kwargs, extra_kw: dict) -> None:
+        super().__init__(spec, chat_ctx=chat_ctx, tools=tools,
+                         conn_options=conn_options)
+        self._spec = spec
+        self._parallel_tool_calls = parallel_tool_calls
+        self._tool_choice = tool_choice
+        self._extra_kwargs = extra_kwargs
+        self._extra_kw = extra_kw
+
+    async def _run(self) -> None:
+        draft = None
+        final_text = _last_user_text(self._chat_ctx)
+        if final_text:
+            try:
+                draft = await self._spec._drafter.take(final_text)
+            except Exception:
+                draft = None
+        if draft:
+            log_event("spec_hit", chars=len(draft))
+            for piece in split_sentences(draft):
+                self._event_ch.send_nowait(llm.ChatChunk(
+                    id=f"spec-{uuid.uuid4().hex[:8]}",
+                    delta=llm.ChoiceDelta(content=piece,
+                                          role="assistant")))
+            return
+        inner = self._spec._inner.chat(
+            chat_ctx=self._chat_ctx,
+            tools=self._tools or None,
+            conn_options=self._conn_options,
+            parallel_tool_calls=self._parallel_tool_calls,
+            tool_choice=self._tool_choice,
+            extra_kwargs=self._extra_kwargs,
+            **self._extra_kw,
+        )
+        async for chunk in inner:
+            self._event_ch.send_nowait(chunk)
+
+
 # ----------------------------------------------------------------- STT ---
 
 class WhisperSTT(stt.STT):
@@ -1116,6 +1375,146 @@ class WhisperSTT(stt.STT):
         except Exception as e:
             log_event("stt_error", error=str(e)[:150], duration_s=dur_s)
             return ""  # treat as silence rather than killing the turn
+
+
+
+
+class StreamingWhisperSTT(stt.STT):
+    """faster-whisper tiny.en as a streaming STT (SPECULATIVE_FEED).
+
+    Shares the loaded WhisperModel with WhisperSTT. The recognize
+    stream re-transcribes the growing utterance buffer on an interval
+    and emits interims (which feed the SpeculativeDrafter); the final
+    lands on the framework's flush sentinel or when the stream closes.
+    """
+
+    def __init__(self, model) -> None:
+        super().__init__(capabilities=stt.STTCapabilities(
+            streaming=True, interim_results=True))
+        self._model = model
+
+    @property
+    def model(self) -> str:
+        return "tiny.en"
+
+    @property
+    def provider(self) -> str:
+        return "faster-whisper-stream"
+
+    async def _recognize_impl(self, buffer, *, language=NOT_GIVEN,
+                              conn_options) -> stt.SpeechEvent:
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(
+            None, _whisper_transcribe_pcm, self._model, buffer)
+        return stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en", text=text)],
+        )
+
+    def stream(self, *, language=NOT_GIVEN,
+               conn_options=DEFAULT_API_CONNECT_OPTIONS):
+        return _WhisperStream(self, conn_options=conn_options)
+
+
+def _whisper_transcribe_pcm(model, buffer) -> str:
+    """Transcribe one merged rtc.AudioFrame (also used by WhisperSTT)."""
+    raw = bytes(buffer.data)
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if buffer.num_channels > 1:
+        audio = audio.reshape(-1, buffer.num_channels).mean(axis=1)
+    return _whisper_transcribe_array(model, audio, buffer.sample_rate)
+
+
+def _whisper_transcribe_array(model, audio, sr: int) -> str:
+    if audio.size == 0 or float(np.abs(audio).max(initial=0.0)) < 1e-4:
+        return ""
+    try:
+        if sr != 16000:
+            dur = len(audio) / sr
+            n = int(dur * 16000)
+            audio = np.interp(
+                np.linspace(0, len(audio), n, endpoint=False),
+                np.arange(len(audio)), audio).astype(np.float32)
+        segments, _ = model.transcribe(audio, language="en",
+                                       beam_size=1, vad_filter=True)
+        return " ".join(s.text.strip() for s in segments).strip()
+    except Exception as e:
+        log_event("stt_error", error=str(e)[:150])
+        return ""
+
+
+class _WhisperStream(stt.RecognizeStream):
+    """One utterance stream: frames accumulate; a ticker emits interims
+    from incremental re-transcription; flush/close emits the final."""
+
+    def __init__(self, stt_obj: StreamingWhisperSTT, *,
+                 conn_options) -> None:
+        super().__init__(stt=stt_obj, conn_options=conn_options)
+        self._stt_obj = stt_obj
+        self._pcm = bytearray()
+        self._sr = 16000
+        self._channels = 1
+        self._prev_hyp = ""
+        self._dirty = False
+        self._lock = asyncio.Lock()
+
+    async def _run(self) -> None:
+        ticker = asyncio.ensure_future(self._ticker())
+        try:
+            async for msg in self._input_ch:
+                if isinstance(msg, stt.RecognizeStream._FlushSentinel):
+                    await self._finalize()
+                    continue
+                if not self._pcm:
+                    self._sr = msg.sample_rate
+                    self._channels = msg.num_channels
+                self._pcm.extend(bytes(msg.data))
+                self._dirty = True
+        finally:
+            ticker.cancel()
+            if self._pcm:
+                await self._finalize()
+
+    async def _ticker(self) -> None:
+        while True:
+            await asyncio.sleep(SPEC_STREAM_INTERVAL_S)
+            if len(self._pcm) / 2 / max(1, self._sr) > 45:
+                log_event("stt_stream_force_final", seconds=45)
+                await self._finalize()
+            elif self._dirty:
+                self._dirty = False
+                await self._emit_interim()
+
+    async def _transcribe_buffer(self) -> str:
+        audio = np.frombuffer(bytes(self._pcm),
+                              dtype=np.int16).astype(np.float32) / 32768.0
+        if self._channels > 1:
+            audio = audio.reshape(-1, self._channels).mean(axis=1)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _whisper_transcribe_array, self._stt_obj._model,
+            audio, self._sr)
+
+    async def _emit_interim(self) -> None:
+        async with self._lock:
+            text = await self._transcribe_buffer()
+        if not text or text == self._prev_hyp:
+            return
+        self._prev_hyp = text
+        self._event_ch.send_nowait(stt.SpeechEvent(
+            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en", text=text)]))
+
+    async def _finalize(self) -> None:
+        async with self._lock:
+            text = await self._transcribe_buffer()
+            self._pcm.clear()
+            self._prev_hyp = ""
+            self._dirty = False
+        self._event_ch.send_nowait(stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en",
+                                         text=text or "")]))
 
 
 # ----------------------------------------------------------------- TTS ---
@@ -2542,10 +2941,27 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         tools=[current_time, consult_jett, local_facts,
                transfer_to_jim, press_digits, leave_voicemail],
     )
+    # --- speculative feed spike (SPECULATIVE_FEED, tier "self" only):
+    # streaming STT + draft-ahead brain wrapper; with the flag off the
+    # proven pipeline stays byte-for-byte in charge.
+    spec_drafter = None
+    spec_history: list | None = None
+    session_llm = agent_llm
+    if SPECULATIVE_FEED and call_info.get("tier") == "self":
+        stt_stream = StreamingWhisperSTT(stt_engine._model)
+        spec_history = []
+        spec_drafter = SpeculativeDrafter(_make_draft_generator(
+            agent_llm, instructions, lambda: list(spec_history or [])))
+        session_llm = SpeculativeLLM(agent_llm, spec_drafter)
+        log_event("spec_enabled", tier=call_info.get("tier"))
+    elif SPECULATIVE_FEED:
+        log_event("spec_skipped", reason="tier_not_self",
+                  tier=call_info.get("tier") or "unknown")
+
     session = AgentSession(
         stt=stt_stream,
         vad=silero.VAD.load(min_silence_duration=0.35),
-        llm=agent_llm,
+        llm=session_llm,
         tts=tts_engine,
         max_tool_steps=10,
         # Endpointing tightened 2026-10-13 (Jim's word): less dead air
@@ -2566,7 +2982,7 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                  brain.model, metrics.duration, metrics.ttft,
                  metrics.prompt_tokens, metrics.completion_tokens)
 
-    agent_llm.on("metrics_collected", _on_llm_metrics)
+    session_llm.on("metrics_collected", _on_llm_metrics)
 
     relay: CallRelay | None = None
     await ctx.connect()
@@ -2604,6 +3020,10 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                 relay.note_deferred(item, mapped)
                 return
             relay.note_transcript(mapped, text, source="item")
+            if spec_history is not None and text:
+                spec_history.append(
+                    ("user" if mapped == "jim" else "assistant", text))
+                del spec_history[:-24]
         except Exception:
             pass
 
@@ -2613,6 +3033,11 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         # dedupes against the conversation-item copy.
         try:
             if not getattr(ev, "is_final", False):
+                if spec_drafter is not None:
+                    interim = (getattr(ev, "transcript", "")
+                               or "").strip()
+                    if interim:
+                        spec_drafter.observe(interim)
                 return
             text = (getattr(ev, "transcript", "") or "").strip()
             if text:
