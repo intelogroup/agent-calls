@@ -293,10 +293,118 @@ def t_engine_singleton_loads_once():
           f"loads={loads}")
 
 
+class CutLiveSession:
+    """LiveSession stand-in that CUTS a segment mid-feed (the real
+    vendor behavior on a pause): on_final('first part') fires during
+    feed() at ~0.9s; a second segment's partial follows; finish()
+    finals the remainder and returns the joined transcript."""
+
+    def __init__(self, speech, *, on_partial, on_final):
+        self._on_partial = on_partial
+        self._on_final = on_final
+        self.samples = 0
+        self._cut = False
+
+    def feed(self, block):
+        self.samples += len(block)
+        secs = self.samples / 16000.0
+        if not self._cut:
+            if secs >= 0.9:
+                self._cut = True
+                self._on_final("first part")
+            else:
+                self._on_partial("first")
+        elif secs >= 1.2:
+            self._on_partial("second part")
+
+    def finish(self):
+        if self._cut:
+            self._on_final("second part")
+        return "first part second part"
+
+
+async def t_stream_segment_cut_emits_final_live():
+    """The probe defect, pinned: a caller turn must be committable
+    WHILE the stream is open. AudioRecognition appends FINAL events
+    to its turn buffer and returns from end-of-turn detection at
+    once when that buffer is empty — so a segment cut must surface
+    as a FINAL without waiting for flush/close."""
+    engine = la.PhononSTT(
+        FakeSpeech(),
+        session_factory=lambda sp, *, on_partial, on_final:
+            CutLiveSession(sp, on_partial=on_partial,
+                           on_final=on_final))
+    stream = engine.stream()
+    events = []
+
+    async def collect():
+        async for ev in stream:
+            events.append(ev)
+
+    collector = asyncio.ensure_future(collect())
+    stream.push_frame(frame(0.6))
+    await asyncio.sleep(0.25)
+    stream.push_frame(frame(0.6))   # crosses the 0.9s cut
+    # NO flush, NO close: poll for the segment final to arrive live.
+    deadline = asyncio.get_running_loop().time() + 3
+    finals = []
+    while asyncio.get_running_loop().time() < deadline:
+        finals = [e for e in events
+                  if e.type == stt.SpeechEventType.FINAL_TRANSCRIPT]
+        if finals:
+            break
+        await asyncio.sleep(0.05)
+    check("segment cut emits FINAL while stream open", len(finals) >= 1,
+          f"events={[ (e.type, e.alternatives[0].text if e.alternatives else '') for e in events]}")
+    check("segment final carries only its segment text",
+          finals and finals[0].alternatives[0].text == "first part",
+          f"finals={[f.alternatives[0].text for f in finals]}")
+    # Simulated AudioRecognition turn buffer (finals append; EOU
+    # returns early when empty): it must be non-empty NOW, live.
+    turn_buffer = " ".join(f.alternatives[0].text for f in finals).strip()
+    check("turn buffer non-empty at end-of-speech (turn commits)",
+          turn_buffer == "first part", f"buffer={turn_buffer!r}")
+    # Interims after the cut must not re-carry the finalized words.
+    interims_after = [e.alternatives[0].text for e in events
+                      if e.type == stt.SpeechEventType.INTERIM_TRANSCRIPT]
+    check("interims after cut exclude finalized text",
+          all("first part" not in t for t in interims_after),
+          f"interims={interims_after}")
+
+    # Flush: only the uncovered remainder may arrive as a final —
+    # the buffer must end up exactly the joined transcript, once.
+    stream.push_frame(frame(0.6))   # second segment partial lands
+    await asyncio.sleep(0.25)
+    stream.flush()
+    await asyncio.sleep(0.5)
+    all_finals = [e.alternatives[0].text for e in events
+                  if e.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                  and e.alternatives and e.alternatives[0].text]
+    check("flush final is remainder only, no duplication",
+          all_finals == ["first part", "second part"],
+          f"finals={all_finals}")
+    collector.cancel()
+    await stream.aclose()
+
+
+def t_session_transcription_timeout_wired():
+    import pathlib
+    src = pathlib.Path(la.__file__).read_text()
+    check("AgentSession sets transcription_timeout=3.0",
+          "transcription_timeout=3.0" in src)
+    check("user_transcription_timeout rescue registered",
+          '"user_transcription_timeout"' in src
+          and "transcription_rescue" in src)
+    check("llm metrics handler has no bare `brain` reference",
+          "brain.model, metrics.duration" not in src)
+
+
 async def main():
     t_removal_is_real()
+    t_session_transcription_timeout_wired()
     t_engine_singleton_loads_once()
     await t_capabilities()
+    await t_stream_segment_cut_emits_final_live()
     await t_stream_flush_and_second_segment()
     await t_stream_final_on_close()
     await t_stream_resamples_8k()

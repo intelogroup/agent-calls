@@ -1487,6 +1487,15 @@ class _PhononSegment:
     folds them into the stream's cumulative transcript — completed
     segments plus the current hypothesis — and finish() returns the
     session's joined transcript of record.
+
+    Segment cuts are ALSO surfaced to the stream as FINAL_TRANSCRIPT
+    events carrying only that segment's text (2026-10-15 fix): the
+    session plumbing (livekit-agents AudioRecognition) appends each
+    final to its turn buffer and only runs end-of-turn detection
+    once a final exists — interims alone never commit a live turn,
+    which left callers answered by silence until hangup. Interims
+    therefore carry only the not-yet-final remainder (in-flight
+    partial), never text already delivered as a final.
     """
 
     def __init__(self, stream: "_PhononStream", speech,
@@ -1496,6 +1505,7 @@ class _PhononSegment:
         self._queue: queue.Queue = queue.Queue()
         self._done = threading.Event()
         self._finals: list[str] = []
+        self._finals_emitted: list[str] = []
         self._partial = ""
         self._last_emitted = ""
         self.final_text: str | None = None
@@ -1518,8 +1528,17 @@ class _PhononSegment:
             parts.append(self._partial)
         return " ".join(parts).strip()
 
+    def _interim_text(self) -> str:
+        # Only what no FINAL event has carried yet: segments cut
+        # since the last emission (normally none — cuts emit at
+        # once) plus the in-flight partial.
+        parts = list(self._finals[len(self._finals_emitted):])
+        if self._partial:
+            parts.append(self._partial)
+        return " ".join(parts).strip()
+
     def _maybe_emit(self) -> None:
-        text = self._cumulative()
+        text = self._interim_text()
         if text and text != self._last_emitted:
             self._last_emitted = text
             self._loop.call_soon_threadsafe(
@@ -1533,6 +1552,14 @@ class _PhononSegment:
         text = (text or "").strip()
         if text:
             self._finals.append(text)
+            # Bookkeeping is synchronous in the callback so
+            # _finalize's remainder math is deterministic; only the
+            # event delivery is deferred to the loop. The final
+            # carries ONLY this segment's text — AudioRecognition
+            # appends finals to its turn buffer.
+            self._finals_emitted.append(text)
+            self._loop.call_soon_threadsafe(
+                self._stream._emit_final, text)
         self._partial = ""
         self._maybe_emit()
 
@@ -1565,8 +1592,11 @@ class _PhononSegment:
 
 
 class _PhononStream(stt.RecognizeStream):
-    """Frames -> _PhononSegments; flush/close emits the final —
-    the contract the session plumbing has always consumed."""
+    """Frames -> _PhononSegments. Vendor segment cuts emit
+    FINAL_TRANSCRIPT events mid-stream (segment text only);
+    flush/close emits one last final carrying whatever the cuts
+    did not already deliver — the contract the session plumbing
+    consumes, now satisfiable while the call is live."""
 
     def __init__(self, stt_obj: PhononSTT, *, conn_options) -> None:
         super().__init__(stt=stt_obj, conn_options=conn_options)
@@ -1582,6 +1612,19 @@ class _PhononStream(stt.RecognizeStream):
                                              text=text)]))
         except Exception:
             pass  # stream already closing; a late interim is moot
+
+    def _emit_final(self, text: str) -> None:
+        # A vendor segment cut mid-stream: this final is what lets
+        # AudioRecognition commit the caller's turn while the call
+        # is still live (its end-of-turn detection returns at once
+        # when the final-transcript buffer is empty).
+        try:
+            self._event_ch.send_nowait(stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language="en",
+                                             text=text)]))
+        except Exception:
+            pass  # stream already closing; flush/close covers it
 
     async def _run(self) -> None:
         try:
@@ -1605,7 +1648,32 @@ class _PhononStream(stt.RecognizeStream):
         seg, self._seg = self._seg, None
         text = ""
         if seg is not None:
-            text = await seg.finish()
+            total = await seg.finish()
+            emitted = " ".join(seg._finals_emitted).strip()
+            if not emitted:
+                # No segment cut was surfaced during the stream
+                # (partial-only segment): the joined transcript is
+                # the final, exactly as before this fix.
+                text = total
+            elif total == emitted:
+                text = ""
+            elif total.startswith(emitted):
+                # finish() cut one last segment whose final was
+                # already emitted, or the transcript of record adds
+                # a tail: emit only the uncovered remainder so the
+                # turn buffer never sees the same words twice.
+                text = total[len(emitted):].strip()
+            else:
+                # Transcript of record diverged from the emitted
+                # segments; the segments already delivered the
+                # content — emit nothing rather than duplicate.
+                text = ""
+            if not text and seg._finals_emitted:
+                # Every word already arrived as a segment final;
+                # a trailing empty final would only confuse the
+                # next segment's consumers. The finals the plumbing
+                # needed have been delivered.
+                return
         self._event_ch.send_nowait(stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(language="en", text=text)]))
@@ -3743,6 +3811,11 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         log_event("spec_skipped", reason="tier_not_self",
                   tier=call_info.get("tier") or "unknown")
 
+    # Belt-and-braces for a missed STT final (2026-10-15): the
+    # latest interim transcript this call has produced, tracked for
+    # the transcription-timeout rescue below. Finals clear it.
+    held_interim = {"text": "", "rescued": ""}
+
     session = AgentSession(
         stt=stt_stream,
         vad=silero.VAD.load(min_silence_duration=0.35),
@@ -3755,6 +3828,16 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         # default), and a long pause caps at 2.5s instead of ~6s.
         min_endpointing_delay=0.3,
         max_endpointing_delay=2.5,
+        # transcription_timeout (SDK semantics, verified in the
+        # 1.8.7 source): armed at VAD end-of-speech only when the
+        # turn has received NO final transcript; it emits a
+        # user_transcription_timeout event, which the handler below
+        # turns into a commit of the held interim. A received final
+        # cancels it, so the healthy path never sees it. 3.0s sits
+        # just past the 2.5s max endpointing delay — a slow-but-real
+        # final always wins — while a genuinely missed segment cut
+        # costs one bounded pause instead of silence until hangup.
+        transcription_timeout=3.0,
     )
 
     # --- brain telemetry: per-turn model/latency via the wrapper's logs,
@@ -3764,7 +3847,8 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         stats["turns"] += 1
         log.info("brain usage: model=%s duration=%.2fs ttft=%.2fs "
                  "tokens prompt=%d completion=%d",
-                 brain.model, metrics.duration, metrics.ttft,
+                 getattr(metrics, "model", None) or agent_llm.model,
+                 metrics.duration, metrics.ttft,
                  metrics.prompt_tokens, metrics.completion_tokens)
 
     session_llm.on("metrics_collected", _on_llm_metrics)
@@ -3818,20 +3902,49 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         # dedupes against the conversation-item copy.
         try:
             if not getattr(ev, "is_final", False):
-                if spec_drafter is not None:
-                    interim = (getattr(ev, "transcript", "")
-                               or "").strip()
-                    if interim:
+                interim = (getattr(ev, "transcript", "")
+                           or "").strip()
+                if interim:
+                    held_interim["text"] = interim
+                    if spec_drafter is not None:
                         spec_drafter.observe(interim)
                 return
             text = (getattr(ev, "transcript", "") or "").strip()
             if text:
+                held_interim["text"] = ""
                 relay.note_transcript("jim", text, source="stt")
+        except Exception:
+            pass
+
+    def _on_transcription_timeout(ev) -> None:
+        # Rescue for a missed STT final: AudioRecognition emitted
+        # user_transcription_timeout because VAD heard a full turn
+        # but no final ever landed, so its end-of-turn detection
+        # returned without committing. Answer the held interim
+        # directly instead of leaving the caller in silence. The
+        # guards keep this from ever double-answering: a final
+        # clears the held text, each held text is rescued at most
+        # once, and an in-flight reply stands down the rescue.
+        try:
+            text = held_interim["text"].strip()
+            if not text or len(text.split()) < 2:
+                return
+            if text == held_interim["rescued"]:
+                return
+            if session.current_speech is not None:
+                return
+            held_interim["rescued"] = text
+            held_interim["text"] = ""
+            log_event("transcription_rescue",
+                      call_id=_CURRENT_CALL_ID,
+                      text=text[:120])
+            session.generate_reply(user_input=text)
         except Exception:
             pass
 
     session.on("conversation_item_added", _on_conversation_item)
     session.on("user_input_transcribed", _on_user_transcribed)
+    session.on("user_transcription_timeout", _on_transcription_timeout)
     await relay.start()
 
     async def _shutdown_flush() -> None:
