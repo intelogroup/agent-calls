@@ -70,12 +70,10 @@ jobs:
               except urllib.error.HTTPError as e:
                   raise SystemExit("%s/%s -> HTTP %s: %s" % (service, method, e.code, e.read().decode()[:400]))
 
-          r = twirp("livekit.RoomService", "CreateRoom", {"name": ROOM})
-          print("room created:", r.get("name") or ROOM)
-          d = twirp("livekit.AgentDispatchService", "CreateAgentDispatch",
-                    {"room": ROOM, "agentName": "jett-proxy",
-                     "metadata": json.dumps({"direction": "outbound", "to": TO, "brief": BRIEF})})
-          print("dispatch created:", d.get("id") or d.get("dispatch_id") or "ok")
+          r = twirp("livekit.RoomService", "CreateRoom",
+                    {"name": ROOM, "agents": [{"agentName": "jett-proxy",
+                     "metadata": json.dumps({"direction": "outbound", "to": TO, "brief": BRIEF})}]})
+          print("room created with agent dispatch:", r.get("name") or ROOM)
           print("dialing", TO, "- waiting for answer...")
           p = twirp("livekit.SIP", "CreateSIPParticipant",
                     {"sipTrunkId": "ST_NqGc4EfiT8mZ", "sipCallTo": TO,
