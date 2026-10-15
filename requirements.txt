@@ -11,10 +11,13 @@ livekit-plugins-silero==1.8.7
 # so pip never pulls the multi-GB CUDA stack.
 fermion-research==0.2.11
 onnxruntime==1.30.0
-kokoro-onnx==0.6.1
+# Pocket TTS (Kyutai): the worker's only TTS since 2026-10-15.
+# Runs on the CPU torch wheel installed in the Dockerfile; its
+# weights are CC-BY-4.0 (attribution in README.md), voice "alba".
+pocket-tts==3.3.0
 tzdata>=2024.1
 soundfile>=0.12.0
-numpy>=1.26.0
+numpy>=2.0.0
 huggingface_hub>=0.20.0
 openai>=3.19,<4
 websockets>=17.1,<17.2

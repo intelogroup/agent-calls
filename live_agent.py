@@ -6,7 +6,7 @@ this worker. Real-time voice pipeline:
 
     Phonon-2 (FermionResearch native CPU engine, streaming LiveSession)
       -> ResilientLLM (OpenRouter free-model chain, empty-output retry)
-      -> kokoro-onnx (local warm-voice TTS)
+      -> Pocket TTS (Kyutai, local streaming TTS, voice "alba")
 
 The worker answers from its brief + Jett's synced facts snapshot when
 confident. The brief is pulled fresh from the bus repo (brief/JETT.md,
@@ -183,9 +183,11 @@ JIM_TZ = ZoneInfo("America/New_York")
 MAX_CALL_SEC = int(os.environ.get("AGENT_MAX_CALL_SEC", "600"))
 # Synced facts snapshot (published by Track B into the bus repo).
 FACTS_STALE_SEC = int(os.environ.get("FACTS_STALE_SEC", "3600"))
-KOKORO_MODEL = os.path.join(AGENT_DIR, "models", "kokoro-v1.0.int8.onnx")
-KOKORO_VOICES = os.path.join(AGENT_DIR, "models", "voices-v1.0.bin")
-KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
+# Pocket TTS voice. Hard-pinned to "alba": the Pocket weights and
+# the alba voice are CC-BY-4.0 (attribution in README.md), while
+# other built-in Pocket voices (jean, cosette) are CC-BY-NC and
+# must never ship in this worker.
+POCKET_TTS_VOICE = "alba"
 AGENT_NAME = "jett-proxy"
 
 # one call at a time; a second caller gets a polite busy message
@@ -1613,7 +1615,7 @@ _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
 
 def split_sentences(text: str, limit: int = 400) -> list[str]:
-    """Split text into TTS-friendly chunks (kokoro phoneme limit is 510)."""
+    """Split text into TTS-friendly sentence chunks."""
     chunks: list[str] = []
     for part in _SENT_SPLIT.split(text.strip()):
         part = part.strip()
@@ -1630,8 +1632,65 @@ def split_sentences(text: str, limit: int = 400) -> list[str]:
     return chunks or [text.strip()]
 
 
-class KokoroTTS(tts.TTS):
-    """kokoro-onnx warm voice as a LiveKit TTS (chunked synthesis)."""
+class _PocketEngine:
+    """Process-wide warm Pocket TTS handle (loaded exactly once).
+
+    Pocket TTS (Kyutai) replaced Kokoro on 2026-10-15 at Jim's word:
+    the bench (~/workspace/tts-bench/RESULTS.md) measured warm
+    time-to-first-audio of ~0.27 s because generate_audio_stream
+    yields real 80 ms chunks, while the old engine's "stream" yielded
+    a single chunk per reply. The model and the cached voice state
+    live for the worker's whole lifetime — the boot warm-up thread
+    pays the load before the first call (see __main__), never during
+    one, and never per call (the per-call construction the old
+    engine used died with it). Generation is serialized on one lock:
+    the worker serves one call at a time and the model is not
+    documented as thread-safe.
+    """
+
+    _model = None
+    _voice_state = None
+    _lock = threading.Lock()
+    gen_lock = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        with cls._lock:
+            if cls._model is None:
+                from pocket_tts import TTSModel
+
+                log.info("loading Pocket TTS (voice %s) …",
+                         POCKET_TTS_VOICE)
+                t0 = time.monotonic()
+                cls._model = TTSModel.load_model()
+                cls._voice_state = \
+                    cls._model.get_state_for_audio_prompt(POCKET_TTS_VOICE)
+                load_s = round(time.monotonic() - t0, 1)
+                log_event("pocket_loaded", load_s=load_s,
+                          voice=POCKET_TTS_VOICE)
+                log.info("pocket tts ready in %.1fs", load_s)
+            return cls._model, cls._voice_state
+
+    @classmethod
+    def reset(cls) -> None:
+        """Tests only: drop the cached handle."""
+        with cls._lock:
+            cls._model = None
+            cls._voice_state = None
+
+
+def _warm_pocket() -> None:
+    """Boot warm-up (background thread): pay the Pocket TTS load
+    before the first call, never during one."""
+    try:
+        _PocketEngine.get()
+    except Exception as e:
+        log_event("pocket_load_failed", error=str(e)[:150])
+        log.warning("pocket tts warm-up failed: %s", e)
+
+
+class PocketTTS(tts.TTS):
+    """Pocket TTS warm voice as a LiveKit TTS (true chunk streaming)."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -1639,35 +1698,44 @@ class KokoroTTS(tts.TTS):
             sample_rate=24000,
             num_channels=1,
         )
-        from kokoro_onnx import Kokoro
-
-        if not (os.path.exists(KOKORO_MODEL) and os.path.exists(KOKORO_VOICES)):
-            raise FileNotFoundError(
-                f"kokoro model files missing: {KOKORO_MODEL}, {KOKORO_VOICES}")
-        log.info("loading kokoro-onnx (%s) …", KOKORO_VOICE)
-        self._kokoro = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
-        self._voice = KOKORO_VOICE
-        log.info("kokoro ready")
 
     @property
     def model(self) -> str:
-        return "kokoro-v1.0-int8"
+        return "pocket-tts"
 
     @property
     def provider(self) -> str:
-        return "kokoro-onnx"
+        return "kyutai-pocket-tts"
 
     def _synth(self, text: str) -> tuple[np.ndarray, int]:
-        return self._kokoro.create(text, voice=self._voice, speed=1.0,
-                                   lang="en-us")
+        """Whole-utterance synthesis (raw speak paths: the no-brain
+        notice and the busy rejection, which publish PCM directly)."""
+        model, state = _PocketEngine.get()
+        with _PocketEngine.gen_lock:
+            audio = model.generate_audio(state, text)
+        samples = audio.detach().cpu().numpy().astype(
+            np.float32).squeeze()
+        return samples, model.sample_rate
+
+    def _stream_chunks(self, text: str):
+        """Yield (float32 samples, sample_rate) per streamed chunk.
+
+        The generation lock is held for the stream's whole life:
+        chunks are produced lazily as the consumer pulls them.
+        """
+        model, state = _PocketEngine.get()
+        with _PocketEngine.gen_lock:
+            for chunk in model.generate_audio_stream(state, text):
+                yield (chunk.detach().cpu().numpy().astype(
+                    np.float32).squeeze(), model.sample_rate)
 
     def synthesize(self, text: str, *, conn_options=DEFAULT_API_CONNECT_OPTIONS
                    ) -> tts.ChunkedStream:
-        return _KokoroChunkedStream(tts=self, input_text=text,
+        return _PocketChunkedStream(tts=self, input_text=text,
                                     conn_options=conn_options)
 
 
-class _KokoroChunkedStream(tts.ChunkedStream):
+class _PocketChunkedStream(tts.ChunkedStream):
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         loop = asyncio.get_running_loop()
         output_emitter.initialize(
@@ -1677,23 +1745,46 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             mime_type="audio/pcm",
             stream=False,
         )
+        # push in ~20 ms frames to keep the pipeline flowing
+        frame_bytes = 24000 * 2 // 50
         for sent in split_sentences(self._input_text):
-            try:
-                samples, _sr = await loop.run_in_executor(
-                    None, self._tts._synth, sent)
-            except Exception as e:
-                log_event("tts_error", sentence_len=len(sent),
-                          error=str(e)[:150])
-                continue
-            if samples is None or len(samples) == 0:
-                log_event("tts_empty_synth", sentence_len=len(sent))
-                continue
-            pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(
-                np.int16).tobytes()
-            # push in ~20 ms frames to keep the pipeline flowing
-            frame_bytes = 24000 * 2 // 50
-            for i in range(0, len(pcm), frame_bytes):
-                output_emitter.push(pcm[i:i + frame_bytes])
+            chunks: asyncio.Queue = asyncio.Queue()
+
+            def _produce() -> None:
+                def _deliver(item) -> None:
+                    try:
+                        loop.call_soon_threadsafe(chunks.put_nowait, item)
+                    except RuntimeError:
+                        # The call's loop is gone (hangup/teardown
+                        # mid-stream): dropping is correct, and a
+                        # producer must never crash over it.
+                        pass
+
+                try:
+                    for samples, _sr in self._tts._stream_chunks(sent):
+                        if samples is not None and len(samples):
+                            _deliver(samples)
+                except Exception as e:  # surfaced to the consumer
+                    _deliver(e)
+                finally:
+                    _deliver(None)
+
+            producer = threading.Thread(target=_produce, daemon=True,
+                                        name="pocket-tts-producer")
+            producer.start()
+            while True:
+                item = await chunks.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    log_event("tts_error", sentence_len=len(sent),
+                              error=str(item)[:150])
+                    break
+                pcm = (np.clip(item, -1.0, 1.0) * 32767).astype(
+                    np.int16).tobytes()
+                for i in range(0, len(pcm), frame_bytes):
+                    output_emitter.push(pcm[i:i + frame_bytes])
+            producer.join(timeout=5)
         output_emitter.flush()
 
 # ------------------------------------------------- agent-call-bus ---
@@ -3460,7 +3551,7 @@ async def _run_no_brain(ctx: JobContext):
     await ctx.connect()
     log_event("no_brain_notice")
     log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
-    tts_engine = KokoroTTS()
+    tts_engine = PocketTTS()
     samples, _ = await asyncio.get_running_loop().run_in_executor(
         None, tts_engine._synth,
         "Hey — this is Jett's voice line, but his brain isn't connected "
@@ -3484,7 +3575,7 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # is handed to the session directly — the shape the speculative
     # spike proved — and the session's VAD below does endpointing.
     stt_stream = PhononSTT()
-    tts_engine = KokoroTTS()
+    tts_engine = PocketTTS()
 
     brief = await load_brief_live()
 
@@ -3885,7 +3976,7 @@ async def entrypoint(ctx: JobContext):
                 return
             log_event("call_rejected_busy", room=ctx.room.name)
             log.info("busy; rejecting second call %s", ctx.room.name)
-            engine = KokoroTTS()
+            engine = PocketTTS()
             samples, _ = await asyncio.get_running_loop().run_in_executor(
                 None, engine._synth,
                 "Jett's line is on another call right now. Try again in a bit.")
@@ -3954,11 +4045,16 @@ if __name__ == "__main__":
               ring_first_window_s=RING_FIRST_WINDOW_S,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
               bus_dir=BUS_DIR, stt_engine="phonon-2",
+              tts_engine="pocket-tts", tts_voice=POCKET_TTS_VOICE,
               bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
     # Pay the ~5 s Phonon-2 load at boot, in the background, so the
     # first call never waits on it.
     threading.Thread(target=_warm_phonon, daemon=True,
                      name="phonon-warmup").start()
+    # Same for Pocket TTS: the model + voice state load once here
+    # and stay resident for the worker's lifetime.
+    threading.Thread(target=_warm_pocket, daemon=True,
+                     name="pocket-warmup").start()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,

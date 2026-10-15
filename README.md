@@ -26,3 +26,14 @@ The agent triggers it via the GitHub API (`workflow_dispatch`) with inputs:
 
 Nothing else is needed. The SIP domain (`sip.linphone.org`) is not sensitive
 and lives in the workflow file.
+
+## Notices
+
+The Fly voice worker (`live_agent.py`, branch `tmp/fly-build` and its
+successors) speaks with **Pocket TTS** by Kyutai
+(https://github.com/kyutai-labs/pocket-tts). The Pocket TTS model
+weights and the built-in **"alba"** voice used by the worker are
+licensed under **CC-BY-4.0**; this section is the attribution that
+license requires. The worker uses the `alba` voice only — other
+built-in Pocket voices (`jean`, `cosette`) are CC-BY-NC and are not
+used. Pocket TTS replaced Kokoro as the worker's TTS on 2026-10-15.

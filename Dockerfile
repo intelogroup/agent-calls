@@ -4,7 +4,7 @@
 # everything installed via exec, wiped on restart). Bakes at build time:
 #   - python deps (pinned, integration-tested 2026-09-18)
 #   - Phonon-2 weights, sha256-verified (STT; bake_phonon.py)
-#   - kokoro-onnx int8 model + voices (TTS)
+#   - Pocket TTS weights + "alba" voice state (TTS; bake_pocket.py)
 # Runtime secrets come ONLY from env (Fly secrets), never baked in:
 #   LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
 #   OPENROUTER_API_KEY / META_API_KEY, TUNNEL_SSH_KEY (optional Oracle tunnel)
@@ -47,25 +47,24 @@ RUN pip install -r /tmp/requirements.txt
 # --- agent code (mirrors deploy-vm.yml layout: /opt/agent) ---
 COPY live_agent.py /opt/agent/live_agent.py
 COPY bake_phonon.py /opt/agent/bake_phonon.py
+COPY bake_pocket.py /opt/agent/bake_pocket.py
 COPY bench_fly.py /opt/agent/bench_fly.py
 COPY deepgram_bridge.py /opt/agent/deepgram_bridge.py
 COPY JETT.md /opt/agent/JETT.md
 
 # --- models, baked so no runtime download ---
-RUN mkdir -p /opt/agent/models && \
-    curl -fL --retry 3 -o /opt/agent/models/kokoro-v1.0.int8.onnx \
-      https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx && \
-    curl -fL --retry 3 -o /opt/agent/models/voices-v1.0.bin \
-      https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin && \
-    python3 -c "from kokoro_onnx import Kokoro; \
-Kokoro('/opt/agent/models/kokoro-v1.0.int8.onnx', '/opt/agent/models/voices-v1.0.bin'); \
-print('kokoro warmup OK')"
+RUN mkdir -p /opt/agent/models
 
 # Phonon-2 weights: download into the vendor cache so the worker
 # never downloads at boot; the bake verifies the container's
 # sha256 against the model repo's own manifest values and proves
 # the load + decode path works inside this image.
 RUN python3 /opt/agent/bake_phonon.py
+
+# Pocket TTS weights + the "alba" voice prompt: download into the
+# HF cache so the worker never downloads at boot; the bake proves
+# the load + streaming-synthesis path works inside this image.
+RUN python3 /opt/agent/bake_pocket.py
 
 # --- livekit-server binary: used ONLY in DRY_TEST mode ---
 RUN LK_TAG=$(curl -fsSL https://api.github.com/repos/livekit/livekit/releases/latest \

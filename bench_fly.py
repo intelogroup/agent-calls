@@ -13,12 +13,12 @@ except Exception as e:
     print("spec_bench cpu_model ?", e, flush=True)
 print("spec_bench loadavg", [round(x, 2) for x in os.getloadavg()], flush=True)
 
-# ---- TTS: production Kokoro path ----
-from kokoro_onnx import Kokoro
+# ---- TTS: production Pocket path (via live_agent's warm engine) ----
+import live_agent as la
+engine = la.PocketTTS()
 t0 = t()
-k = Kokoro("/opt/agent/models/kokoro-v1.0.int8.onnx",
-           "/opt/agent/models/voices-v1.0.bin")
-print("spec_bench kokoro_load_s", round(t() - t0, 2), flush=True)
+la._PocketEngine.get()
+print("spec_bench pocket_load_s", round(t() - t0, 2), flush=True)
 sents = [
     "Hey, it's Jett's line. What do you want to talk about?",
     "I can hear you loud and clear, Jim. What can I do for you?",
@@ -28,16 +28,16 @@ sents = [
 ]
 for s in sents:
     t0 = t()
-    samples, sr = k.create(s, voice="af_heart", speed=1.0, lang="en-us")
+    samples, sr = engine._synth(s)
     dt = t() - t0
     dur = len(samples) / sr
     print(f"spec_bench tts chars={len(s)} synth_s={dt:.3f} audio_s={dur:.2f} "
           f"rtf={dt / dur:.3f} sr={sr}", flush=True)
 
-# ---- STT test input: a Kokoro-spoken question ----
+# ---- STT test input: a Pocket-spoken question ----
 q = ("Hey Jett, can you hear me well, and what is on my calendar "
      "this Thursday afternoon?")
-samples, sr = k.create(q, voice="af_heart", speed=1.0, lang="en-us")
+samples, sr = engine._synth(q)
 print("spec_bench stt_input_audio_s", round(len(samples) / sr, 2), flush=True)
 n = int(len(samples) * 16000 / sr)
 audio16 = np.interp(np.linspace(0, len(samples), n, endpoint=False),

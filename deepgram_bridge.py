@@ -1,7 +1,7 @@
 """Deepgram Voice Agent bridge (spike, 2026-10-15).
 
 Jim's A/B test of a streaming-native speech stack against the local
-Phonon-2 + Kokoro pipeline: on a self-tier inbound call, when the
+Phonon-2 + Pocket TTS pipeline: on a self-tier inbound call, when the
 DEEPGRAM_BRIDGE env flag is set AND the bus kill-switch file
 config/deepgram-bridge.enabled exists in the bus clone, the call is
 handed to Deepgram's Voice Agent API instead of the local pipeline.
