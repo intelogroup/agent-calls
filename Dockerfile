@@ -39,6 +39,7 @@ RUN pip install -r /tmp/requirements.txt
 # --- agent code (mirrors deploy-vm.yml layout: /opt/agent) ---
 COPY live_agent.py /opt/agent/live_agent.py
 COPY bench_fly.py /opt/agent/bench_fly.py
+COPY deepgram_bridge.py /opt/agent/deepgram_bridge.py
 COPY JETT.md /opt/agent/JETT.md
 
 # --- models, baked so no runtime download ---

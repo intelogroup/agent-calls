@@ -1073,6 +1073,12 @@ class _ResilientStream(llm.LLMStream):
 # Every decision is logged (spec_*) so a test call shows exactly what
 # the layer did.
 SPECULATIVE_FEED = os.environ.get("SPECULATIVE_FEED") == "1"
+
+# DEEPGRAM_BRIDGE=1 (Jim's A/B, 2026-10-15): self-tier inbound calls
+# are handed to the Deepgram Voice Agent (brief-only) when the bus
+# kill-switch file config/deepgram-bridge.enabled also exists. See
+# deepgram_bridge.py. Off in every other configuration.
+DEEPGRAM_BRIDGE = os.environ.get("DEEPGRAM_BRIDGE") == "1"
 SPEC_MIN_WORDS = int(os.environ.get("SPEC_MIN_WORDS", "3"))
 SPEC_SETTLE_S = float(os.environ.get("SPEC_SETTLE_S", "0.25"))
 SPEC_DRAFT_WAIT_S = float(os.environ.get("SPEC_DRAFT_WAIT_S", "1.5"))
@@ -2957,6 +2963,25 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
               direction=call_info["direction"],
               tier=call_info["tier"] or "unknown",
               known=bool(call_info["name"]))
+
+    # --- Deepgram bridge A/B (2026-10-15): self-tier inbound only,
+    # brief-only, gated by env flag AND the bus kill-switch file.
+    if DEEPGRAM_BRIDGE and call_info.get("direction") == "inbound" \
+            and call_info.get("tier") == "self":
+        import deepgram_bridge as _dgb
+        if _dgb.bridge_flag_on(BUS_DIR) \
+                and os.environ.get("DEEPGRAM_API_KEY"):
+            log_event("dg_bridge_start", call_id=_CURRENT_CALL_ID)
+            await _dgb.run_bridge(
+                ctx, call_id=_CURRENT_CALL_ID, brief=brief,
+                greeting=greeting_for(call_info),
+                api_key=os.environ["DEEPGRAM_API_KEY"],
+                append_lines=_bus_append_lines, log_event=log_event,
+                max_call_s=MAX_CALL_SEC)
+            return
+        log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
+                  reason="flag_off" if not _dgb.bridge_flag_on(BUS_DIR)
+                  else "no_api_key")
 
     instructions = SYSTEM_PROMPT.format(brief=brief)
     if call_info["channel"] == "pstn" \

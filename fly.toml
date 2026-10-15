@@ -10,6 +10,7 @@ primary_region = "iad"
 [env]
   AGENT_DIR = "/opt/agent"
   SPECULATIVE_FEED = "1"
+  DEEPGRAM_BRIDGE = "1"
   # No DRY_TEST here: production mode. Worker uses LIVEKIT_URL and
   # TUNNEL_SSH_KEY from Fly secrets on the jett-voice app.
 
