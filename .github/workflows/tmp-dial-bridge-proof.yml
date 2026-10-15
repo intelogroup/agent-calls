@@ -1,0 +1,69 @@
+name: tmp-dial-bridge-proof
+# TEMPORARY one-call proof workflow (2026-10-15). Jim's decision:
+# "Build it — Beckendy's call becomes its first live proof." Places
+# EXACTLY ONE outbound call via dial.py from the tmp/bridge-outbound
+# branch with --engine deepgram, so the deployed worker serves it
+# on the Deepgram bridge (new selectable route). Plain readable
+# text; no encoded payloads. Deleted from main after the run.
+on:
+  workflow_dispatch:
+jobs:
+  dial:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - name: Check out the bridge-outbound tree (dial.py lives at its root)
+        uses: actions/checkout@v4
+        with:
+          ref: tmp/bridge-outbound
+          path: tree
+      - name: Install LiveKit Python SDK into /tmp/probe-libs
+        run: |
+          python3 -m pip install --target=/tmp/probe-libs "livekit>=0.20,<2"
+          ls /tmp/probe-libs | head -5
+      - name: Load LiveKit dialer env from the server config (values never printed)
+        run: |
+          python3 - <<'PYEOF'
+          import os, subprocess
+          raw = subprocess.run(["sudo", "cat", "/opt/agent/livekit.yaml"],
+                               capture_output=True, text=True).stdout
+          key = secret = None
+          in_keys = False
+          for ln in raw.splitlines():
+              s = ln.strip()
+              if s == "keys:":
+                  in_keys = True
+                  continue
+              if in_keys:
+                  if ln.startswith((" ", "\t")) and ":" in s and not s.startswith("#"):
+                      k, v = s.split(":", 1)
+                      key, secret = k.strip(), v.strip()
+                      break
+                  elif s:
+                      in_keys = False
+          assert key and secret, "livekit keys not found"
+          env = {
+              "LIVEKIT_URL": "http://localhost:7880",
+              "LIVEKIT_API_KEY": key,
+              "LIVEKIT_API_SECRET": secret,
+              "LIVEKIT_SIP_OUTBOUND_TRUNK_ID": "ST_NqGc4EfiT8mZ",
+              "JETT_PHONE_E164": "+16176556805",
+          }
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              for k, v in env.items():
+                  fh.write(f"{k}={v}\n")
+          print("dialer env loaded (values not shown)")
+          PYEOF
+      - name: Dry-run plan first (no call placed)
+        run: |
+          PYTHONPATH=/tmp/probe-libs python3 tree/dial.py \
+            --to +19787156903 --engine deepgram --name Beckendy \
+            --brief "Check in on Beckendy for Jim: Jim asked you to ask if he is feeling well after his flu shot. Be warm and keep it short. Listen to his answer, respond to what he says, wish him well, and end the call politely." \
+            --dry-run
+      - name: Place the ONE proof call
+        run: |
+          PYTHONPATH=/tmp/probe-libs python3 tree/dial.py \
+            --to +19787156903 --engine deepgram --name Beckendy \
+            --brief "Check in on Beckendy for Jim: Jim asked you to ask if he is feeling well after his flu shot. Be warm and keep it short. Listen to his answer, respond to what he says, wish him well, and end the call politely."
+      - name: Let the call play out
+        run: sleep 120
