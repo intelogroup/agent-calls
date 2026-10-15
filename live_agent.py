@@ -2933,6 +2933,56 @@ def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
     }
 
 
+def diversion_header_present(attrs: dict) -> bool:
+    """True when the trunk delivered ANY diversion-shaped header,
+    parsed or not. A present-but-unparsed header is the debugging
+    case: the carrier sent a shape parse_diversion doesn't
+    understand, and without this flag the call looks like a
+    direct dial."""
+    attrs = attrs or {}
+    return any(str(attrs.get(k) or "").strip() for k in (
+        "sip.diversion", "sip.h.diversion",
+        "sip.history_info", "sip.h.history-info",
+        "sip.history-info"))
+
+
+def caller_recovered_from_pai(attrs: dict, info: dict) -> bool:
+    """True when the classified number came from
+    P-Asserted-Identity rather than the From / phoneNumber
+    attribute — i.e. From was rewritten to the redirector and
+    classify_caller recovered the real caller from PAI."""
+    pai = _digits10(pai_number(attrs))
+    if not pai:
+        return False
+    phone = _digits10((attrs or {}).get("sip.phoneNumber", "") or "")
+    return _digits10(info.get("number", "")) == pai and pai != phone
+
+
+_DEFAULT_CALL_INFO = {
+    "channel": "sip", "direction": "inbound",
+    "number": "", "called_number": "", "name": "",
+    "tier": "", "diverted": False, "diverted_from": "",
+    "diverted_from_digits": "", "diversion_reason": "",
+    "diversion_source": "", "forwarded_from_cell": False}
+
+
+def classify_safely(attrs: dict, identity: str, brief: str,
+                    call_id: str = "") -> tuple[dict, str]:
+    """classify_caller behind a fail-safe wrapper (observability
+    pass, 2026-10-15): a classification exception must never kill
+    or hang a call, and must never be silent. Returns (info,
+    error). On exception, info is the untrusted default
+    (message-taking, NEVER self tier) and error is
+    "Type: message" for the caller's bus receipt."""
+    try:
+        return classify_caller(attrs, identity, brief), ""
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:150]}"
+        log_event("classification_error", call_id=call_id,
+                  stage="classify_caller", error=err)
+        return dict(_DEFAULT_CALL_INFO), err
+
+
 def greeting_for(info: dict) -> str:
     """The exact greeting line for a phone call (ignored for SIP).
 
@@ -3650,17 +3700,23 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # --- telephony classification: who is on the line, which channel.
     # The SIP participant is already present (entrypoint waited for
     # it); outbound jobs carry their target in the dispatch metadata.
-    call_info = {"channel": "sip", "direction": "inbound",
-                 "number": "", "called_number": "", "name": "",
-                 "tier": "", "diverted": False, "diverted_from": "",
-                 "diverted_from_digits": "", "diversion_reason": "",
-                 "diversion_source": "", "forwarded_from_cell": False}
+    call_info = dict(_DEFAULT_CALL_INFO)
     caller_identity = ""
+    caller_attrs: dict = {}
     for p in ctx.room.remote_participants.values():
         caller_identity = p.identity or ""
-        call_info = classify_caller(
-            dict(getattr(p, "attributes", {}) or {}),
-            p.identity or "", brief)
+        caller_attrs = dict(getattr(p, "attributes", {}) or {})
+        # Fail-safe: a classification exception falls back to the
+        # untrusted default and the call CONTINUES as
+        # message-taking — it never dies and never lands on self.
+        call_info, _classify_err = classify_safely(
+            caller_attrs, p.identity or "", brief,
+            call_id=_CURRENT_CALL_ID or "")
+        if _classify_err:
+            asyncio.ensure_future(_ring_receipt(
+                _CURRENT_CALL_ID or "", "classification_error",
+                via="classification", stage="classify_caller",
+                error=_classify_err))
         break
     if job_meta and job_meta.get("direction") == "outbound":
         call_info.update(direction="outbound", channel="pstn",
@@ -3679,6 +3735,38 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
               diverted=bool(call_info.get("diverted")),
               forwarded_from_cell=bool(
                   call_info.get("forwarded_from_cell")))
+    # The same classification, on the bus (observability pass,
+    # 2026-10-15): call_classified above is stderr-only and Fly
+    # logs are not readable from the sandbox, so without this
+    # receipt a misclassified forwarded call leaves no debug
+    # record anywhere Jett can reach. Fire-and-forget, like
+    # call_forwarded below — the call never waits on the bus.
+    asyncio.ensure_future(_ring_receipt(
+        call_id, "call_classified", via="classification",
+        caller_number=call_info.get("number", ""),
+        channel=call_info["channel"],
+        direction=call_info["direction"],
+        tier=call_info["tier"] or "unknown",
+        known=bool(call_info["name"]),
+        diverted=bool(call_info.get("diverted")),
+        diversion_source=call_info.get("diversion_source", ""),
+        diversion_reason=call_info.get("diversion_reason", ""),
+        forwarded_from_cell=bool(
+            call_info.get("forwarded_from_cell")),
+        pai_recovered=caller_recovered_from_pai(
+            caller_attrs, call_info),
+        diversion_header_present=diversion_header_present(
+            caller_attrs)))
+    if diversion_header_present(caller_attrs) \
+            and not call_info.get("diverted"):
+        # LOUD, not silent: the carrier sent a diversion-shaped
+        # header that parse_diversion could not read. The call is
+        # being treated as a direct dial — if it was really a
+        # forwarded call, this receipt is the only trace.
+        asyncio.ensure_future(_ring_receipt(
+            call_id, "diversion_unparsed", via="classification",
+            caller_number=call_info.get("number", ""),
+            tier=call_info["tier"] or "unknown"))
     if call_info.get("diverted"):
         # On the record from the start (fire-and-forget; the call
         # proceeds in parallel): the summary for this call must show
@@ -3705,11 +3793,26 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         call_info, enabled=RING_FIRST,
         quiet=in_quiet_hours(datetime.now(JIM_TZ)),
         trunk_id=SIP_OUTBOUND_TRUNK_ID)
+    if _rf in ("off", "skip"):
+        # The no-ring decision lands on the bus too
+        # (observability pass): for a forwarded call this receipt
+        # is the record that the agent answered immediately
+        # instead of ringing Jim about his own forwarded call.
+        _skip_reason = (
+            "forwarded_immediate_answer"
+            if call_info.get("diverted") else
+            "self_tier" if call_info.get("tier") == "self" else _rf)
+        asyncio.ensure_future(_ring_receipt(
+            call_id, "ring_first_skipped", reason=_skip_reason,
+            decision=_rf))
     if _rf == "quiet_hours":
         await _ring_receipt(call_id, "ring_first_quiet_hours")
     elif _rf == "no_trunk":
         log_event("ring_first_unavailable", call_id=call_id,
                   reason="no_outbound_trunk")
+        asyncio.ensure_future(_ring_receipt(
+            call_id, "ring_first_unavailable",
+            reason="no_outbound_trunk"))
     elif _rf == "ring":
         _outcome, _elapsed, _detail = await _ring_first(
             ctx, caller_identity, call_id, call_info.get("number", ""))
@@ -3772,10 +3875,23 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                 return  # caller already gone; nothing to fall back to
             log_event("dg_bridge_fallback_local",
                       call_id=_CURRENT_CALL_ID)
+            # On the bus as well (observability pass): "the local
+            # pipeline answered" is a forwarding-path decision a
+            # debug session needs, and stderr is not readable.
+            asyncio.ensure_future(_ring_receipt(
+                _CURRENT_CALL_ID or "", "dg_bridge_fallback_local",
+                via="bridge",
+                tier=call_info.get("tier") or "unknown",
+                forwarded_from_cell=bool(
+                    call_info.get("forwarded_from_cell"))))
         else:
+            _skip_reason = ("flag_off" if not _dgb.bridge_flag_on(BUS_DIR)
+                            else "no_api_key")
             log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
-                      reason="flag_off" if not _dgb.bridge_flag_on(BUS_DIR)
-                      else "no_api_key")
+                      reason=_skip_reason)
+            asyncio.ensure_future(_ring_receipt(
+                _CURRENT_CALL_ID or "", "dg_bridge_skipped",
+                via="bridge", reason=_skip_reason))
 
     instructions = SYSTEM_PROMPT.format(brief=brief)
     if call_info["channel"] == "pstn" \
@@ -4133,6 +4249,13 @@ async def entrypoint(ctx: JobContext):
         stats["errors"].append(type(e).__name__)
         log_event("call_error", call_id=call_id,
                   error=f"{type(e).__name__}: {str(e)[:150]}")
+        # Bus copy (observability pass): a call that dies anywhere
+        # in _run_call must leave a record on the one channel that
+        # is actually readable, not only in lossy Fly logs.
+        asyncio.ensure_future(_ring_receipt(
+            call_id, "call_error", via="entrypoint",
+            stage="run_call",
+            error=f"{type(e).__name__}: {str(e)[:150]}"))
         log.exception("call %s failed: %s", call_id, e)
     finally:
         with _CALL_LOCK:
