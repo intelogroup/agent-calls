@@ -73,13 +73,19 @@ jobs:
           pw = os.environ["TELNYX_PW"]
           assert pw, "TELNYX_CONN_PASSWORD secret is empty"
 
+          def gid(obj, *names):
+              for n in names:
+                  if obj.get(n):
+                      return obj[n]
+              raise SystemExit("id field missing; response keys: %s" % sorted(obj.keys()))
+
           items = twirp("ListSIPInboundTrunk", {}).get("items", [])
           inb = next((t for t in items if t.get("name") == "telnyx-in"), None)
           if not inb:
               inb = twirp("CreateSIPInboundTrunk", {"trunk": {
                   "name": "telnyx-in", "numbers": ["+16176556805"],
                   "allowedAddresses": ["sip.telnyx.com"]}})
-          in_id = inb["sipTrunkId"]
+          in_id = gid(inb, "sipTrunkId", "sip_trunk_id")
           print("inbound trunk:", in_id)
 
           items = twirp("ListSIPOutboundTrunk", {}).get("items", [])
@@ -90,7 +96,7 @@ jobs:
                   "numbers": ["+16176556805"], "authUsername": "jettlivekit",
                   "authPassword": pw,
                   "headersToAttributes": {"X-Telnyx-Username": "jettlivekit"}}})
-          out_id = outb["sipTrunkId"]
+          out_id = gid(outb, "sipTrunkId", "sip_trunk_id")
           print("outbound trunk:", out_id)
 
           rules = twirp("ListSIPDispatchRule", {}).get("items", [])
@@ -100,7 +106,7 @@ jobs:
                   "name": "telnyx-inbound-to-jett-proxy", "trunkIds": [in_id],
                   "rule": {"dispatchRuleIndividual": {"roomPrefix": "jett-"}},
                   "roomConfig": {"agents": [{"agentName": "jett-proxy"}]}}})
-          print("dispatch rule:", rule["sipDispatchRuleId"])
+          print("dispatch rule:", gid(rule, "sipDispatchRuleId", "sip_dispatch_rule_id"))
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("inbound_trunk_id=%s\noutbound_trunk_id=%s\n" % (in_id, out_id))
