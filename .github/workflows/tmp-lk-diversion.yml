@@ -58,7 +58,7 @@ jobs:
                       trunk.headers_to_attributes[hk] = av
                   trunk.include_headers = S.SIPHeaderOptions.SIP_ALL_HEADERS
                   out = await client.sip.update_inbound_trunk(
-                      S.UpdateSIPInboundTrunkRequest(replace=trunk))
+                      TRUNK, trunk)
                   print("UPDATE RESULT:", json.dumps(
                       MessageToDict(out, preserving_proto_field_name=True),
                       indent=1))
