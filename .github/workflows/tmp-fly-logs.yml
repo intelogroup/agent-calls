@@ -10,5 +10,7 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
         run: |
-          curl -sL https://github.com/superfly/flyctl/releases/download/v0.3.248/flyctl_0.3.248_Linux_x86_64.tar.gz | tar xz -C /tmp flyctl
+          if [ ! -x /tmp/flyctl ]; then
+            curl -sL https://github.com/superfly/flyctl/releases/download/v0.3.248/flyctl_0.3.248_Linux_x86_64.tar.gz | tar xz -C /tmp flyctl
+          fi
           /tmp/flyctl logs -a jett-voice --no-tail 2>/dev/null | grep -aE '"event": "(boot_config|bridge_boot|registered|call_classified)"' | tail -4
