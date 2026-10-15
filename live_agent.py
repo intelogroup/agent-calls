@@ -1074,10 +1074,11 @@ class _ResilientStream(llm.LLMStream):
 # the layer did.
 SPECULATIVE_FEED = os.environ.get("SPECULATIVE_FEED") == "1"
 
-# DEEPGRAM_BRIDGE=1 (Jim's A/B, 2026-10-15): self-tier inbound calls
-# are handed to the Deepgram Voice Agent (brief-only) when the bus
-# kill-switch file config/deepgram-bridge.enabled also exists. See
-# deepgram_bridge.py. Off in every other configuration.
+# DEEPGRAM_BRIDGE=1: agent calls are handed to the Deepgram Voice
+# Agent (PRIMARY since 2026-10-15, Jim's word; started as a self-
+# tier A/B) when the bus kill-switch file
+# config/deepgram-bridge.enabled also exists. See deepgram_bridge.py.
+# Off in every other configuration; the local pipeline is fallback.
 DEEPGRAM_BRIDGE = os.environ.get("DEEPGRAM_BRIDGE") == "1"
 SPEC_MIN_WORDS = int(os.environ.get("SPEC_MIN_WORDS", "3"))
 SPEC_SETTLE_S = float(os.environ.get("SPEC_SETTLE_S", "0.25"))
@@ -2977,14 +2978,24 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
               tier=call_info["tier"] or "unknown",
               known=bool(call_info["name"]))
 
-    # --- Deepgram bridge A/B (2026-10-15): self-tier only (inbound
-    # from Jim, or outbound TO Jim — tier "self" keys on his number
-    # either way), gated by env flag AND the bus kill-switch file.
-    if DEEPGRAM_BRIDGE and call_info.get("tier") == "self":
+    # --- Deepgram bridge (2026-10-15): PRIMARY engine for agent
+    # calls (Jim's word) — every inbound call, plus outbound calls
+    # to Jim (tier "self" either direction). Outbound errands to
+    # other people stay on the local pipeline below: they need
+    # press_digits / leave_voicemail / transfer tools the bridge
+    # doesn't have. Gated by env flag AND the bus kill-switch file.
+    # If the bridge never establishes a session, the local pipeline
+    # takes the call instead (fallback, logged).
+    _outbound_errand = call_info.get("direction") == "outbound" \
+        and call_info.get("tier") != "self"
+    if DEEPGRAM_BRIDGE and not _outbound_errand:
         import deepgram_bridge as _dgb
         if _dgb.bridge_flag_on(BUS_DIR) \
                 and os.environ.get("DEEPGRAM_API_KEY"):
-            log_event("dg_bridge_start", call_id=_CURRENT_CALL_ID)
+            _mode = "self" if call_info.get("tier") == "self" \
+                else "untrusted"
+            log_event("dg_bridge_start", call_id=_CURRENT_CALL_ID,
+                      mode=_mode, direction=call_info["direction"])
             bridge_brief = brief
             if call_info.get("direction") == "outbound":
                 errand = str((job_meta or {}).get("brief", ""))[:800]
@@ -2992,17 +3003,23 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                     bridge_brief += ("\n\nTHIS CALL: you placed this "
                                      "call to Jim. Your errand from "
                                      f"Jim: {errand}")
-            await _dgb.run_bridge(
+            _stats = await _dgb.run_bridge(
                 ctx, call_id=_CURRENT_CALL_ID, brief=bridge_brief,
                 greeting=greeting_for(call_info),
                 api_key=os.environ["DEEPGRAM_API_KEY"],
                 append_lines=_bus_append_lines, log_event=log_event,
-                file_consult=_file_consult_once,
+                file_consult=file_consult_request, mode=_mode,
                 max_call_s=MAX_CALL_SEC)
-            return
-        log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
-                  reason="flag_off" if not _dgb.bridge_flag_on(BUS_DIR)
-                  else "no_api_key")
+            if _stats.get("established") or _stats.get("turns", 0) > 0:
+                return
+            if not ctx.room.remote_participants:
+                return  # caller already gone; nothing to fall back to
+            log_event("dg_bridge_fallback_local",
+                      call_id=_CURRENT_CALL_ID)
+        else:
+            log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
+                      reason="flag_off" if not _dgb.bridge_flag_on(BUS_DIR)
+                      else "no_api_key")
 
     instructions = SYSTEM_PROMPT.format(brief=brief)
     if call_info["channel"] == "pstn" \
