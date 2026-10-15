@@ -34,10 +34,18 @@ WORKDIR /opt/agent
 
 # --- python deps first (own layer, changes rarely) ---
 COPY requirements.txt /tmp/requirements.txt
+# CPU-only torch FIRST: moondream's kestrel engine requires
+# torch>=2.8, and the default PyPI wheel bundles the full CUDA
+# stack. Measured locally 2026-10-15: torch 2.14.1+cpu +
+# moondream 2.6.1 as a standalone venv = 1.8 GB, vs 6.2 GB for
+# the default CUDA install — and zero nvidia packages.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+      "torch==2.14.1+cpu"
 RUN pip install -r /tmp/requirements.txt
 
 # --- agent code (mirrors deploy-vm.yml layout: /opt/agent) ---
 COPY live_agent.py /opt/agent/live_agent.py
+COPY bake_parakeet.py /opt/agent/bake_parakeet.py
 COPY bench_fly.py /opt/agent/bench_fly.py
 COPY deepgram_bridge.py /opt/agent/deepgram_bridge.py
 COPY JETT.md /opt/agent/JETT.md
@@ -61,6 +69,11 @@ print('whisper tiny.en verified from cache')" && \
     python3 -c "from kokoro_onnx import Kokoro; \
 Kokoro('/opt/agent/models/kokoro-v1.0.int8.onnx', '/opt/agent/models/voices-v1.0.bin'); \
 print('kokoro warmup OK')"
+
+# Parakeet Redux weights (STREAMING_STT): bake into the HF cache so
+# the worker never downloads at boot; also proves the Photon load +
+# transcribe path works inside this image.
+RUN python3 /opt/agent/bake_parakeet.py
 
 # --- livekit-server binary: used ONLY in DRY_TEST mode ---
 RUN LK_TAG=$(curl -fsSL https://api.github.com/repos/livekit/livekit/releases/latest \

@@ -11,6 +11,9 @@ primary_region = "iad"
   AGENT_DIR = "/opt/agent"
   SPECULATIVE_FEED = "1"
   DEEPGRAM_BRIDGE = "1"
+  # Parakeet Redux streaming STT replaces Whisper in the local
+  # pipeline (Jim's decision, 2026-10-15). Unset = Whisper fallback.
+  STREAMING_STT = "1"
   # No DRY_TEST here: production mode. Worker uses LIVEKIT_URL and
   # TUNNEL_SSH_KEY from Fly secrets on the jett-voice app.
 

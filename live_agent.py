@@ -4,7 +4,8 @@
 One SIP line (sip:jett@129.159.189.244) -> LiveKit room (prefix jett-) ->
 this worker. Real-time voice pipeline:
 
-    faster-whisper tiny.en (local STT, via StreamAdapter + silero VAD)
+    faster-whisper tiny.en (local STT, via StreamAdapter + silero VAD;
+      STREAMING_STT=1 swaps in Parakeet Redux streaming via Photon)
       -> ResilientLLM (OpenRouter free-model chain, empty-output retry)
       -> kokoro-onnx (local warm-voice TTS)
 
@@ -1080,6 +1081,16 @@ SPECULATIVE_FEED = os.environ.get("SPECULATIVE_FEED") == "1"
 # config/deepgram-bridge.enabled also exists. See deepgram_bridge.py.
 # Off in every other configuration; the local pipeline is fallback.
 DEEPGRAM_BRIDGE = os.environ.get("DEEPGRAM_BRIDGE") == "1"
+
+# STREAMING_STT=1 (Jim's decision, 2026-10-15): Parakeet Redux via
+# Moondream Photon replaces faster-whisper as the local pipeline's
+# STT. Photon streams progressive snapshots — first text ~4 s into
+# the caller's speech, vs Whisper's nothing-until-utterance-end —
+# benchmarked at zero accuracy cost (parakeet-bench RESULTS.md).
+# With the flag unset, the Whisper path stays in charge, unchanged.
+STREAMING_STT = os.environ.get("STREAMING_STT") == "1"
+PARAKEET_MODEL = os.environ.get("PARAKEET_MODEL",
+                                "moondream/parakeet-redux")
 SPEC_MIN_WORDS = int(os.environ.get("SPEC_MIN_WORDS", "3"))
 SPEC_SETTLE_S = float(os.environ.get("SPEC_SETTLE_S", "0.25"))
 SPEC_DRAFT_WAIT_S = float(os.environ.get("SPEC_DRAFT_WAIT_S", "1.5"))
@@ -1522,6 +1533,238 @@ class _WhisperStream(stt.RecognizeStream):
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(language="en",
                                          text=text or "")]))
+
+
+# ---------------------------------------------------- Parakeet STT ---
+# Parakeet Redux (Moondream Photon) streaming STT — selected by
+# STREAMING_STT=1 (Jim's decision, 2026-10-15). Photon's cold start
+# is ~20-28 s, so the engine is a process-wide singleton warmed at
+# boot (see __main__); loading it per call would be a bug. Photon
+# emits full-transcript snapshot revisions while audio is still
+# arriving: each new snapshot becomes an INTERIM_TRANSCRIPT and the
+# end-of-segment result the FINAL_TRANSCRIPT — the same event
+# contract _WhisperStream honours, so the speculative drafter and
+# the rest of the session plumbing work unchanged.
+
+class _PhotonEngine:
+    """Process-wide warm Photon speech handle (loaded exactly once)."""
+
+    _speech = None
+    _cm = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        with cls._lock:
+            if cls._speech is None:
+                import moondream as md
+
+                log.info("loading Parakeet Redux via Photon (cpu) …")
+                t0 = time.monotonic()
+                cls._cm = md.photon(PARAKEET_MODEL, device="cpu")
+                cls._speech = cls._cm.__enter__()
+                load_s = round(time.monotonic() - t0, 1)
+                log_event("parakeet_loaded", load_s=load_s,
+                          model=PARAKEET_MODEL)
+                log.info("parakeet ready in %.1fs", load_s)
+            return cls._speech
+
+    @classmethod
+    def reset(cls) -> None:
+        """Tests only: drop the cached handle."""
+        with cls._lock:
+            cls._speech = None
+            cls._cm = None
+
+
+def _warm_parakeet() -> None:
+    """Boot warm-up (background thread): pay the Photon cold start
+    before the first call, never during one."""
+    try:
+        _PhotonEngine.get()
+    except Exception as e:
+        log_event("parakeet_load_failed", error=str(e)[:150])
+        log.warning("parakeet warm-up failed: %s", e)
+
+
+def _frame_to_16k(frame) -> np.ndarray:
+    """One rtc.AudioFrame -> float32 mono 16 kHz (Whisper-path maths)."""
+    audio = np.frombuffer(bytes(frame.data),
+                          dtype=np.int16).astype(np.float32) / 32768.0
+    if frame.num_channels > 1:
+        audio = audio.reshape(-1, frame.num_channels).mean(axis=1)
+    sr = frame.sample_rate
+    if sr != 16000 and audio.size:
+        n = int(len(audio) / sr * 16000)
+        audio = np.interp(
+            np.linspace(0, len(audio), n, endpoint=False),
+            np.arange(len(audio)), audio).astype(np.float32)
+    return audio
+
+
+async def _parakeet_final_for_audio(speech, pcm16k: np.ndarray) -> str:
+    """One-shot Photon transcription of a finished buffer (the
+    recognize path): stream it through a session, take its final."""
+    async def gen():
+        yield pcm16k
+
+    updates = await speech.atranscribe(audio=gen(), sample_rate=16000,
+                                       stream=True)
+    async for _ in updates:
+        pass
+    final = await updates.aresult()
+    return (final.get("text") or "").strip()
+
+
+class StreamingParakeetSTT(stt.STT):
+    """Parakeet Redux (Photon) as a streaming LiveKit STT."""
+
+    def __init__(self, speech=None) -> None:
+        super().__init__(capabilities=stt.STTCapabilities(
+            streaming=True, interim_results=True))
+        # Injectable for tests; production resolves the warm
+        # process-wide Photon handle lazily on first use.
+        self._injected = speech
+
+    @property
+    def model(self) -> str:
+        return "parakeet-redux"
+
+    @property
+    def provider(self) -> str:
+        return "moondream-photon"
+
+    async def _speech(self):
+        if self._injected is not None:
+            return self._injected
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _PhotonEngine.get)
+
+    async def _recognize_impl(self, buffer, *, language=NOT_GIVEN,
+                              conn_options) -> stt.SpeechEvent:
+        text = ""
+        try:
+            audio = _frame_to_16k(buffer)
+            if audio.size and float(
+                    np.abs(audio).max(initial=0.0)) >= 1e-4:
+                speech = await self._speech()
+                text = await _parakeet_final_for_audio(speech, audio)
+        except Exception as e:
+            log_event("parakeet_stt_error", error=str(e)[:150])
+            text = ""  # treat as silence rather than killing the turn
+        return stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en", text=text)],
+        )
+
+    def stream(self, *, language=NOT_GIVEN,
+               conn_options=DEFAULT_API_CONNECT_OPTIONS):
+        return _ParakeetStream(self, conn_options=conn_options)
+
+
+class _ParakeetSegment:
+    """One utterance's Photon session: PCM queue in, snapshots out."""
+
+    def __init__(self, stream: "_ParakeetStream", speech) -> None:
+        self._stream = stream
+        self._speech = speech
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.task: asyncio.Task | None = None
+        self.last_text = ""
+        self.final_text: str | None = None
+
+    def start(self) -> None:
+        self.task = asyncio.ensure_future(self._pump())
+
+    async def _audio_gen(self):
+        # Batch queued frames into ~250 ms float32 chunks (the shape
+        # the Photon bench harness proved); None ends the session.
+        buf: list[np.ndarray] = []
+        n = 0
+        while True:
+            frame = await self.queue.get()
+            if frame is None:
+                break
+            chunk = _frame_to_16k(frame)
+            buf.append(chunk)
+            n += len(chunk)
+            if n >= 4000:
+                yield np.concatenate(buf)
+                buf, n = [], 0
+        if buf:
+            yield np.concatenate(buf)
+
+    async def _pump(self) -> None:
+        try:
+            updates = await self._speech.atranscribe(
+                audio=self._audio_gen(), sample_rate=16000,
+                stream=True)
+            async for upd in updates:
+                text = (upd.get("text") or "").strip()
+                if text and text != self.last_text:
+                    self.last_text = text
+                    self._stream._emit_interim(text)
+            final = await updates.aresult()
+            self.final_text = (final.get("text") or "").strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("parakeet_stt_error", error=str(e)[:150])
+
+    async def finish(self) -> str:
+        """Close the audio side, wait for the final, return its text
+        (or the last snapshot if the engine died mid-segment)."""
+        self.queue.put_nowait(None)
+        if self.task is not None:
+            try:
+                await asyncio.wait_for(self.task, timeout=30)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self.task.cancel()
+                log_event("parakeet_final_timeout")
+        if self.final_text is not None:
+            return self.final_text
+        return self.last_text
+
+
+class _ParakeetStream(stt.RecognizeStream):
+    """Frames -> _ParakeetSegments; flush/close emits the final —
+    the same contract as _WhisperStream."""
+
+    def __init__(self, stt_obj: StreamingParakeetSTT, *,
+                 conn_options) -> None:
+        super().__init__(stt=stt_obj, conn_options=conn_options)
+        self._stt_obj = stt_obj
+        self._seg: _ParakeetSegment | None = None
+        self._speech = None
+
+    def _emit_interim(self, text: str) -> None:
+        self._event_ch.send_nowait(stt.SpeechEvent(
+            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en", text=text)]))
+
+    async def _run(self) -> None:
+        try:
+            self._speech = await self._stt_obj._speech()
+            async for msg in self._input_ch:
+                if isinstance(msg, stt.RecognizeStream._FlushSentinel):
+                    await self._finalize()
+                    continue
+                if self._seg is None:
+                    self._seg = _ParakeetSegment(self, self._speech)
+                    self._seg.start()
+                self._seg.queue.put_nowait(msg)
+        finally:
+            if self._seg is not None:
+                await self._finalize()
+
+    async def _finalize(self) -> None:
+        seg, self._seg = self._seg, None
+        text = ""
+        if seg is not None:
+            text = await seg.finish()
+        self._event_ch.send_nowait(stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en", text=text)]))
 
 
 # ----------------------------------------------------------------- TTS ---
@@ -3056,6 +3299,16 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         log_event("spec_skipped", reason="tier_not_self",
                   tier=call_info.get("tier") or "unknown")
 
+    # --- Parakeet streaming STT (STREAMING_STT=1, Jim's decision
+    # 2026-10-15): replaces Whisper in this pipeline — both the batch
+    # StreamAdapter above and, when both flags are on, the spike's
+    # StreamingWhisperSTT. Interims still reach the SpeculativeDrafter
+    # via user_input_transcribed and finals feed the brain exactly as
+    # Whisper's did. Flag unset = the Whisper path, unchanged.
+    if STREAMING_STT:
+        stt_stream = StreamingParakeetSTT()
+        log_event("parakeet_stt_enabled", call_id=_CURRENT_CALL_ID)
+
     session = AgentSession(
         stt=stt_stream,
         vad=silero.VAD.load(min_silence_duration=0.35),
@@ -3313,8 +3566,13 @@ if __name__ == "__main__":
               brain_chunk_stall_s=BRAIN_CHUNK_STALL_S,
               consult_timeout_s=CONSULT_TIMEOUT_SEC,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
-              bus_dir=BUS_DIR,
+              bus_dir=BUS_DIR, stt_streaming=STREAMING_STT,
               bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
+    if STREAMING_STT:
+        # Pay the ~20-28 s Photon cold start at boot, in the
+        # background, so the first call never waits on it.
+        threading.Thread(target=_warm_parakeet, daemon=True,
+                         name="parakeet-warmup").start()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,
