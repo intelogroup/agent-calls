@@ -3,7 +3,7 @@
 # Replaces the hand-built ephemeral Fly machine (PID 1 = sleep infinity,
 # everything installed via exec, wiped on restart). Bakes at build time:
 #   - python deps (pinned, integration-tested 2026-09-18)
-#   - faster-whisper tiny.en (STT)
+#   - Phonon-2 weights, sha256-verified (STT; bake_phonon.py)
 #   - kokoro-onnx int8 model + voices (TTS)
 # Runtime secrets come ONLY from env (Fly secrets), never baked in:
 #   LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
@@ -34,18 +34,19 @@ WORKDIR /opt/agent
 
 # --- python deps first (own layer, changes rarely) ---
 COPY requirements.txt /tmp/requirements.txt
-# CPU-only torch FIRST: moondream's kestrel engine requires
-# torch>=2.8, and the default PyPI wheel bundles the full CUDA
-# stack. Measured locally 2026-10-15: torch 2.14.1+cpu +
-# moondream 2.6.1 as a standalone venv = 1.8 GB, vs 6.2 GB for
-# the default CUDA install — and zero nvidia packages.
+# CPU-only torch FIRST: fermion-research requires torch>=2.3, and
+# the default PyPI wheel bundles the full CUDA stack the native
+# CPU engine never uses. Measured locally 2026-10-15: torch
+# 2.14.1+cpu + fermion-research 0.2.11 + transformers as a
+# standalone venv = 1.3 GB, vs the 5.8 GB CUDA-tainted bench venv,
+# with zero nvidia packages — and the engine loads + decodes on it.
 RUN pip install --index-url https://download.pytorch.org/whl/cpu \
       "torch==2.14.1+cpu"
 RUN pip install -r /tmp/requirements.txt
 
 # --- agent code (mirrors deploy-vm.yml layout: /opt/agent) ---
 COPY live_agent.py /opt/agent/live_agent.py
-COPY bake_parakeet.py /opt/agent/bake_parakeet.py
+COPY bake_phonon.py /opt/agent/bake_phonon.py
 COPY bench_fly.py /opt/agent/bench_fly.py
 COPY deepgram_bridge.py /opt/agent/deepgram_bridge.py
 COPY JETT.md /opt/agent/JETT.md
@@ -56,24 +57,15 @@ RUN mkdir -p /opt/agent/models && \
       https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx && \
     curl -fL --retry 3 -o /opt/agent/models/voices-v1.0.bin \
       https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin && \
-    for i in 1 2 3 4 5 6; do \
-      python3 -c "from faster_whisper import WhisperModel; \
-WhisperModel('tiny.en', device='cpu', compute_type='int8'); \
-print('whisper tiny.en cached')" && break; \
-      echo "whisper download attempt $i failed (HF 429?); retrying in 30s"; \
-      sleep 30; \
-    done; \
-    HF_HUB_OFFLINE=1 python3 -c "from faster_whisper import WhisperModel; \
-WhisperModel('tiny.en', device='cpu', compute_type='int8'); \
-print('whisper tiny.en verified from cache')" && \
     python3 -c "from kokoro_onnx import Kokoro; \
 Kokoro('/opt/agent/models/kokoro-v1.0.int8.onnx', '/opt/agent/models/voices-v1.0.bin'); \
 print('kokoro warmup OK')"
 
-# Parakeet Redux weights (STREAMING_STT): bake into the HF cache so
-# the worker never downloads at boot; also proves the Photon load +
-# transcribe path works inside this image.
-RUN python3 /opt/agent/bake_parakeet.py
+# Phonon-2 weights: download into the vendor cache so the worker
+# never downloads at boot; the bake verifies the container's
+# sha256 against the model repo's own manifest values and proves
+# the load + decode path works inside this image.
+RUN python3 /opt/agent/bake_phonon.py
 
 # --- livekit-server binary: used ONLY in DRY_TEST mode ---
 RUN LK_TAG=$(curl -fsSL https://api.github.com/repos/livekit/livekit/releases/latest \

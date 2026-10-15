@@ -43,27 +43,29 @@ n = int(len(samples) * 16000 / sr)
 audio16 = np.interp(np.linspace(0, len(samples), n, endpoint=False),
                     np.arange(len(samples)), samples).astype(np.float32)
 
-# ---- STT: production faster-whisper path, streaming simulation ----
-from faster_whisper import WhisperModel
+# ---- STT: production Phonon-2 path (vendor LiveSession) ----
+import fermion
+from fermion._speech.live import LiveSession, warm_up
 t0 = t()
-m = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-print("spec_bench whisper_load_s", round(t() - t0, 2), flush=True)
+speech = fermion.load_speech("phonon-2", quiet=True)
+print("spec_bench phonon_load_s", round(t() - t0, 2), flush=True)
+warm_up(speech)
 
-def transcribe(a):
-    segs, _ = m.transcribe(a, language="en", beam_size=1, vad_filter=True)
-    return " ".join(s.text.strip() for s in segs).strip()
-
-step = int(16000 * 0.35)
-i = 0
-while i < len(audio16):
-    buf = audio16[: i + step]
-    i += step
+partials = []
+sess = LiveSession(speech, on_partial=lambda tx: partials.append(tx))
+step = int(16000 * 0.05)
+fed = 0
+for i in range(0, len(audio16), step):
+    block = audio16[i:i + step]
+    fed += len(block)
     t0 = t()
-    txt = transcribe(buf)
+    sess.feed(block)
     dt = t() - t0
-    print(f"spec_bench stt_step buf_s={len(buf) / 16000:.2f} decode_s={dt:.3f} "
-          f"interim={txt[:40]!r}", flush=True)
+    if partials:
+        print(f"spec_bench stt_step fed_s={fed / 16000:.2f} decode_s={dt:.3f} "
+              f"interim={partials[-1][:40]!r}", flush=True)
+        partials.clear()
 t0 = t()
-final = transcribe(audio16)
+final = sess.finish()
 print(f"spec_bench stt_final decode_s={t() - t0:.3f} text={final!r}", flush=True)
 print("spec_bench done", flush=True)

@@ -15,9 +15,8 @@ primary_region = "iad"
   # cell for 10s before the agent answers. Unset = agent answers
   # immediately, as before.
   RING_FIRST = "1"
-  # Parakeet Redux streaming STT replaces Whisper in the local
-  # pipeline (Jim's decision, 2026-10-15). Unset = Whisper fallback.
-  STREAMING_STT = "1"
+  # STT is Phonon-2 unconditionally (Jim's decisions, 2026-10-15):
+  # no STT flag — Whisper was removed from the worker entirely.
   # No DRY_TEST here: production mode. Worker uses LIVEKIT_URL and
   # TUNNEL_SSH_KEY from Fly secrets on the jett-voice app.
 

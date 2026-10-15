@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for the SPECULATIVE_FEED spike (2026-10-15): streaming Whisper
+"""Tests for the SPECULATIVE_FEED spike (2026-10-15): streaming STT
 interims + speculative draft/commit layer in live_agent.py.
 
 Covers:
   - texts_compatible / draft_is_speakable policy functions
   - SpeculativeDrafter: settle-debounce, draft on interim, accept on
     matching final, wait-for-in-flight, reject on mismatch/unspeakable
-  - StreamingWhisperSTT: interim events from incremental transcription,
-    final on flush, sharing the WhisperSTT model object
+  - PhononSTT (the pipeline's only STT since the Whisper removal):
+    interim events from LiveSession partials, final on flush
   - SpeculativeLLM: draft hit replays without touching the inner chain;
     miss delegates untouched
 Run: ~/venv187/bin/python test_streaming_feed.py
@@ -23,7 +23,6 @@ from livekit import rtc
 from livekit.agents import llm, stt
 
 la.SPEC_SETTLE_S = 0.02
-la.SPEC_STREAM_INTERVAL_S = 0.05
 la.SPEC_DRAFT_WAIT_S = 1.0
 
 FAILED = []
@@ -122,22 +121,44 @@ async def t_drafter_short_interims_ignored():
 
 
 # ------------------------------------------------------------ streaming STT
-class FakeModel:
-    """Scripted faster-whisper stand-in: text grows with audio length."""
+class FakeSpeech:
+    """Scripted Phonon-2 stand-in: text grows with audio length."""
 
     def __init__(self):
-        self.calls = 0
+        self.final_text = "what is on my calendar today"
 
-    def transcribe(self, audio, language="en", beam_size=1, vad_filter=True):
-        self.calls += 1
-        secs = len(audio) / 16000.0
+    def text_at(self, secs):
         if secs < 0.4:
-            text = ""
-        elif secs < 0.9:
-            text = "what is on"
-        else:
-            text = "what is on my calendar today"
-        return [SimpleNamespace(text=text)], None
+            return ""
+        if secs < 0.9:
+            return "what is on"
+        return self.final_text
+
+    def transcribe_array(self, audio):
+        return self.text_at(len(audio) / 16000.0), 0.0, len(audio) / 16000.0
+
+
+class FakeLiveSession:
+    """Vendor LiveSession stand-in (segment-local callbacks)."""
+
+    def __init__(self, speech, *, on_partial, on_final):
+        self._speech = speech
+        self._on_partial = on_partial
+        self._on_final = on_final
+        self._samples = 0
+        self._text = ""
+
+    def feed(self, block):
+        self._samples += len(block)
+        text = self._speech.text_at(self._samples / 16000.0)
+        if text and text != self._text:
+            self._text = text
+            self._on_partial(text)
+
+    def finish(self):
+        if self._text:
+            self._on_final(self._text)
+        return self._speech.final_text
 
 
 def frame(seconds, sr=16000):
@@ -147,8 +168,11 @@ def frame(seconds, sr=16000):
 
 
 async def t_streaming_stt():
-    model = FakeModel()
-    engine = la.StreamingWhisperSTT(model)
+    engine = la.PhononSTT(
+        FakeSpeech(),
+        session_factory=lambda sp, *, on_partial, on_final:
+            FakeLiveSession(sp, on_partial=on_partial,
+                            on_final=on_final))
     check("streaming capabilities", engine.capabilities.streaming
           and engine.capabilities.interim_results)
     stream = engine.stream()

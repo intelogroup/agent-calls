@@ -4,8 +4,7 @@
 One SIP line (sip:jett@129.159.189.244) -> LiveKit room (prefix jett-) ->
 this worker. Real-time voice pipeline:
 
-    faster-whisper tiny.en (local STT, via StreamAdapter + silero VAD;
-      STREAMING_STT=1 swaps in Parakeet Redux streaming via Photon)
+    Phonon-2 (FermionResearch native CPU engine, streaming LiveSession)
       -> ResilientLLM (OpenRouter free-model chain, empty-output retry)
       -> kokoro-onnx (local warm-voice TTS)
 
@@ -46,6 +45,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -1068,8 +1068,8 @@ class _ResilientStream(llm.LLMStream):
 
 
 # ------------------------------------------------- speculative feed (spike)
-# SPECULATIVE_FEED=1 (Jim's design, 2026-10-15): Whisper transcribes
-# incrementally while the caller is still talking; interim transcripts
+# SPECULATIVE_FEED=1 (Jim's design, 2026-10-15): the streaming STT
+# transcribes incrementally while the caller is still talking; interim transcripts
 # start a tool-free draft reply from the brain chain; when the final
 # transcript matches the draft's basis, the draft is spoken immediately
 # instead of paying full generation latency after the caller stops.
@@ -1088,20 +1088,14 @@ SPECULATIVE_FEED = os.environ.get("SPECULATIVE_FEED") == "1"
 # Off in every other configuration; the local pipeline is fallback.
 DEEPGRAM_BRIDGE = os.environ.get("DEEPGRAM_BRIDGE") == "1"
 
-# STREAMING_STT=1 (Jim's decision, 2026-10-15): Parakeet Redux via
-# Moondream Photon replaces faster-whisper as the local pipeline's
-# STT. Photon streams progressive snapshots — first text ~4 s into
-# the caller's speech, vs Whisper's nothing-until-utterance-end —
-# benchmarked at zero accuracy cost (parakeet-bench RESULTS.md).
-# With the flag unset, the Whisper path stays in charge, unchanged.
-STREAMING_STT = os.environ.get("STREAMING_STT") == "1"
-PARAKEET_MODEL = os.environ.get("PARAKEET_MODEL",
-                                "moondream/parakeet-redux")
+# STT is Phonon-2, unconditionally (Jim's decisions, 2026-10-15):
+# Whisper was removed from the worker entirely, and the Parakeet/
+# Photon streaming build was superseded by Phonon-2 the same day —
+# see the PhononSTT class comment and phonon2-bench RESULTS.md
+# for the numbers that drove the switch.
 SPEC_MIN_WORDS = int(os.environ.get("SPEC_MIN_WORDS", "3"))
 SPEC_SETTLE_S = float(os.environ.get("SPEC_SETTLE_S", "0.25"))
 SPEC_DRAFT_WAIT_S = float(os.environ.get("SPEC_DRAFT_WAIT_S", "1.5"))
-SPEC_STREAM_INTERVAL_S = float(
-    os.environ.get("SPEC_STREAM_INTERVAL_S", "0.35"))
 
 _SPEC_DEFERRALS = (
     "let me check", "let me look", "let me ask", "let me find",
@@ -1343,236 +1337,35 @@ class _SpeculativeStream(llm.LLMStream):
 
 # ----------------------------------------------------------------- STT ---
 
-class WhisperSTT(stt.STT):
-    """faster-whisper tiny.en wrapped as a LiveKit STT (non-streaming)."""
+class _PhononEngine:
+    """Process-wide warm Phonon-2 speech handle (loaded exactly once).
 
-    def __init__(self) -> None:
-        super().__init__(
-            capabilities=stt.STTCapabilities(
-                streaming=False, interim_results=False))
-        from faster_whisper import WhisperModel
-
-        log.info("loading faster-whisper tiny.en …")
-        self._model = WhisperModel("tiny.en", device="cpu",
-                                   compute_type="int8")
-        log.info("whisper ready")
-
-    @property
-    def model(self) -> str:
-        return "tiny.en"
-
-    @property
-    def provider(self) -> str:
-        return "faster-whisper"
-
-    async def _recognize_impl(self, buffer, *, language=NOT_GIVEN,
-                              conn_options) -> stt.SpeechEvent:
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, self._transcribe, buffer)
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(language="en", text=text)],
-        )
-
-    def _transcribe(self, buffer) -> str:
-        # buffer is a single merged rtc.AudioFrame (from StreamAdapter)
-        raw = bytes(buffer.data)
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if buffer.num_channels > 1:
-            audio = audio.reshape(-1, buffer.num_channels).mean(axis=1)
-        sr = buffer.sample_rate
-        dur_s = round(len(audio) / max(1, sr), 2)
-        if audio.size == 0 or float(np.abs(audio).max(initial=0.0)) < 1e-4:
-            log_event("stt_empty_audio", duration_s=dur_s)
-            return ""
-        try:
-            if sr != 16000:
-                # cheap linear resample to 16 kHz
-                dur = len(audio) / sr
-                n = int(dur * 16000)
-                audio = np.interp(
-                    np.linspace(0, len(audio), n, endpoint=False),
-                    np.arange(len(audio)), audio).astype(np.float32)
-            segments, _ = self._model.transcribe(audio, language="en",
-                                                 beam_size=1, vad_filter=True)
-            return " ".join(s.text.strip() for s in segments).strip()
-        except Exception as e:
-            log_event("stt_error", error=str(e)[:150], duration_s=dur_s)
-            return ""  # treat as silence rather than killing the turn
-
-
-
-
-class StreamingWhisperSTT(stt.STT):
-    """faster-whisper tiny.en as a streaming STT (SPECULATIVE_FEED).
-
-    Shares the loaded WhisperModel with WhisperSTT. The recognize
-    stream re-transcribes the growing utterance buffer on an interval
-    and emits interims (which feed the SpeculativeDrafter); the final
-    lands on the framework's flush sentinel or when the stream closes.
+    Cold load is ~5 s; the boot warm-up thread pays it before the
+    first call (see __main__). The vendor engine is a native C CPU
+    decoder — not thread-safe across concurrent sessions — so one
+    lock serializes streaming sessions and batch recognizes.
     """
 
-    def __init__(self, model) -> None:
-        super().__init__(capabilities=stt.STTCapabilities(
-            streaming=True, interim_results=True))
-        self._model = model
-
-    @property
-    def model(self) -> str:
-        return "tiny.en"
-
-    @property
-    def provider(self) -> str:
-        return "faster-whisper-stream"
-
-    async def _recognize_impl(self, buffer, *, language=NOT_GIVEN,
-                              conn_options) -> stt.SpeechEvent:
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(
-            None, _whisper_transcribe_pcm, self._model, buffer)
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(language="en", text=text)],
-        )
-
-    def stream(self, *, language=NOT_GIVEN,
-               conn_options=DEFAULT_API_CONNECT_OPTIONS):
-        return _WhisperStream(self, conn_options=conn_options)
-
-
-def _whisper_transcribe_pcm(model, buffer) -> str:
-    """Transcribe one merged rtc.AudioFrame (also used by WhisperSTT)."""
-    raw = bytes(buffer.data)
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    if buffer.num_channels > 1:
-        audio = audio.reshape(-1, buffer.num_channels).mean(axis=1)
-    return _whisper_transcribe_array(model, audio, buffer.sample_rate)
-
-
-def _whisper_transcribe_array(model, audio, sr: int) -> str:
-    if audio.size == 0 or float(np.abs(audio).max(initial=0.0)) < 1e-4:
-        return ""
-    try:
-        if sr != 16000:
-            dur = len(audio) / sr
-            n = int(dur * 16000)
-            audio = np.interp(
-                np.linspace(0, len(audio), n, endpoint=False),
-                np.arange(len(audio)), audio).astype(np.float32)
-        segments, _ = model.transcribe(audio, language="en",
-                                       beam_size=1, vad_filter=True)
-        return " ".join(s.text.strip() for s in segments).strip()
-    except Exception as e:
-        log_event("stt_error", error=str(e)[:150])
-        return ""
-
-
-class _WhisperStream(stt.RecognizeStream):
-    """One utterance stream: frames accumulate; a ticker emits interims
-    from incremental re-transcription; flush/close emits the final."""
-
-    def __init__(self, stt_obj: StreamingWhisperSTT, *,
-                 conn_options) -> None:
-        super().__init__(stt=stt_obj, conn_options=conn_options)
-        self._stt_obj = stt_obj
-        self._pcm = bytearray()
-        self._sr = 16000
-        self._channels = 1
-        self._prev_hyp = ""
-        self._dirty = False
-        self._lock = asyncio.Lock()
-
-    async def _run(self) -> None:
-        ticker = asyncio.ensure_future(self._ticker())
-        try:
-            async for msg in self._input_ch:
-                if isinstance(msg, stt.RecognizeStream._FlushSentinel):
-                    await self._finalize()
-                    continue
-                if not self._pcm:
-                    self._sr = msg.sample_rate
-                    self._channels = msg.num_channels
-                self._pcm.extend(bytes(msg.data))
-                self._dirty = True
-        finally:
-            ticker.cancel()
-            if self._pcm:
-                await self._finalize()
-
-    async def _ticker(self) -> None:
-        while True:
-            await asyncio.sleep(SPEC_STREAM_INTERVAL_S)
-            if len(self._pcm) / 2 / max(1, self._sr) > 45:
-                log_event("stt_stream_force_final", seconds=45)
-                await self._finalize()
-            elif self._dirty:
-                self._dirty = False
-                await self._emit_interim()
-
-    async def _transcribe_buffer(self) -> str:
-        audio = np.frombuffer(bytes(self._pcm),
-                              dtype=np.int16).astype(np.float32) / 32768.0
-        if self._channels > 1:
-            audio = audio.reshape(-1, self._channels).mean(axis=1)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, _whisper_transcribe_array, self._stt_obj._model,
-            audio, self._sr)
-
-    async def _emit_interim(self) -> None:
-        async with self._lock:
-            text = await self._transcribe_buffer()
-        if not text or text == self._prev_hyp:
-            return
-        self._prev_hyp = text
-        self._event_ch.send_nowait(stt.SpeechEvent(
-            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-            alternatives=[stt.SpeechData(language="en", text=text)]))
-
-    async def _finalize(self) -> None:
-        async with self._lock:
-            text = await self._transcribe_buffer()
-            self._pcm.clear()
-            self._prev_hyp = ""
-            self._dirty = False
-        self._event_ch.send_nowait(stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(language="en",
-                                         text=text or "")]))
-
-
-# ---------------------------------------------------- Parakeet STT ---
-# Parakeet Redux (Moondream Photon) streaming STT — selected by
-# STREAMING_STT=1 (Jim's decision, 2026-10-15). Photon's cold start
-# is ~20-28 s, so the engine is a process-wide singleton warmed at
-# boot (see __main__); loading it per call would be a bug. Photon
-# emits full-transcript snapshot revisions while audio is still
-# arriving: each new snapshot becomes an INTERIM_TRANSCRIPT and the
-# end-of-segment result the FINAL_TRANSCRIPT — the same event
-# contract _WhisperStream honours, so the speculative drafter and
-# the rest of the session plumbing work unchanged.
-
-class _PhotonEngine:
-    """Process-wide warm Photon speech handle (loaded exactly once)."""
-
     _speech = None
-    _cm = None
     _lock = threading.Lock()
+    load_lock = threading.Lock()
 
     @classmethod
     def get(cls):
         with cls._lock:
             if cls._speech is None:
-                import moondream as md
+                import fermion
+                from fermion._speech.live import warm_up
 
-                log.info("loading Parakeet Redux via Photon (cpu) …")
+                log.info("loading Phonon-2 (fermion CPU engine) …")
                 t0 = time.monotonic()
-                cls._cm = md.photon(PARAKEET_MODEL, device="cpu")
-                cls._speech = cls._cm.__enter__()
+                cls._speech = fermion.load_speech("phonon-2",
+                                                  quiet=True)
+                warm_up(cls._speech)
                 load_s = round(time.monotonic() - t0, 1)
-                log_event("parakeet_loaded", load_s=load_s,
-                          model=PARAKEET_MODEL)
-                log.info("parakeet ready in %.1fs", load_s)
+                log_event("phonon_loaded", load_s=load_s,
+                          model="phonon-2")
+                log.info("phonon-2 ready in %.1fs", load_s)
             return cls._speech
 
     @classmethod
@@ -1580,21 +1373,20 @@ class _PhotonEngine:
         """Tests only: drop the cached handle."""
         with cls._lock:
             cls._speech = None
-            cls._cm = None
 
 
-def _warm_parakeet() -> None:
-    """Boot warm-up (background thread): pay the Photon cold start
+def _warm_phonon() -> None:
+    """Boot warm-up (background thread): pay the Phonon-2 load
     before the first call, never during one."""
     try:
-        _PhotonEngine.get()
+        _PhononEngine.get()
     except Exception as e:
-        log_event("parakeet_load_failed", error=str(e)[:150])
-        log.warning("parakeet warm-up failed: %s", e)
+        log_event("phonon_load_failed", error=str(e)[:150])
+        log.warning("phonon-2 warm-up failed: %s", e)
 
 
 def _frame_to_16k(frame) -> np.ndarray:
-    """One rtc.AudioFrame -> float32 mono 16 kHz (Whisper-path maths)."""
+    """One rtc.AudioFrame -> float32 mono 16 kHz."""
     audio = np.frombuffer(bytes(frame.data),
                           dtype=np.int16).astype(np.float32) / 32768.0
     if frame.num_channels > 1:
@@ -1608,43 +1400,55 @@ def _frame_to_16k(frame) -> np.ndarray:
     return audio
 
 
-async def _parakeet_final_for_audio(speech, pcm16k: np.ndarray) -> str:
-    """One-shot Photon transcription of a finished buffer (the
-    recognize path): stream it through a session, take its final."""
-    async def gen():
-        yield pcm16k
-
-    updates = await speech.atranscribe(audio=gen(), sample_rate=16000,
-                                       stream=True)
-    async for _ in updates:
-        pass
-    final = await updates.aresult()
-    return (final.get("text") or "").strip()
+def _phonon_transcribe_array(speech, audio: np.ndarray) -> str:
+    """Batch-decode one finished buffer with the vendor engine."""
+    with _PhononEngine.load_lock:
+        text, _, _ = speech.transcribe_array(audio)
+    return (text or "").strip()
 
 
-class StreamingParakeetSTT(stt.STT):
-    """Parakeet Redux (Photon) as a streaming LiveKit STT."""
+def _live_session(speech, *, on_partial, on_final):
+    """Production session factory: the vendor LiveSession."""
+    from fermion._speech.live import LiveSession
 
-    def __init__(self, speech=None) -> None:
+    return LiveSession(speech, on_partial=on_partial,
+                       on_final=on_final)
+
+
+class PhononSTT(stt.STT):
+    """Phonon-2 (FermionResearch, native CPU engine) streaming STT.
+
+    THE local-pipeline STT since 2026-10-15 (Jim's decisions):
+    Whisper was removed from the worker entirely, and Phonon-2
+    replaced the interim Parakeet/Photon build on Jim's metrics —
+    streaming first text 0.5-1.6 s (vs Photon's ~4 s, Whisper
+    batch's ~11 s), WER 7.86% (vs 12.04% / 12.53%), ~5 s cold load
+    (phonon2-bench RESULTS.md). Interim snapshots feed the
+    SpeculativeDrafter through user_input_transcribed, exactly as
+    the previous streaming STTs' did.
+    """
+
+    def __init__(self, speech=None, session_factory=None) -> None:
         super().__init__(capabilities=stt.STTCapabilities(
             streaming=True, interim_results=True))
         # Injectable for tests; production resolves the warm
-        # process-wide Photon handle lazily on first use.
+        # process-wide engine handle lazily on first use.
         self._injected = speech
+        self._session_factory = session_factory or _live_session
 
     @property
     def model(self) -> str:
-        return "parakeet-redux"
+        return "phonon-2"
 
     @property
     def provider(self) -> str:
-        return "moondream-photon"
+        return "fermion"
 
     async def _speech(self):
         if self._injected is not None:
             return self._injected
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _PhotonEngine.get)
+        return await loop.run_in_executor(None, _PhononEngine.get)
 
     async def _recognize_impl(self, buffer, *, language=NOT_GIVEN,
                               conn_options) -> stt.SpeechEvent:
@@ -1654,9 +1458,11 @@ class StreamingParakeetSTT(stt.STT):
             if audio.size and float(
                     np.abs(audio).max(initial=0.0)) >= 1e-4:
                 speech = await self._speech()
-                text = await _parakeet_final_for_audio(speech, audio)
+                loop = asyncio.get_running_loop()
+                text = await loop.run_in_executor(
+                    None, _phonon_transcribe_array, speech, audio)
         except Exception as e:
-            log_event("parakeet_stt_error", error=str(e)[:150])
+            log_event("phonon_stt_error", error=str(e)[:150])
             text = ""  # treat as silence rather than killing the turn
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -1665,100 +1471,130 @@ class StreamingParakeetSTT(stt.STT):
 
     def stream(self, *, language=NOT_GIVEN,
                conn_options=DEFAULT_API_CONNECT_OPTIONS):
-        return _ParakeetStream(self, conn_options=conn_options)
+        return _PhononStream(self, conn_options=conn_options)
 
 
-class _ParakeetSegment:
-    """One utterance's Photon session: PCM queue in, snapshots out."""
+class _PhononSegment:
+    """One utterance's LiveSession.
 
-    def __init__(self, stream: "_ParakeetStream", speech) -> None:
+    LiveSession.feed() decodes synchronously (partials re-decode the
+    in-flight segment inside the call), so feeding runs on a
+    dedicated thread pulling converted blocks from a queue. The
+    session's own callbacks are segment-local: on_partial carries
+    the in-flight hypothesis, on_final one cut segment. This class
+    folds them into the stream's cumulative transcript — completed
+    segments plus the current hypothesis — and finish() returns the
+    session's joined transcript of record.
+    """
+
+    def __init__(self, stream: "_PhononStream", speech,
+                 session_factory, loop) -> None:
         self._stream = stream
-        self._speech = speech
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.task: asyncio.Task | None = None
-        self.last_text = ""
+        self._loop = loop
+        self._queue: queue.Queue = queue.Queue()
+        self._done = threading.Event()
+        self._finals: list[str] = []
+        self._partial = ""
+        self._last_emitted = ""
         self.final_text: str | None = None
+        self._session = session_factory(
+            speech, on_partial=self._on_partial,
+            on_final=self._on_final)
+        self._thread = threading.Thread(
+            target=self._feed_loop, daemon=True, name="phonon-feed")
 
     def start(self) -> None:
-        self.task = asyncio.ensure_future(self._pump())
+        self._thread.start()
 
-    async def _audio_gen(self):
-        # Batch queued frames into ~250 ms float32 chunks (the shape
-        # the Photon bench harness proved); None ends the session.
-        buf: list[np.ndarray] = []
-        n = 0
-        while True:
-            frame = await self.queue.get()
-            if frame is None:
-                break
-            chunk = _frame_to_16k(frame)
-            buf.append(chunk)
-            n += len(chunk)
-            if n >= 4000:
-                yield np.concatenate(buf)
-                buf, n = [], 0
-        if buf:
-            yield np.concatenate(buf)
+    def push(self, frame) -> None:
+        self._queue.put(_frame_to_16k(frame))
 
-    async def _pump(self) -> None:
+    # --- vendor callbacks (feeder thread) ---
+    def _cumulative(self) -> str:
+        parts = list(self._finals)
+        if self._partial:
+            parts.append(self._partial)
+        return " ".join(parts).strip()
+
+    def _maybe_emit(self) -> None:
+        text = self._cumulative()
+        if text and text != self._last_emitted:
+            self._last_emitted = text
+            self._loop.call_soon_threadsafe(
+                self._stream._emit_interim, text)
+
+    def _on_partial(self, text: str) -> None:
+        self._partial = (text or "").strip()
+        self._maybe_emit()
+
+    def _on_final(self, text: str) -> None:
+        text = (text or "").strip()
+        if text:
+            self._finals.append(text)
+        self._partial = ""
+        self._maybe_emit()
+
+    def _feed_loop(self) -> None:
         try:
-            updates = await self._speech.atranscribe(
-                audio=self._audio_gen(), sample_rate=16000,
-                stream=True)
-            async for upd in updates:
-                text = (upd.get("text") or "").strip()
-                if text and text != self.last_text:
-                    self.last_text = text
-                    self._stream._emit_interim(text)
-            final = await updates.aresult()
-            self.final_text = (final.get("text") or "").strip()
-        except asyncio.CancelledError:
-            raise
+            with _PhononEngine.load_lock:
+                while True:
+                    block = self._queue.get()
+                    if block is None:
+                        break
+                    self._session.feed(block)
+                self.final_text = (self._session.finish()
+                                   or "").strip()
         except Exception as e:
-            log_event("parakeet_stt_error", error=str(e)[:150])
+            log_event("phonon_stt_error", error=str(e)[:150])
+        finally:
+            self._done.set()
 
     async def finish(self) -> str:
-        """Close the audio side, wait for the final, return its text
-        (or the last snapshot if the engine died mid-segment)."""
-        self.queue.put_nowait(None)
-        if self.task is not None:
-            try:
-                await asyncio.wait_for(self.task, timeout=30)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self.task.cancel()
-                log_event("parakeet_final_timeout")
+        """Close the audio side, wait for the session's final
+        transcript (or the cumulative snapshots if it died)."""
+        self._queue.put(None)
+        loop = asyncio.get_running_loop()
+        done = await loop.run_in_executor(None, self._done.wait, 30)
+        if not done:
+            log_event("phonon_final_timeout")
         if self.final_text is not None:
             return self.final_text
-        return self.last_text
+        return self._cumulative()
 
 
-class _ParakeetStream(stt.RecognizeStream):
-    """Frames -> _ParakeetSegments; flush/close emits the final —
-    the same contract as _WhisperStream."""
+class _PhononStream(stt.RecognizeStream):
+    """Frames -> _PhononSegments; flush/close emits the final —
+    the contract the session plumbing has always consumed."""
 
-    def __init__(self, stt_obj: StreamingParakeetSTT, *,
-                 conn_options) -> None:
+    def __init__(self, stt_obj: PhononSTT, *, conn_options) -> None:
         super().__init__(stt=stt_obj, conn_options=conn_options)
         self._stt_obj = stt_obj
-        self._seg: _ParakeetSegment | None = None
+        self._seg: _PhononSegment | None = None
         self._speech = None
 
     def _emit_interim(self, text: str) -> None:
-        self._event_ch.send_nowait(stt.SpeechEvent(
-            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-            alternatives=[stt.SpeechData(language="en", text=text)]))
+        try:
+            self._event_ch.send_nowait(stt.SpeechEvent(
+                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language="en",
+                                             text=text)]))
+        except Exception:
+            pass  # stream already closing; a late interim is moot
 
     async def _run(self) -> None:
         try:
             self._speech = await self._stt_obj._speech()
+            loop = asyncio.get_running_loop()
             async for msg in self._input_ch:
                 if isinstance(msg, stt.RecognizeStream._FlushSentinel):
                     await self._finalize()
                     continue
                 if self._seg is None:
-                    self._seg = _ParakeetSegment(self, self._speech)
+                    self._seg = _PhononSegment(
+                        self, self._speech,
+                        self._stt_obj._session_factory, loop)
                     self._seg.start()
-                self._seg.queue.put_nowait(msg)
+                self._seg.push(msg)
         finally:
             if self._seg is not None:
                 await self._finalize()
@@ -1771,8 +1607,6 @@ class _ParakeetStream(stt.RecognizeStream):
         self._event_ch.send_nowait(stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(language="en", text=text)]))
-
-
 # ----------------------------------------------------------------- TTS ---
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+")
@@ -3645,9 +3479,11 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     log.info("call brain chain: %s",
              " -> ".join(f"{e.brain.label}:{e.model}"
                          for e in agent_llm._chain()))
-    stt_engine = WhisperSTT()
-    stt_stream = stt.StreamAdapter(
-        stt=stt_engine, vad=silero.VAD.load(min_silence_duration=0.35))
+    # Phonon-2 is the pipeline's only STT (Whisper was removed from
+    # the worker entirely, 2026-10-15). It streams natively, so it
+    # is handed to the session directly — the shape the speculative
+    # spike proved — and the session's VAD below does endpointing.
+    stt_stream = PhononSTT()
     tts_engine = KokoroTTS()
 
     brief = await load_brief_live()
@@ -3801,13 +3637,12 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                transfer_to_jim, press_digits, leave_voicemail],
     )
     # --- speculative feed spike (SPECULATIVE_FEED, tier "self" only):
-    # streaming STT + draft-ahead brain wrapper; with the flag off the
-    # proven pipeline stays byte-for-byte in charge.
+    # the STT already streams; the flag gates the draft-ahead brain
+    # wrapper that consumes its interims.
     spec_drafter = None
     spec_history: list | None = None
     session_llm = agent_llm
     if SPECULATIVE_FEED and call_info.get("tier") == "self":
-        stt_stream = StreamingWhisperSTT(stt_engine._model)
         spec_history = []
         spec_drafter = SpeculativeDrafter(_make_draft_generator(
             agent_llm, instructions, lambda: list(spec_history or [])))
@@ -3816,16 +3651,6 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     elif SPECULATIVE_FEED:
         log_event("spec_skipped", reason="tier_not_self",
                   tier=call_info.get("tier") or "unknown")
-
-    # --- Parakeet streaming STT (STREAMING_STT=1, Jim's decision
-    # 2026-10-15): replaces Whisper in this pipeline — both the batch
-    # StreamAdapter above and, when both flags are on, the spike's
-    # StreamingWhisperSTT. Interims still reach the SpeculativeDrafter
-    # via user_input_transcribed and finals feed the brain exactly as
-    # Whisper's did. Flag unset = the Whisper path, unchanged.
-    if STREAMING_STT:
-        stt_stream = StreamingParakeetSTT()
-        log_event("parakeet_stt_enabled", call_id=_CURRENT_CALL_ID)
 
     session = AgentSession(
         stt=stt_stream,
@@ -4128,13 +3953,12 @@ if __name__ == "__main__":
               ring_first=RING_FIRST,
               ring_first_window_s=RING_FIRST_WINDOW_S,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
-              bus_dir=BUS_DIR, stt_streaming=STREAMING_STT,
+              bus_dir=BUS_DIR, stt_engine="phonon-2",
               bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
-    if STREAMING_STT:
-        # Pay the ~20-28 s Photon cold start at boot, in the
-        # background, so the first call never waits on it.
-        threading.Thread(target=_warm_parakeet, daemon=True,
-                         name="parakeet-warmup").start()
+    # Pay the ~5 s Phonon-2 load at boot, in the background, so the
+    # first call never waits on it.
+    threading.Thread(target=_warm_phonon, daemon=True,
+                     name="phonon-warmup").start()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,
