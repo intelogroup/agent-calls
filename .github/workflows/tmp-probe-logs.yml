@@ -4,17 +4,12 @@ on:
 jobs:
   logs:
     runs-on: [self-hosted, oracle]
-    timeout-minutes: 4
+    timeout-minutes: 8
     steps:
-      - name: Setup flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Pull fly logs, grep probe window
+      - name: Fly worker logs around the probes
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
         run: |
-          timeout 90 flyctl logs -a jett-voice --no-tail > flylogs.txt 2>&1 || true
-          wc -l flylogs.txt
-          echo "=== lines mentioning the probe call ==="
-          grep -a "1792103503" flylogs.txt | head -60 || true
-          echo "=== event lines 22:31-22:33Z ==="
-          grep -aE "2026-10-15T22:3[123]" flylogs.txt | head -80 || true
+          curl -sL https://github.com/superfly/flyctl/releases/download/v0.3.207/flyctl_0.3.207_Linux_x86_64.tar.gz -o /tmp/flyctl.tgz
+          tar -xzf /tmp/flyctl.tgz -C /tmp
+          /tmp/flyctl logs -a jett-voice --no-tail 2>&1 | grep -aiE "probe|tester|call_start|call_end|call_classified|session|transcript|registered|starting agent|error|phonon|turn|vad|interim|eou|metrics" | tail -120 || true
