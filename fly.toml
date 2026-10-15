@@ -14,8 +14,9 @@ primary_region = "iad"
   # TUNNEL_SSH_KEY from Fly secrets on the jett-voice app.
 
 [[vm]]
-  size = "shared-cpu-2x"
-  memory = "2gb"
+  size = "shared-cpu-4x"
+  memory = "8gb"
 
 auto_stop_machines = false
 auto_start_machines = true
+
