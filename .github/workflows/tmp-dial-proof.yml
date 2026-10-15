@@ -6,21 +6,23 @@ jobs:
     runs-on: [self-hosted, oracle]
     timeout-minutes: 8
     steps:
-      - name: Checkout voice build branch
-        uses: actions/checkout@v4
-        with:
-          ref: tmp/fly-build
-      - name: Extract LiveKit creds and place the call
+      - name: Place outbound call via LiveKit Twirp API (stdlib only)
         run: |
-          set -euo pipefail
           python3 - <<'PYEOF'
-          import subprocess
+          import subprocess, json, time, hmac, hashlib, base64, urllib.request, urllib.error
+
           raw = subprocess.run(["sudo", "cat", "/opt/agent/livekit.yaml"],
                                capture_output=True, text=True).stdout
           api_key = api_secret = None
+          port = 7880
           in_keys = False
           for ln in raw.splitlines():
               s = ln.strip()
+              if s.startswith("port:") and not ln.startswith((" ", "\t")):
+                  try:
+                      port = int(s.split(":", 1)[1].strip())
+                  except Exception:
+                      pass
               if s == "keys:":
                   in_keys = True
                   continue
@@ -36,16 +38,50 @@ jobs:
               if api_secret is None and s.startswith("api_secret:"):
                   api_secret = s.split(":", 1)[1].strip().strip('"').strip("'")
           assert api_key and api_secret, "livekit keys not found"
-          with open("lkcreds.env", "w") as f:
-              f.write("LIVEKIT_API_KEY=%s\nLIVEKIT_API_SECRET=%s\n" % (api_key, api_secret))
-          print("creds extracted for key:", api_key)
+          print("lk key:", api_key, "| port:", port)
+
+          ROOM = "jett-out-proof-" + str(int(time.time()))
+          TO = "+18574261739"
+          BRIEF = ("Outbound proof call on Jim's new Telnyx line. Greet Jim warmly, "
+                   "confirm he can hear you clearly, and ask him to confirm the caller "
+                   "ID on his phone showed 617-655-6805. Keep it short and friendly, "
+                   "then wrap up and say goodbye.")
+
+          def b64(b):
+              return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+          now = int(time.time())
+          header = {"alg": "HS256", "typ": "JWT"}
+          claims = {"iss": api_key, "sub": "jett-dial-proof", "nbf": now - 10,
+                    "exp": now + 3600, "sip": {"admin": True, "call": True},
+                    "video": {"roomCreate": True, "roomAdmin": True, "room": ROOM,
+                              "canPublish": False, "canSubscribe": False}}
+          msg = b64(json.dumps(header).encode()) + "." + b64(json.dumps(claims).encode())
+          jwt = msg + "." + b64(hmac.new(api_secret.encode(), msg.encode(), hashlib.sha256).digest())
+
+          def twirp(service, method, body, timeout=180):
+              url = "http://127.0.0.1:%d/twirp/%s/%s" % (port, service, method)
+              req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+              req.add_header("Content-Type", "application/json")
+              req.add_header("Authorization", "Bearer " + jwt)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  raise SystemExit("%s/%s -> HTTP %s: %s" % (service, method, e.code, e.read().decode()[:400]))
+
+          r = twirp("livekit.RoomService", "CreateRoom", {"name": ROOM})
+          print("room created:", r.get("name") or ROOM)
+          d = twirp("livekit.AgentDispatchService", "CreateAgentDispatch",
+                    {"room": ROOM, "agentName": "jett-proxy",
+                     "metadata": json.dumps({"direction": "outbound", "to": TO, "brief": BRIEF})})
+          print("dispatch created:", d.get("id") or d.get("dispatch_id") or "ok")
+          print("dialing", TO, "- waiting for answer...")
+          p = twirp("livekit.SIP", "CreateSIPParticipant",
+                    {"sipTrunkId": "ST_NqGc4EfiT8mZ", "sipCallTo": TO,
+                     "sipNumber": "+16176556805", "roomName": ROOM,
+                     "participantIdentity": "callee-" + TO,
+                     "waitUntilAnswered": True, "krispEnabled": True})
+          print("ANSWERED. sip_call_id:", p.get("sip_call_id") or p.get("sipCallId") or "created")
+          print("DIAL OK")
           PYEOF
-          set -a; . ./lkcreds.env; set +a
-          rm -f lkcreds.env
-          export LIVEKIT_URL=http://localhost:7880
-          export LIVEKIT_SIP_OUTBOUND_TRUNK_ID=ST_NqGc4EfiT8mZ
-          export JETT_PHONE_E164=+16176556805
-          python3 -m pip install --user --quiet "livekit>=0.18" || python3 -m pip install --user --quiet --break-system-packages "livekit>=0.18"
-          DIAL=$(find . -name dial.py | head -1)
-          echo "dialer: $DIAL"
-          python3 "$DIAL" --to +18574261739 --brief "Outbound proof call on Jim's new Telnyx line. Greet Jim warmly, confirm he can hear you clearly, and ask him to confirm the caller ID on his phone showed 617-655-6805. Keep it short and friendly, then wrap up and say goodbye."
