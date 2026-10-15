@@ -3012,6 +3012,104 @@ def greeting_for(info: dict) -> str:
             "message for him. " + CONSENT_LINE)
 
 
+# ------------------------------------- Deepgram bridge routing ---
+
+def bridge_route(call_info: dict, job_meta: dict | None) -> dict:
+    """Whether the Deepgram bridge serves this call, and in which
+    mode. Pure function over (call_info, job_meta) — the gate matrix
+    is unit-tested (test_bridge_outbound.py).
+
+    `engine` is read ONLY from the agent-job dispatch metadata,
+    which only the dialer sets. PSTN inbound calls arrive via the
+    SIP dispatch rule, whose jobs carry no metadata, so no phone
+    call can ever set this flag — and the flag NEVER touches
+    classification: tier/direction/diverted come from
+    classify_caller and the dispatch direction exactly as before,
+    so a diverted or spoofed call stays untrusted here too.
+
+    Routes:
+      tier "self" (either direction)      -> bridge, mode "self"
+                                             (unchanged behavior)
+      inbound, any other tier             -> bridge, mode
+                                             "untrusted" (unchanged)
+      outbound, tier != "self",
+        engine == "deepgram"              -> bridge, mode
+                                             "untrusted" (NEW: the
+                                             selectable errand
+                                             route, Jim 2026-10-15)
+      outbound, tier != "self", no flag   -> local pipeline
+                                             (unchanged: errands
+                                             needing press_digits /
+                                             leave_voicemail /
+                                             transfer stay local)
+    """
+    tier = call_info.get("tier")
+    direction = call_info.get("direction")
+    engine = str((job_meta or {}).get("engine", "")
+                 or "").strip().lower()
+    if tier == "self":
+        return {"serve": True, "mode": "self", "via_engine": False}
+    if direction == "outbound":
+        if engine == "deepgram":
+            return {"serve": True, "mode": "untrusted",
+                    "via_engine": True}
+        return {"serve": False, "mode": "untrusted",
+                "via_engine": False}
+    return {"serve": True, "mode": "untrusted", "via_engine": False}
+
+
+def outbound_bridge_brief(base_brief: str, call_info: dict,
+                          job_meta: dict | None) -> str:
+    """The bridge brief for an outbound call to a third party
+    (bridge_route via_engine). The JETT.md brief stays on as
+    background; this appended section reframes the call: Jett
+    PLACED it, the person who answered is the callee — never Jim —
+    and the errand in the dispatch rules the conversation. Runs in
+    the bridge's guarded "untrusted" mode: nothing here widens what
+    may be shared or committed."""
+    meta = job_meta or {}
+    errand = str(meta.get("brief", ""))[:800]
+    name = str(meta.get("callee_name", "") or "").strip()
+    number = str(call_info.get("number")
+                 or meta.get("to", "") or "")
+    callee = name or "the person who answers"
+    if name and number:
+        callee_id = f"{name} at {number}"
+    elif number:
+        callee_id = f"the person at {number}"
+    else:
+        callee_id = callee
+    out = [base_brief,
+           "\n\nTHIS CALL: you placed this call yourself, on Jim's "
+           f"behalf, to {callee_id}. You are speaking with "
+           f"{callee}, who is NOT Jim. Introduce yourself as Jett, "
+           "Jim's assistant, and say plainly that you are calling "
+           "for Jim.\n"]
+    if errand:
+        out.append(f"Your errand from Jim: {errand}\n")
+    out.append(
+        "Complete the errand in a short, natural conversation. "
+        "Listen carefully to what they tell you — their answer "
+        "comes back to Jim in this call's record, so confirm "
+        "anything important (names, times, callback numbers) by "
+        "repeating it back. When the errand is done, thank them, "
+        "say goodbye, and end the call.")
+    return "".join(out)
+
+
+def outbound_bridge_greeting(job_meta: dict | None) -> str:
+    """Opener for a bridge-served outbound errand call: Jett is the
+    caller here, so the answering-service greeting (greeting_for)
+    would be backwards."""
+    name = str((job_meta or {}).get("callee_name", "")
+               or "").strip()
+    if name:
+        return (f"Hi {name}, this is Jett, Jim's assistant — "
+                "calling on his behalf.")
+    return ("Hi, this is Jett, Jim's assistant — calling on his "
+            "behalf.")
+
+
 PHONE_RULES = """\
 PHONE RULES (this is a real phone call — you are answering Jim's phone):
 - You are Jim's assistant, never Jim himself. If pressed, saying you are an AI assistant is fine.
@@ -3840,23 +3938,49 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # --- Deepgram bridge (2026-10-15): PRIMARY engine for agent
     # calls (Jim's word) — every inbound call, plus outbound calls
     # to Jim (tier "self" either direction). Outbound errands to
-    # other people stay on the local pipeline below: they need
-    # press_digits / leave_voicemail / transfer tools the bridge
-    # doesn't have. Gated by env flag AND the bus kill-switch file.
-    # If the bridge never establishes a session, the local pipeline
-    # takes the call instead (fallback, logged).
-    _outbound_errand = call_info.get("direction") == "outbound" \
-        and call_info.get("tier") != "self"
-    if DEEPGRAM_BRIDGE and not _outbound_errand:
+    # other people stay on the local pipeline below BY DEFAULT: they
+    # may need press_digits / leave_voicemail / transfer tools the
+    # bridge doesn't have. The one exception (also Jim's word, same
+    # day): the dialer may explicitly select the bridge for an
+    # errand via dispatch metadata engine="deepgram" — see
+    # bridge_route(). The flag lives only in job metadata (the
+    # dialer sets it; SIP-dispatched inbound jobs carry none) and
+    # never touches classification. Gated by env flag AND the bus
+    # kill-switch file. If the bridge never establishes a session,
+    # the local pipeline takes the call instead (fallback, logged).
+    _route = bridge_route(call_info, job_meta)
+    if DEEPGRAM_BRIDGE and _route["serve"]:
         import deepgram_bridge as _dgb
         if _dgb.bridge_flag_on(BUS_DIR) \
                 and os.environ.get("DEEPGRAM_API_KEY"):
-            _mode = "self" if call_info.get("tier") == "self" \
-                else "untrusted"
+            _mode = _route["mode"]
             log_event("dg_bridge_start", call_id=_CURRENT_CALL_ID,
-                      mode=_mode, direction=call_info["direction"])
+                      mode=_mode, direction=call_info["direction"],
+                      via_engine=_route["via_engine"])
             bridge_brief = brief
-            if call_info.get("direction") == "outbound":
+            bridge_greeting = greeting_for(call_info)
+            if call_info.get("direction") == "outbound" \
+                    and _route["via_engine"]:
+                # Bridge-served outbound errand (NEW route): the
+                # generalized third-party brief + an opener that
+                # fits Jett being the caller, the route decision on
+                # the bus, and a wait for the callee to actually
+                # answer before the bridge looks for their track
+                # (its 15 s track window starts at answer, not at
+                # ring). Classification is untouched by all of this.
+                bridge_brief = outbound_bridge_brief(
+                    brief, call_info, job_meta)
+                bridge_greeting = outbound_bridge_greeting(job_meta)
+                asyncio.ensure_future(_ring_receipt(
+                    call_id, "dg_bridge_outbound", via="bridge",
+                    engine="deepgram", mode=_mode,
+                    caller_number=call_info.get("number", ""),
+                    tier=call_info.get("tier") or "unknown"))
+                for _ in range(90):
+                    if ctx.room.remote_participants:
+                        break
+                    await asyncio.sleep(0.5)
+            elif call_info.get("direction") == "outbound":
                 errand = str((job_meta or {}).get("brief", ""))[:800]
                 if errand:
                     bridge_brief += ("\n\nTHIS CALL: you placed this "
@@ -3864,12 +3988,32 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                                      f"Jim: {errand}")
             _stats = await _dgb.run_bridge(
                 ctx, call_id=_CURRENT_CALL_ID, brief=bridge_brief,
-                greeting=greeting_for(call_info),
+                greeting=bridge_greeting,
                 api_key=os.environ["DEEPGRAM_API_KEY"],
                 append_lines=_bus_append_lines, log_event=log_event,
                 file_consult=file_consult_request, mode=_mode,
                 max_call_s=MAX_CALL_SEC)
             if _stats.get("established") or _stats.get("turns", 0) > 0:
+                if _route["via_engine"]:
+                    # Same call_ended record the local pipeline
+                    # writes (requirement: a bridge-served outbound
+                    # call lands the same bus evidence) — the early
+                    # return below skips the local teardown that
+                    # normally emits it.
+                    asyncio.ensure_future(_ring_receipt(
+                        call_id, "call_ended", via="bridge",
+                        engine="deepgram",
+                        channel=call_info["channel"],
+                        direction=call_info["direction"],
+                        caller_number=call_info["number"],
+                        known_name=call_info["name"],
+                        tier=call_info["tier"],
+                        forwarded_from_cell=bool(
+                            call_info.get("forwarded_from_cell")),
+                        diverted_from=call_info.get(
+                            "diverted_from", ""),
+                        diversion_reason=call_info.get(
+                            "diversion_reason", "")))
                 return
             if not ctx.room.remote_participants:
                 return  # caller already gone; nothing to fall back to
