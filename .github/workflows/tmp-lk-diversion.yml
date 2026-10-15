@@ -1,0 +1,75 @@
+name: "(temporary) add diversion header mappings to inbound trunk"
+on:
+  workflow_dispatch:
+jobs:
+  apply:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - name: Update inbound trunk ST_XG4qP8s6wg9w (headers_to_attributes + include all headers)
+        run: |
+          set -euo pipefail
+          pip3 install --user -q "livekit==1.1.20"
+          sudo cat /opt/agent/livekit.yaml > /tmp/livekit.yaml
+          python3 - <<'PY'
+          import asyncio, json, re, sys
+          sys.path.insert(0, __import__("site").getusersitepackages())
+          from google.protobuf.json_format import MessageToDict
+          from livekit import api as lk_api
+          from livekit.protocol import sip as S
+
+          text = open("/tmp/livekit.yaml").read()
+          port = 7880
+          m = re.search(r"^port:\s*(\d+)", text, re.M)
+          if m:
+              port = int(m.group(1))
+          km = re.search(r"^keys:\s*\n\s+(\S+):\s*(\S+)", text, re.M)
+          if not km:
+              sys.exit("could not parse API keys from livekit.yaml")
+          key, secret = km.group(1), km.group(2)
+
+          TRUNK = "ST_XG4qP8s6wg9w"
+          WANT = {"Diversion": "sip.diversion",
+                  "History-Info": "sip.history_info",
+                  "P-Asserted-Identity": "sip.p_asserted_identity"}
+
+          async def main():
+              client = lk_api.LiveKitAPI(
+                  url=f"http://127.0.0.1:{port}",
+                  api_key=key, api_secret=secret)
+              try:
+                  resp = await client.sip.get_inbound_trunk(
+                      S.GetSIPInboundTrunkRequest(sip_trunk_id=TRUNK))
+                  trunk = resp.trunk
+                  print("BEFORE:", json.dumps(
+                      MessageToDict(trunk, preserving_proto_field_name=True),
+                      indent=1))
+                  assert list(trunk.numbers) == ["+16176556805"], trunk.numbers
+                  assert "sip.telnyx.com" in list(trunk.allowed_addresses), \
+                      trunk.allowed_addresses
+                  for hk, av in WANT.items():
+                      trunk.headers_to_attributes[hk] = av
+                  trunk.include_headers = S.SIPHeaderOptions.SIP_ALL_HEADERS
+                  out = await client.sip.update_inbound_trunk(
+                      S.UpdateSIPInboundTrunkRequest(replace=trunk))
+                  print("UPDATE RESULT:", json.dumps(
+                      MessageToDict(out, preserving_proto_field_name=True),
+                      indent=1))
+                  resp2 = await client.sip.get_inbound_trunk(
+                      S.GetSIPInboundTrunkRequest(sip_trunk_id=TRUNK))
+                  after = resp2.trunk
+                  got = dict(after.headers_to_attributes)
+                  print("AFTER headers_to_attributes:", got)
+                  print("AFTER include_headers:", after.include_headers)
+                  for hk, av in WANT.items():
+                      assert got.get(hk) == av, (hk, got)
+                  assert after.include_headers == \
+                      S.SIPHeaderOptions.SIP_ALL_HEADERS
+                  assert list(after.numbers) == ["+16176556805"]
+                  assert "sip.telnyx.com" in list(after.allowed_addresses)
+                  print("TRUNK UPDATE VERIFIED")
+              finally:
+                  await client.aclose()
+
+          asyncio.run(main())
+          PY
