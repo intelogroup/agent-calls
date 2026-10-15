@@ -20,3 +20,5 @@ primary_region = "iad"
 auto_stop_machines = false
 auto_start_machines = true
 
+[deploy]
+  release_command = "python3 /opt/agent/bench_fly.py || true"
