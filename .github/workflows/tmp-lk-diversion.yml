@@ -10,7 +10,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv /tmp/lkvenv
-          /tmp/lkvenv/bin/pip install -q "livekit==1.1.20"
+          /tmp/lkvenv/bin/pip install -q "livekit==1.1.20" "livekit-api==1.2.1" "livekit-protocol==1.1.27"
           sudo cat /opt/agent/livekit.yaml > /tmp/livekit.yaml
           cd /tmp
           PYTHONPATH= /tmp/lkvenv/bin/python - <<'PY'
