@@ -1,0 +1,51 @@
+name: "(temporary) outbound proof call to Jim's cell"
+on:
+  workflow_dispatch:
+jobs:
+  dial:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 8
+    steps:
+      - name: Checkout voice build branch
+        uses: actions/checkout@v4
+        with:
+          ref: tmp/fly-build
+      - name: Extract LiveKit creds and place the call
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import subprocess
+          raw = subprocess.run(["sudo", "cat", "/opt/agent/livekit.yaml"],
+                               capture_output=True, text=True).stdout
+          api_key = api_secret = None
+          in_keys = False
+          for ln in raw.splitlines():
+              s = ln.strip()
+              if s == "keys:":
+                  in_keys = True
+                  continue
+              if in_keys:
+                  if ln.startswith((" ", "\t")) and ":" in s and not s.startswith("#"):
+                      k, v = s.split(":", 1)
+                      api_key, api_secret = k.strip(), v.strip().strip('"').strip("'")
+                      in_keys = False
+                  elif s:
+                      in_keys = False
+              if api_key is None and s.startswith("api_key:"):
+                  api_key = s.split(":", 1)[1].strip().strip('"').strip("'")
+              if api_secret is None and s.startswith("api_secret:"):
+                  api_secret = s.split(":", 1)[1].strip().strip('"').strip("'")
+          assert api_key and api_secret, "livekit keys not found"
+          with open("lkcreds.env", "w") as f:
+              f.write("LIVEKIT_API_KEY=%s\nLIVEKIT_API_SECRET=%s\n" % (api_key, api_secret))
+          print("creds extracted for key:", api_key)
+          PYEOF
+          set -a; . ./lkcreds.env; set +a
+          rm -f lkcreds.env
+          export LIVEKIT_URL=http://localhost:7880
+          export LIVEKIT_SIP_OUTBOUND_TRUNK_ID=ST_NqGc4EfiT8mZ
+          export JETT_PHONE_E164=+16176556805
+          pip3 install --user --quiet "livekit>=0.18" || pip3 install --user --quiet --break-system-packages "livekit>=0.18"
+          DIAL=$(find . -name dial.py | head -1)
+          echo "dialer: $DIAL"
+          python3 "$DIAL" --to +18574261739 --brief "Outbound proof call on Jim's new Telnyx line. Greet Jim warmly, confirm he can hear you clearly, and ask him to confirm the caller ID on his phone showed 617-655-6805. Keep it short and friendly, then wrap up and say goodbye."
