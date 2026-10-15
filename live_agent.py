@@ -2471,16 +2471,48 @@ def parse_known_callers(brief: str) -> dict:
     return out
 
 
+# Jim's own SIP account usernames: he reaches the line from Linphone
+# account-to-account, where the "caller number" is his SIP username,
+# not a phone number. Env-overridable, comma-separated.
+SELF_SIP_IDENTITIES = {
+    s.strip().lower()
+    for s in os.environ.get(
+        "JETT_SELF_SIP_IDENTITIES", "intelogroup").split(",")
+    if s.strip()
+}
+
+
 def classify_caller(attrs: dict, identity: str, brief: str) -> dict:
     """Who is on the line and how did they arrive. attrs are the SIP
     participant's attributes (sip.phoneNumber = caller's number,
     sip.trunkPhoneNumber = the number they dialed). A participant
     with a phone number is PSTN; anything else is the SIP test line.
+
+    A NON-numeric caller id is a SIP username, not a phone number
+    (2026-10-15 A/B call: Jim on Linphone arrived as phoneNumber
+    "intelogroup", matched no known caller, and was classified a
+    stranger on his own line — tier gates and the speculative feed
+    never engaged). Jim's own SIP usernames are tier "self".
     """
     phone = (attrs or {}).get("sip.phoneNumber", "") or ""
     called = (attrs or {}).get("sip.trunkPhoneNumber", "") or ""
     if not phone and _digits10(identity or ""):
         phone = identity
+    raw_id = phone or (identity or "")
+    if raw_id and not _digits10(raw_id):
+        user = raw_id.strip().lower()
+        if user.startswith("sip:"):
+            user = user[4:]
+        user = user.split("@")[0].strip()
+        is_self = user in SELF_SIP_IDENTITIES
+        return {
+            "channel": "sip",
+            "direction": "inbound",
+            "number": "",
+            "called_number": called,
+            "name": "Jim" if is_self else "",
+            "tier": "self" if is_self else "",
+        }
     known = parse_known_callers(brief)
     hit = known.get(_digits10(phone), {})
     return {
