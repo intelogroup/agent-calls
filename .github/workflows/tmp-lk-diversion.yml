@@ -41,9 +41,13 @@ jobs:
                   url=f"http://127.0.0.1:{port}",
                   api_key=key, api_secret=secret)
               try:
-                  resp = await client.sip.get_inbound_trunk(
-                      S.GetSIPInboundTrunkRequest(sip_trunk_id=TRUNK))
-                  trunk = resp.trunk
+                  async def fetch():
+                      resp = await client.sip.list_inbound_trunk(
+                          S.ListSIPInboundTrunkRequest(
+                              trunk_ids=[TRUNK]))
+                      assert len(resp.items) == 1, resp.items
+                      return resp.items[0]
+                  trunk = await fetch()
                   print("BEFORE:", json.dumps(
                       MessageToDict(trunk, preserving_proto_field_name=True),
                       indent=1))
@@ -58,9 +62,7 @@ jobs:
                   print("UPDATE RESULT:", json.dumps(
                       MessageToDict(out, preserving_proto_field_name=True),
                       indent=1))
-                  resp2 = await client.sip.get_inbound_trunk(
-                      S.GetSIPInboundTrunkRequest(sip_trunk_id=TRUNK))
-                  after = resp2.trunk
+                  after = await fetch()
                   got = dict(after.headers_to_attributes)
                   print("AFTER headers_to_attributes:", got)
                   print("AFTER include_headers:", after.include_headers)
