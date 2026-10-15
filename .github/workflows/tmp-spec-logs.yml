@@ -11,6 +11,6 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
         run: |
-          timeout 45 flyctl logs -a jett-voice --no-tail 2>&1 | tail -900 > flylogs.txt || true
+          timeout 45 flyctl logs -a jett-voice --no-tail 2>&1 | tail -3000 > flylogs.txt || true
           echo "=== spec / classify / latency lines ==="
-          grep -aiE 'spec_|call_classified|e2e_latency|brain usage|session started|caller hung' flylogs.txt | tail -120 || true
+          grep -aiE 'spec_|call_classified|e2e_latency|brain usage|session started|caller hung' flylogs.txt | tail -3000 || true
