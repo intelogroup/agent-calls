@@ -1,0 +1,93 @@
+name: "(temporary) flip PSTN dispatch rule agent (SDR_bRnSbdXQhxQ4)"
+on:
+  workflow_dispatch:
+    inputs:
+      agent_name:
+        description: "Agent the PSTN dispatch rule should target"
+        required: true
+        type: choice
+        options:
+          - jett-bridge
+          - jett-proxy
+jobs:
+  flip:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - name: Read back, flip, read back the PSTN dispatch rule
+        env:
+          TARGET_AGENT: ${{ inputs.agent_name }}
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/lkvenv
+          /tmp/lkvenv/bin/pip install -q "livekit==1.1.20" "livekit-api==1.2.1" "livekit-protocol==1.1.27"
+          sudo cat /opt/agent/livekit.yaml > /tmp/livekit.yaml
+          cd /tmp
+          PYTHONPATH= /tmp/lkvenv/bin/python - <<'PY'
+          import asyncio, json, os, re, sys
+          from google.protobuf.json_format import MessageToDict
+          from livekit import api as lk_api
+          from livekit.protocol import sip as S
+
+          RULE = "SDR_bRnSbdXQhxQ4"
+          TRUNK = "ST_XG4qP8s6wg9w"
+          TARGET = os.environ["TARGET_AGENT"]
+          assert TARGET in ("jett-bridge", "jett-proxy"), TARGET
+
+          text = open("/tmp/livekit.yaml").read()
+          m = re.search(r"^port:\s*(\d+)", text, re.M)
+          port = int(m.group(1)) if m else 7880
+          km = re.search(r"^keys:\s*\n\s+(\S+):\s*(\S+)", text, re.M)
+          if not km:
+              sys.exit("could not parse API keys from livekit.yaml")
+          key, secret = km.group(1), km.group(2)
+
+          def shape(rule):
+              d = MessageToDict(rule, preserving_proto_field_name=True)
+              agents = (d.get("room_config") or {}).get("agents") or []
+              return {
+                  "dispatch_rule_id": d.get("dispatch_rule_id"),
+                  "name": d.get("name"),
+                  "trunk_ids": d.get("trunk_ids"),
+                  "agents": [a.get("agent_name") for a in agents],
+                  "rule": d.get("rule"),
+              }
+
+          async def main():
+              client = lk_api.LiveKitAPI(
+                  url=f"http://127.0.0.1:{port}",
+                  api_key=<redacted>
+              try:
+                  async def fetch():
+                      resp = await client.sip.list_dispatch_rule(
+                          S.ListSIPDispatchRuleRequest(rule_ids=[RULE]))
+                      assert len(resp.items) == 1, resp.items
+                      return resp.items[0]
+
+                  rule = await fetch()
+                  before = shape(rule)
+                  print("BEFORE:", json.dumps(before, indent=1))
+                  assert before["trunk_ids"] == [TRUNK], before
+                  assert len(before["agents"]) == 1, before
+                  if before["agents"] == [TARGET]:
+                      print(f"NO-OP: rule already targets {TARGET}")
+                      return
+                  rule.room_config.agents[0].agent_name = TARGET
+                  out = await client.sip.update_dispatch_rule(
+                      S.UpdateSIPDispatchRuleRequest(
+                          sip_dispatch_rule_id=RULE,
+                          dispatch_rule=rule))
+                  after = shape(out)
+                  print("AFTER:", json.dumps(after, indent=1))
+                  assert after["agents"] == [TARGET], after
+                  assert after["trunk_ids"] == before["trunk_ids"], after
+                  assert after["rule"] == before["rule"], after
+                  verify = shape(await fetch())
+                  print("READBACK:", json.dumps(verify, indent=1))
+                  assert verify == after, (verify, after)
+                  print(f"FLIP VERIFIED: {before['agents']} -> {after['agents']}")
+              finally:
+                  await client.aclose()
+
+          asyncio.run(main())
+          PY

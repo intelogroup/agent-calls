@@ -1,0 +1,64 @@
+name: "(temporary) provision jett-bridge secrets"
+on:
+  workflow_dispatch:
+jobs:
+  provision:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 10
+    steps:
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Generate bridge tunnel + bus keys; install tunnel pubkey on this host
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          ssh-keygen -t ed25519 -N "" -C "jett-bridge-tunnel-2026-10-16" -f "$WORK/tunnel_key"
+          ssh-keygen -t ed25519 -N "" -C "jett-bridge-bus-2026-10-16" -f "$WORK/bus_key"
+          # This runner IS the Oracle host: the bridge worker's SSH
+          # tunnel lands on the ubuntu user, same as jett-voice's.
+          PUB=$(cat "$WORK/tunnel_key.pub")
+          sudo -u ubuntu mkdir -p /home/ubuntu/.ssh
+          sudo -u ubuntu chmod 700 /home/ubuntu/.ssh
+          if ! sudo grep -qF "$PUB" /home/ubuntu/.ssh/authorized_keys 2>/dev/null; then
+            echo "$PUB" | sudo -u ubuntu tee -a /home/ubuntu/.ssh/authorized_keys > /dev/null
+          fi
+          sudo -u ubuntu chmod 600 /home/ubuntu/.ssh/authorized_keys
+          sudo -u ubuntu sort -u /home/ubuntu/.ssh/authorized_keys -o /home/ubuntu/.ssh/authorized_keys
+          # Public halves are safe to print: the bus pubkey must be
+          # added as a deploy key on the agent-call-bus repo.
+          echo "TUNNEL_PUBKEY $PUB"
+          echo "BUS_PUBKEY $(cat "$WORK/bus_key.pub")"
+          sudo cp "$WORK/tunnel_key" /tmp/.bridge_tunnel_key
+          sudo cp "$WORK/bus_key" /tmp/.bridge_bus_key
+          sudo chmod 600 /tmp/.bridge_tunnel_key /tmp/.bridge_bus_key
+          rm -rf "$WORK"
+      - name: Set secrets on jett-bridge (values never printed)
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
+          DEEPGRAM_API_KEY: <redacted>
+          OPENROUTER_API_KEY: <redacted>
+          OPENAI_API_KEY: <redacted>
+        run: |
+          set -euo pipefail
+          sudo cat /opt/agent/livekit.yaml > /tmp/livekit.yaml
+          LK_PAIR=$(python3 -c "import re; t=open('/tmp/livekit.yaml').read(); m=re.search(r'^keys:\s*\n\s+(\S+):\s*(\S+)', t, re.M); print(m.group(1)); print(m.group(2))")
+          LK_KEY=$(echo "$LK_PAIR" | sed -n 1p)
+          LK_SECRET=$(echo "$LK_PAIR" | sed -n 2p)
+          TUNNEL_KEY=$(sudo cat /tmp/.bridge_tunnel_key)
+          BUS_KEY=$(sudo cat /tmp/.bridge_bus_key)
+          flyctl secrets set -a jett-bridge \
+            LIVEKIT_API_KEY="$LK_KEY" \
+            LIVEKIT_API_SECRET="$LK_SECRET" \
+            LIVEKIT_URL="ws://localhost:7880" \
+            TUNNEL_SSH_KEY="$TUNNEL_KEY" \
+            BUS_KEY_PEM="$BUS_KEY" \
+            BUS_SSH_KEY="$BUS_KEY" \
+            DEEPGRAM_API_KEY="$DEEPGRAM_API_KEY" \
+            OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+            OPENAI_API_KEY="$OPENAI_API_KEY" \
+            JETT_PHONE_E164="+16176556805" \
+            LIVEKIT_SIP_OUTBOUND_TRUNK_ID="ST_NqGc4EfiT8mZ" \
+            PSTN_TRANSFER_URI="sip:+18574261739@sip.telnyx.com"
+          sudo rm -f /tmp/.bridge_tunnel_key /tmp/.bridge_bus_key /tmp/livekit.yaml
+          echo "secrets staged on jett-bridge"
+          flyctl secrets list -a jett-bridge
