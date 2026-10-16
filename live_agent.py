@@ -190,6 +190,21 @@ FACTS_STALE_SEC = int(os.environ.get("FACTS_STALE_SEC", "3600"))
 POCKET_TTS_VOICE = "alba"
 AGENT_NAME = "jett-proxy"
 
+# Bridge-only receptionist mode (BRIDGE_ONLY=1, Jim 2026-10-16 —
+# "deepgram is primary and livekit secondary"): a small always-on
+# worker whose ONLY job is answering direct PSTN calls on the
+# Deepgram bridge, while the full local-pipeline worker sleeps
+# until announced. In this mode the worker registers as
+# "jett-bridge", never loads Phonon-2 or Pocket (no warm-up
+# threads, no local session), and any call that would fall through
+# to the local pipeline refuses cleanly with a bus receipt instead
+# (see bridge_only_guard). With the flag unset nothing changes:
+# same name, same warm-ups, same routing — the big worker's
+# behavior is byte-equivalent.
+BRIDGE_ONLY = os.environ.get("BRIDGE_ONLY") == "1"
+if BRIDGE_ONLY:
+    AGENT_NAME = "jett-bridge"
+
 # one call at a time; a second caller gets a polite busy message
 _CALL_LOCK = threading.Lock()
 _ACTIVE_CALL: str | None = None
@@ -3083,6 +3098,47 @@ def self_linphone_local_route(call_info: dict, toggle_on: bool) -> bool:
         and call_info.get("tier") == "self"
 
 
+def bridge_only_guard(route: dict, self_ll: bool,
+                      dg_skip_reason: str = "",
+                      *, bridge_only: bool | None = None) -> str | None:
+    """BRIDGE_ONLY choke point for the local pipeline (Jim,
+    2026-10-16). Returns the refusal reason for the
+    bridge_only_local_refused bus receipt when control reaches the
+    local pipeline on a bridge-only worker — a worker that carries
+    no loaded local models and must never serve a call locally —
+    or None when the local pipeline may proceed. In the default
+    big-worker mode (BRIDGE_ONLY unset) this ALWAYS returns None:
+    the local pipeline is that worker's whole purpose, so behavior
+    there is unchanged.
+
+    Reasons mirror the state that brought the call here:
+      "self_linphone_local" — the bus toggle diverted the call to
+        local; on the receptionist that diversion is meaningless
+        (the toggle targets the big worker's Linphone rule, whose
+        jobs never dispatch here), so it refuses rather than
+        silently serving a call Jim pointed at the local stack.
+      "route_local_only"    — bridge_route keeps this call local
+        by design (an outbound errand without the deepgram flag):
+        a tools-route job that was misdispatched to the
+        receptionist.
+      the dg_bridge_skipped reason ("flag_off" / "no_api_key") —
+        the bridge was selected but is gated off or unkeyed.
+      "bridge_unavailable"  — anything else (bridge selected,
+        gate open, yet control still fell through).
+    """
+    if bridge_only is None:
+        bridge_only = BRIDGE_ONLY
+    if not bridge_only:
+        return None
+    if self_ll:
+        return "self_linphone_local"
+    if not route.get("serve"):
+        return "route_local_only"
+    if dg_skip_reason:
+        return dg_skip_reason
+    return "bridge_unavailable"
+
+
 def outbound_bridge_brief(base_brief: str, call_info: dict,
                           job_meta: dict | None) -> str:
     """The bridge brief for an outbound call to a third party
@@ -3806,6 +3862,16 @@ async def _run_no_brain(ctx: JobContext):
     """No brain key: connect, play a spoken notice, hang up gracefully."""
     await ctx.connect()
     log_event("no_brain_notice")
+    if BRIDGE_ONLY:
+        # The spoken notice is a Pocket path; on the receptionist
+        # it refuses like every other local path — receipt, then a
+        # clean disconnect.
+        asyncio.ensure_future(_ring_receipt(
+            ctx.room.name.replace("jett-", "", 1),
+            "bridge_only_local_refused", via="bridge",
+            reason="no_brain_notice"))
+        await ctx.room.disconnect()
+        return
     log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
     tts_engine = PocketTTS()
     samples, _ = await asyncio.get_running_loop().run_in_executor(
@@ -3994,6 +4060,7 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # Phonon-2 + Pocket + speculative-feed stack is what his own
     # test calls exercise — see self_linphone_local_route.
     _route = bridge_route(call_info, job_meta)
+    _dg_skip_reason = ""
     import deepgram_bridge as _dgb_gate
     _self_ll = self_linphone_local_route(
         call_info, _dgb_gate.self_linphone_local_on(BUS_DIR))
@@ -4089,14 +4156,51 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                 tier=call_info.get("tier") or "unknown",
                 forwarded_from_cell=bool(
                     call_info.get("forwarded_from_cell"))))
+            if BRIDGE_ONLY:
+                # The receptionist has no local pipeline to fall
+                # back TO (deepgram primary, livekit secondary —
+                # and the secondary is asleep by design). Name the
+                # gap on the bus with its own receipt and end the
+                # call cleanly; never fall into a pipeline whose
+                # models were never loaded on this worker.
+                log_event("bridge_only_no_fallback",
+                          call_id=_CURRENT_CALL_ID)
+                asyncio.ensure_future(_ring_receipt(
+                    _CURRENT_CALL_ID or "",
+                    "bridge_only_no_fallback", via="bridge",
+                    tier=call_info.get("tier") or "unknown",
+                    forwarded_from_cell=bool(
+                        call_info.get("forwarded_from_cell"))))
+                return
         else:
             _skip_reason = ("flag_off" if not _dgb.bridge_flag_on(BUS_DIR)
                             else "no_api_key")
+            _dg_skip_reason = _skip_reason
             log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
                       reason=_skip_reason)
             asyncio.ensure_future(_ring_receipt(
                 _CURRENT_CALL_ID or "", "dg_bridge_skipped",
                 via="bridge", reason=_skip_reason))
+
+    # BRIDGE_ONLY choke point: the bridge did not serve this call
+    # (its route keeps the call local, the self-linphone toggle
+    # diverted it, or the bridge is gated off / unkeyed). The
+    # receptionist carries no local models, so instead of starting
+    # a pipeline that cannot run here it refuses cleanly — one bus
+    # receipt saying why, then the call ends. In the default mode
+    # bridge_only_guard always returns None and this is inert.
+    _guard_reason = bridge_only_guard(_route, _self_ll,
+                                      _dg_skip_reason)
+    if _guard_reason is not None:
+        log_event("bridge_only_local_refused",
+                  call_id=_CURRENT_CALL_ID, reason=_guard_reason)
+        asyncio.ensure_future(_ring_receipt(
+            _CURRENT_CALL_ID or "", "bridge_only_local_refused",
+            via="bridge", reason=_guard_reason,
+            channel=call_info.get("channel", ""),
+            direction=call_info.get("direction", ""),
+            tier=call_info.get("tier") or "unknown"))
+        return
 
     instructions = SYSTEM_PROMPT.format(brief=brief)
     if call_info["channel"] == "pstn" \
@@ -4410,6 +4514,16 @@ async def entrypoint(ctx: JobContext):
                 return
             log_event("call_rejected_busy", room=ctx.room.name)
             log.info("busy; rejecting second call %s", ctx.room.name)
+            if BRIDGE_ONLY:
+                # No Pocket voice exists on the receptionist: the
+                # spoken busy message is a local-model path, so the
+                # rejection here is a bus receipt + a clean
+                # disconnect — never a model load.
+                asyncio.ensure_future(_ring_receipt(
+                    call_id, "bridge_only_local_refused",
+                    via="bridge", reason="busy_rejection"))
+                await ctx.room.disconnect()
+                return
             engine = PocketTTS()
             samples, _ = await asyncio.get_running_loop().run_in_executor(
                 None, engine._synth,
@@ -4485,17 +4599,31 @@ if __name__ == "__main__":
               ring_first=RING_FIRST,
               ring_first_window_s=RING_FIRST_WINDOW_S,
               max_call_s=MAX_CALL_SEC, facts_stale_s=FACTS_STALE_SEC,
-              bus_dir=BUS_DIR, stt_engine="phonon-2",
-              tts_engine="pocket-tts", tts_voice=POCKET_TTS_VOICE,
+              bus_dir=BUS_DIR,
+              stt_engine=("deepgram-bridge" if BRIDGE_ONLY
+                          else "phonon-2"),
+              tts_engine=("deepgram-bridge" if BRIDGE_ONLY
+                          else "pocket-tts"),
+              tts_voice=POCKET_TTS_VOICE,
+              bridge_only=BRIDGE_ONLY,
               bus_cloned=os.path.isdir(os.path.join(BUS_DIR, ".git")))
-    # Pay the ~5 s Phonon-2 load at boot, in the background, so the
-    # first call never waits on it.
-    threading.Thread(target=_warm_phonon, daemon=True,
-                     name="phonon-warmup").start()
-    # Same for Pocket TTS: the model + voice state load once here
-    # and stay resident for the worker's lifetime.
-    threading.Thread(target=_warm_pocket, daemon=True,
-                     name="pocket-warmup").start()
+    if BRIDGE_ONLY:
+        # Receptionist: NO local-model warm-up at all. Measured
+        # 2026-10-16: importing this module costs ~150 MB RSS and
+        # pulls in neither torch, fermion, nor pocket_tts (both
+        # engines import lazily, inside their load paths), while
+        # the warmed big worker sits at ~2.4 GB. Skipping the two
+        # warm-up threads is the whole memory story of this mode.
+        log_event("bridge_only_mode", agent=AGENT_NAME)
+    else:
+        # Pay the ~5 s Phonon-2 load at boot, in the background, so
+        # the first call never waits on it.
+        threading.Thread(target=_warm_phonon, daemon=True,
+                         name="phonon-warmup").start()
+        # Same for Pocket TTS: the model + voice state load once
+        # here and stay resident for the worker's lifetime.
+        threading.Thread(target=_warm_pocket, daemon=True,
+                         name="pocket-warmup").start()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,
