@@ -3058,6 +3058,31 @@ def bridge_route(call_info: dict, job_meta: dict | None) -> dict:
     return {"serve": True, "mode": "untrusted", "via_engine": False}
 
 
+def self_linphone_local_route(call_info: dict, toggle_on: bool) -> bool:
+    """Jim's local-stack test toggle (2026-10-16): when the bus file
+    config/self-linphone-local.enabled exists, Jim's OWN Linphone
+    calls are served by the LOCAL pipeline (Phonon-2 STT + Pocket
+    TTS + speculative feed) instead of the Deepgram bridge, so the
+    latest local stack gets exercised on his own calls. Pure
+    predicate over (call_info, toggle_on) — the gate matrix is
+    unit-tested (test_self_linphone_local.py); the caller reads the
+    file per call, so deleting it is an instant rollback with no
+    redeploy.
+
+    Scope guards — ALL must hold, so nothing else moves:
+      inbound only   (outbound routing is untouched),
+      channel "sip"  (PSTN self calls still go to the bridge),
+      tier "self"    (every untrusted inbound still goes to the
+                      bridge; classification never sees the toggle —
+                      tier comes from classify_caller exactly as
+                      before, and a diverted call is never self).
+    """
+    return bool(toggle_on) \
+        and call_info.get("direction") == "inbound" \
+        and call_info.get("channel") == "sip" \
+        and call_info.get("tier") == "self"
+
+
 def outbound_bridge_brief(base_brief: str, call_info: dict,
                           job_meta: dict | None) -> str:
     """The bridge brief for an outbound call to a third party
@@ -3963,8 +3988,28 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # never touches classification. Gated by env flag AND the bus
     # kill-switch file. If the bridge never establishes a session,
     # the local pipeline takes the call instead (fallback, logged).
+    # One deliberate exception (Jim, 2026-10-16): the bus toggle
+    # config/self-linphone-local.enabled diverts his own Linphone
+    # calls (inbound, SIP, self) to the local pipeline so the
+    # Phonon-2 + Pocket + speculative-feed stack is what his own
+    # test calls exercise — see self_linphone_local_route.
     _route = bridge_route(call_info, job_meta)
-    if DEEPGRAM_BRIDGE and _route["serve"]:
+    import deepgram_bridge as _dgb_gate
+    _self_ll = self_linphone_local_route(
+        call_info, _dgb_gate.self_linphone_local_on(BUS_DIR))
+    if DEEPGRAM_BRIDGE and _route["serve"] and _self_ll:
+        # Diverted by the toggle: the local pipeline below serves
+        # the call. The receipt mirrors the other dg_bridge_skipped
+        # records so the call record shows WHY the bridge did not
+        # serve this one.
+        log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
+                  reason="self_linphone_local")
+        asyncio.ensure_future(_ring_receipt(
+            _CURRENT_CALL_ID or "", "dg_bridge_skipped",
+            via="bridge", reason="self_linphone_local",
+            channel=call_info.get("channel", ""),
+            tier=call_info.get("tier") or "unknown"))
+    if DEEPGRAM_BRIDGE and _route["serve"] and not _self_ll:
         import deepgram_bridge as _dgb
         if _dgb.bridge_flag_on(BUS_DIR) \
                 and os.environ.get("DEEPGRAM_API_KEY"):

@@ -34,6 +34,8 @@ INPUT_SR = 16000
 OUTPUT_SR = 24000
 OUT_CHUNK_SAMPLES = OUTPUT_SR // 50          # 20 ms of output audio
 FLAG_RELPATH = os.path.join("config", "deepgram-bridge.enabled")
+SELF_LINPHONE_LOCAL_RELPATH = os.path.join(
+    "config", "self-linphone-local.enabled")
 
 LISTEN_CANDIDATES = [os.environ.get("DG_LISTEN_MODEL", "flux-general-en"),
                      "nova-3"]
@@ -48,6 +50,17 @@ def bridge_requested() -> bool:
 
 def bridge_flag_on(bus_dir: str) -> bool:
     return os.path.exists(os.path.join(bus_dir, FLAG_RELPATH))
+
+
+def self_linphone_local_on(bus_dir: str) -> bool:
+    """Jim's local-stack test toggle (2026-10-16): when the bus file
+    config/self-linphone-local.enabled exists, his own Linphone
+    calls (inbound, SIP channel, self tier) are served by the LOCAL
+    pipeline instead of this bridge — see
+    live_agent.self_linphone_local_route. Read per call; deleting
+    the file restores bridge routing instantly, no redeploy."""
+    return os.path.exists(
+        os.path.join(bus_dir, SELF_LINPHONE_LOCAL_RELPATH))
 
 
 def model_combos() -> list[tuple[str, str]]:
