@@ -34,7 +34,7 @@ jobs:
           rm -rf "$WORK"
       - name: Set secrets on jett-bridge (values never printed)
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_BRIDGE_DEPLOY_TOKEN }}
           DEEPGRAM_API_KEY: <redacted>
           OPENROUTER_API_KEY: <redacted>
           OPENAI_API_KEY: <redacted>
