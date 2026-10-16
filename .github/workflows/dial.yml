@@ -1,0 +1,142 @@
+name: dial
+
+# Permanent parameterized outbound dial route for Jett's line.
+# Replaces the one-shot push-dial-delete workflow pattern: dispatch
+# this with to / name / brief / engine (+ dry_run to print the plan
+# only, placing no call). This file STAYS on main.
+#
+# SECURITY: this workflow never prints secret values. Config files
+# are parsed, never echoed; env presence is verified by NAME only;
+# there is no env dump and no set -x anywhere in this file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Callee number, E.164 (e.g. +16175550134)"
+        required: true
+        type: string
+      name:
+        description: "Callee name, exactly as given in the dispatch"
+        required: true
+        type: string
+      brief:
+        description: "What the agent should do on the call"
+        required: true
+        type: string
+      engine:
+        description: "Conversation engine"
+        required: true
+        type: choice
+        options:
+          - local
+          - deepgram
+        default: deepgram
+      dry_run:
+        description: "Print the dial plan only; place NO call"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Not secrets: the SIP outbound trunk id and Jett's caller number,
+  # verified on the Oct 15 live outbound proof. Passed explicitly
+  # because they do not exist in the runner's on-box config files.
+  LIVEKIT_SIP_OUTBOUND_TRUNK_ID: "ST_NqGc4EfiT8mZ"
+  JETT_PHONE_E164: "+16176556805"
+
+jobs:
+  dial:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout dialer (tmp/bridge-outbound @802cfa87)
+        uses: actions/checkout@v4
+        with:
+          ref: 802cfa8775479ccfd09570121f803274e663ecc0
+
+      - name: LiveKit SDK check (install into venv only if missing)
+        run: |
+          if /opt/agent/venv/bin/python -c "import livekit" 2>/dev/null; then
+            echo "livekit SDK import OK (already installed in /opt/agent/venv)"
+          else
+            echo "livekit SDK missing; installing requirements.txt into /opt/agent/venv"
+            /opt/agent/venv/bin/python -m pip install -r requirements.txt
+            /opt/agent/venv/bin/python -c "import livekit"
+            echo "livekit SDK import OK (installed this run)"
+          fi
+
+      - name: Assemble LiveKit env from on-box config (names only, values never printed)
+        run: |
+          /opt/agent/venv/bin/python - <<'PYEOF'
+          import os, re, sys
+
+          NAMES = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+          FILES = ("/opt/agent/livekit.env", "/opt/agent/agent.env",
+                   "/opt/agent/livekit.yaml", "/opt/livekit/livekit.yaml",
+                   "/etc/livekit/livekit.yaml")
+          found = {}
+
+          def clean(v):
+              return v.strip().strip('"').strip("'")
+
+          for path in FILES:
+              try:
+                  lines = open(path).read().splitlines()
+              except OSError:
+                  continue
+              for line in lines:
+                  for name in NAMES:
+                      if name in found:
+                          continue
+                      m = re.match(r"^\s*(?:export\s+)?" + name + r"\s*[:=]\s*(\S+)\s*$", line)
+                      if m:
+                          found[name] = clean(m.group(1))
+              # LiveKit server yaml keeps credentials under a `keys:` map:
+              # the first entry's name is the API key, its value the secret.
+              if "LIVEKIT_API_KEY" not in found or "LIVEKIT_API_SECRET" not in found:
+                  for i, line in enumerate(lines):
+                      if re.match(r"^\s*keys:\s*$", line):
+                          for sub in lines[i + 1:]:
+                              m = re.match(r"^\s+(\S+):\s*(\S+)\s*$", sub)
+                              if m:
+                                  found.setdefault("LIVEKIT_API_KEY", clean(m.group(1)))
+                                  found.setdefault("LIVEKIT_API_SECRET", clean(m.group(2)))
+                              elif sub.strip():
+                                  break
+                          break
+
+          env_file = os.environ.get("GITHUB_ENV")
+          for name in NAMES:
+              if name in found:
+                  os.environ[name] = found[name]
+                  if env_file:
+                      with open(env_file, "a") as fh:
+                          fh.write(name + "=" + found[name] + "\n")
+
+          missing = 0
+          for name in NAMES + ("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "JETT_PHONE_E164"):
+              present = bool(os.environ.get(name))
+              print(name + ": " + ("SET" if present else "MISSING"))
+              missing += 0 if present else 1
+          if missing:
+              print("Required env missing; aborting before any dial.")
+              sys.exit(1)
+          PYEOF
+
+      - name: Dial
+        env:
+          TO: ${{ inputs.to }}
+          NAME: ${{ inputs.name }}
+          BRIEF: ${{ inputs.brief }}
+          ENGINE: ${{ inputs.engine }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(--to "$TO" --name "$NAME" --brief "$BRIEF" --engine "$ENGINE")
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          /opt/agent/venv/bin/python dial.py "${args[@]}"
