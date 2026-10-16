@@ -1,0 +1,74 @@
+name: tmp-dial-benoucheca
+on:
+  workflow_dispatch: {}
+jobs:
+  dial:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 12
+    env:
+      BRIEF: "Warm personal message delivery from Jim. Greet Benoucheca by name, say you are Jett, Jim's assistant, calling on his behalf, and tell her: Jim asked me to call and tell you he's been thinking about you, he's missed you, and he wants to be with you tonight. Then chat briefly and warmly if she responds; do not invent plans, commitments, or any details Jim did not state, and do not discuss his schedule, money, or anything else."
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/bridge-outbound
+      - name: Install LiveKit SDK (runner has no pip3; use python3 -m pip)
+        run: python3 -m pip install livekit==1.1.20 livekit-api==1.2.1 livekit-protocol==1.1.27
+      - name: Assemble LiveKit env from this box's own config (values never printed)
+        run: |
+          set -euo pipefail
+          { sudo cat /opt/agent/livekit.env 2>/dev/null; sudo cat /opt/agent/agent.env 2>/dev/null; echo "__LK_YAML_BELOW__"; sudo cat /opt/agent/livekit.yaml 2>/dev/null; } | python3 - <<'PYEOF'
+          import os, re, sys
+          raw = sys.stdin.read()
+          envpart, _, yamlpart = raw.partition("__LK_YAML_BELOW__")
+          want = ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
+                  "LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "JETT_PHONE_E164"]
+          found = {}
+          for line in envpart.splitlines():
+              line = line.strip()
+              if line.startswith("export "):
+                  line = line[7:].strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              k, v = line.split("=", 1)
+              k = k.strip()
+              v = v.strip().strip('"').strip("'")
+              if k in want and v:
+                  found[k] = v
+          if "LIVEKIT_API_KEY" not in found or "LIVEKIT_API_SECRET" not in found:
+              pairs = []
+              m = re.search(r"(?m)^keys:\s*\{\s*([^:,\s]+):\s*([^,}\s]+)", yamlpart)
+              if m:
+                  pairs = [(m.group(1), m.group(2))]
+              else:
+                  km = re.search(r"(?m)^keys:\s*$", yamlpart)
+                  if km:
+                      for line in yamlpart[km.end():].splitlines():
+                          if not line.strip():
+                              continue
+                          if not line.startswith((" ", "\t")):
+                              break
+                          mm = re.match(r"\s*([^:\s]+):\s*(\S+)", line)
+                          if mm:
+                              pairs.append((mm.group(1), mm.group(2)))
+              if pairs:
+                  found.setdefault("LIVEKIT_API_KEY", pairs[0][0])
+                  found.setdefault("LIVEKIT_API_SECRET", pairs[0][1])
+          found.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
+          found.setdefault("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "ST_NqGc4EfiT8mZ")
+          found.setdefault("JETT_PHONE_E164", "+16176556805")
+          missing = [k for k in ("LIVEKIT_API_KEY", "LIVEKIT_API_SECRET") if k not in found]
+          assert not missing, "missing required env: " + ",".join(missing)
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              for k in want:
+                  fh.write(k + "=" + found[k] + "\n")
+          print("env assembled for:", ", ".join(sorted(found)))
+          print("api_key:", found["LIVEKIT_API_KEY"], "secret_len:", len(found["LIVEKIT_API_SECRET"]))
+          PYEOF
+      - name: Dry-run plan check (places NO call)
+        run: |
+          set -euo pipefail
+          python3 dial.py --to +16178994780 --engine deepgram --name Benoucheca --brief "$BRIEF" --dry-run | tee dryrun.json
+          ! grep -q '<unset>' dryrun.json
+      - name: Place Jim's call to Benoucheca (ONE call, no redial)
+        run: |
+          python3 dial.py --to +16178994780 --engine deepgram --name Benoucheca --brief "$BRIEF"
