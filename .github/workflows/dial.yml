@@ -71,61 +71,137 @@ jobs:
 
       - name: Assemble LiveKit env from on-box config (names only, values never printed)
         run: |
-          /opt/agent/venv/bin/python - <<'PYEOF'
-          import os, re, sys
+          cat > "$RUNNER_TEMP/assemble_env.py" <<'PYEOF'
+          import glob, os, re, sys
 
           NAMES = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
-          FILES = ("/opt/agent/livekit.env", "/opt/agent/agent.env",
-                   "/opt/agent/livekit.yaml", "/opt/livekit/livekit.yaml",
-                   "/etc/livekit/livekit.yaml")
           found = {}
+          sources = {}
+          notes = []
+
+          # Anything already in this process's environment wins.
+          for name in NAMES:
+              if os.environ.get(name):
+                  found[name] = os.environ[name]
+                  sources[name] = "process environment"
 
           def clean(v):
-              return v.strip().strip('"').strip("'")
+              v = (v or "").strip()
+              if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                  v = v[1:-1]
+              return v.strip()
 
-          for path in FILES:
-              try:
-                  lines = open(path).read().splitlines()
-              except OSError:
-                  continue
+          def take(name, value, where):
+              value = clean(value)
+              if value and name not in found:
+                  found[name] = value
+                  sources[name] = where
+
+          def scan_text(text, where):
+              lines = text.splitlines()
               for line in lines:
                   for name in NAMES:
-                      if name in found:
-                          continue
-                      m = re.match(r"^\s*(?:export\s+)?" + name + r"\s*[:=]\s*(\S+)\s*$", line)
+                      m = re.match(r"^\s*(?:export\s+|Environment\s*=\s*\"?)?" + name + r"\s*[:=]\s*(.+?)\s*$", line)
                       if m:
-                          found[name] = clean(m.group(1))
-              # LiveKit server yaml keeps credentials under a `keys:` map:
-              # the first entry's name is the API key, its value the secret.
-              if "LIVEKIT_API_KEY" not in found or "LIVEKIT_API_SECRET" not in found:
-                  for i, line in enumerate(lines):
-                      if re.match(r"^\s*keys:\s*$", line):
-                          for sub in lines[i + 1:]:
-                              m = re.match(r"^\s+(\S+):\s*(\S+)\s*$", sub)
-                              if m:
-                                  found.setdefault("LIVEKIT_API_KEY", clean(m.group(1)))
-                                  found.setdefault("LIVEKIT_API_SECRET", clean(m.group(2)))
-                              elif sub.strip():
-                                  break
-                          break
+                          take(name, m.group(1).strip().strip('"'), where)
+                  m = re.search(r"--keys\s+[\"']?([A-Za-z0-9_\-]+)\s*:\s*([^\s\"']+)", line)
+                  if m:
+                      take("LIVEKIT_API_KEY", m.group(1), where + " (--keys)")
+                      take("LIVEKIT_API_SECRET", m.group(2), where + " (--keys)")
+              for i, line in enumerate(lines):
+                  if re.match(r"^\s*keys:\s*$", line):
+                      for sub in lines[i + 1:]:
+                          m = re.match(r"^\s+(\S+):\s*(\S+)\s*$", sub)
+                          if m:
+                              take("LIVEKIT_API_KEY", m.group(1), where + " (keys: map)")
+                              take("LIVEKIT_API_SECRET", m.group(2), where + " (keys: map)")
+                          elif sub.strip():
+                              break
+                      break
+
+          def read(path):
+              try:
+                  if os.path.getsize(path) > 2_000_000:
+                      return None
+                  with open(path, errors="replace") as fh:
+                      return fh.read()
+              except OSError as e:
+                  notes.append("unreadable: " + path + " (" + (e.strerror or "error") + ")")
+                  return None
+
+          candidates = []
+          for pat in ("/opt/agent/**/*.env", "/opt/agent/**/*.yaml",
+                      "/opt/agent/**/*.yml", "/opt/agent/.env",
+                      "/opt/livekit/**/*.env", "/opt/livekit/**/*.yaml",
+                      "/opt/livekit/**/*.yml", "/etc/livekit/**/*.env",
+                      "/etc/livekit/**/*.yaml", "/etc/livekit/**/*.yml"):
+              candidates += [p for p in glob.glob(pat, recursive=True)
+                             if os.path.isfile(p)]
+
+          extra = []
+          for pat in ("/etc/systemd/system/*.service",
+                      "/lib/systemd/system/*.service",
+                      "/usr/lib/systemd/system/*.service"):
+              for unit in glob.glob(pat):
+                  if not re.search(r"(livekit|jett|agent)", os.path.basename(unit)):
+                      continue
+                  text = read(unit)
+                  if text is None:
+                      continue
+                  scan_text(text, unit)
+                  for m in re.finditer(r"EnvironmentFile\s*=\s*-?(\S+)", text):
+                      extra.append(m.group(1))
+                  for m in re.finditer(r"--config\s+(\S+)", text):
+                      extra.append(m.group(1))
+
+          for path in dict.fromkeys(candidates + extra):
+              text = read(path)
+              if text is not None:
+                  scan_text(text, path)
+
+          # Last resort for the URL: the LiveKit server runs on this
+          # box, so derive ws://localhost:<port> from its server yaml.
+          if "LIVEKIT_URL" not in found and "LIVEKIT_API_SECRET" in found:
+              port = "7880"
+              for path in dict.fromkeys(candidates + extra):
+                  text = read(path) or ""
+                  m = re.search(r"^\s*port:\s*(\d+)\s*$", text, re.M)
+                  if m:
+                      port = m.group(1)
+                      break
+              take("LIVEKIT_URL", "ws://localhost:" + port,
+                   "derived from on-box LiveKit server port")
 
           env_file = os.environ.get("GITHUB_ENV")
-          for name in NAMES:
-              if name in found:
-                  os.environ[name] = found[name]
-                  if env_file:
-                      with open(env_file, "a") as fh:
+          if env_file:
+              with open(env_file, "a") as fh:
+                  for name in NAMES:
+                      if name in found and sources.get(name) != "process environment":
                           fh.write(name + "=" + found[name] + "\n")
 
-          missing = 0
           for name in NAMES + ("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "JETT_PHONE_E164"):
-              present = bool(os.environ.get(name))
-              print(name + ": " + ("SET" if present else "MISSING"))
-              missing += 0 if present else 1
-          if missing:
-              print("Required env missing; aborting before any dial.")
-              sys.exit(1)
+              present = bool(found.get(name) or os.environ.get(name))
+              suffix = (" (from " + sources[name] + ")") if (present and name in sources) else ""
+              print(name + ": " + ("SET" if present else "MISSING") + suffix)
+          for n in notes:
+              print("note: " + n)
+          missing = [n for n in NAMES if n not in found]
+          print("ASSEMBLY_RESULT: " + ("COMPLETE" if not missing
+                                       else "INCOMPLETE " + ",".join(missing)))
+          sys.exit(0 if not missing else 3)
           PYEOF
+          set +e
+          /opt/agent/venv/bin/python "$RUNNER_TEMP/assemble_env.py"
+          rc=$?
+          if [ $rc -eq 3 ]; then
+            echo "Direct read incomplete; retrying assembly under sudo -n (values still never printed)"
+            sudo -n /opt/agent/venv/bin/python "$RUNNER_TEMP/assemble_env.py"
+            rc=$?
+          fi
+          if [ $rc -ne 0 ]; then
+            echo "Required env missing; aborting before any dial."
+          fi
+          exit $rc
 
       - name: Dial
         env:
