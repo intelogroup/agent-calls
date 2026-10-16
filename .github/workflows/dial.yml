@@ -172,12 +172,27 @@ jobs:
               take("LIVEKIT_URL", "ws://localhost:" + port,
                    "derived from on-box LiveKit server port")
 
+          lines = [name + "=" + found[name] for name in NAMES
+                   if name in found and sources.get(name) != "process environment"]
           env_file = os.environ.get("GITHUB_ENV")
           if env_file:
               with open(env_file, "a") as fh:
-                  for name in NAMES:
-                      if name in found and sources.get(name) != "process environment":
-                          fh.write(name + "=" + found[name] + "\n")
+                  for line in lines:
+                      fh.write(line + "\n")
+          # Under sudo -n the step's GITHUB_ENV variable is stripped
+          # from the environment, so the write above never happens on
+          # the sudo pass. Also write the same lines to the file named
+          # on argv; the step shell appends that file to $GITHUB_ENV
+          # after the sudo pass so later steps inherit the values.
+          out_path = sys.argv[1] if len(sys.argv) > 1 else ""
+          if out_path:
+              with open(out_path, "w") as fh:
+                  for line in lines:
+                      fh.write(line + "\n")
+              try:
+                  os.chmod(out_path, 0o644)
+              except OSError:
+                  pass
 
           for name in NAMES + ("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "JETT_PHONE_E164"):
               present = bool(found.get(name) or os.environ.get(name))
@@ -191,13 +206,20 @@ jobs:
           sys.exit(0 if not missing else 3)
           PYEOF
           set +e
-          /opt/agent/venv/bin/python "$RUNNER_TEMP/assemble_env.py"
+          ENV_LINES="$RUNNER_TEMP/lk_env_lines"
+          rm -f "$ENV_LINES"
+          /opt/agent/venv/bin/python "$RUNNER_TEMP/assemble_env.py" "$ENV_LINES"
           rc=$?
           if [ $rc -eq 3 ]; then
             echo "Direct read incomplete; retrying assembly under sudo -n (values still never printed)"
-            sudo -n /opt/agent/venv/bin/python "$RUNNER_TEMP/assemble_env.py"
+            sudo -n /opt/agent/venv/bin/python "$RUNNER_TEMP/assemble_env.py" "$ENV_LINES"
             rc=$?
+            if [ $rc -eq 0 ] && [ -s "$ENV_LINES" ]; then
+              cat "$ENV_LINES" >> "$GITHUB_ENV"
+              echo "Assembled env propagated to later steps via GITHUB_ENV (names only, values never printed)"
+            fi
           fi
+          rm -f "$ENV_LINES"
           if [ $rc -ne 0 ]; then
             echo "Required env missing; aborting before any dial."
           fi
@@ -211,6 +233,12 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
+          for v in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_SIP_OUTBOUND_TRUNK_ID JETT_PHONE_E164; do
+            if [ -n "${!v:-}" ]; then echo "$v: SET"; else echo "$v: MISSING"; fi
+          done
+          for v in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_SIP_OUTBOUND_TRUNK_ID JETT_PHONE_E164; do
+            if [ -z "${!v:-}" ]; then echo "Required env $v is missing in the Dial step; aborting before any dial."; exit 1; fi
+          done
           args=(--to "$TO" --name "$NAME" --brief "$BRIEF" --engine "$ENGINE")
           if [ "$DRY_RUN" = "true" ]; then
             args+=(--dry-run)
