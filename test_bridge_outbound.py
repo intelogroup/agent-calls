@@ -21,7 +21,12 @@ test:
     in the source;
   - the dialer: plan metadata carries engine (+callee_name), and
     a brief that plainly needs bridge-missing tools is refused
-    for --engine deepgram (exit 2) but fine for --engine local.
+    for --engine deepgram (exit 2) but fine for --engine local;
+  - the outbound prompts (bridge build_prompt AND the local
+    OUTBOUND_RULES) carry Jim's 2026-10-16 relay wording (agree
+    to relay — the transcript reaches Jim; no can't-relay
+    posture) and brief-adherence rule (deliver Jim's message
+    verbatim, never add sentiments he did not state).
 
 Run: <venv>/python test_bridge_outbound.py
 """
@@ -258,11 +263,43 @@ def t_dialer():
           == "Beckendy", f"rc={rc3.returncode}")
 
 
+def t_prompt_relay_verbatim():
+    """Jim's relay-wording + brief-adherence rules (2026-10-16)
+    on BOTH outbound prompt paths: the bridge's build_prompt in
+    untrusted+outbound mode and the local pipeline's
+    OUTBOUND_RULES. Relay agreement is grounded in the real
+    mechanism (transcript + summary are delivered to Jim), the
+    can't-relay posture is absent, and Jim's message must be
+    delivered in the brief's exact words with nothing added."""
+    import deepgram_bridge as dgb
+    p = dgb.build_prompt(BRIEF, mode="untrusted", outbound=True)
+    check("prompt [relay agreement present]",
+          "I will relay the message to him" in p)
+    check("prompt [relay grounded in transcript delivery]",
+          "transcript and summary are delivered to Jim" in p)
+    check("prompt [no can't-relay posture]",
+          "can't relay" not in p and "cannot relay" not in p)
+    check("prompt [say-only-what-you-did still present]",
+          "SAY ONLY WHAT YOU DID" in p)
+    check("prompt [verbatim rule present]",
+          "in exactly the words the brief states" in p
+          and "Never add sentiments" in p)
+    check("prompt [local OUTBOUND_RULES carry the pair]",
+          "I will relay the message to him" in la.OUTBOUND_RULES
+          and "transcript and summary are delivered to Jim"
+          in la.OUTBOUND_RULES
+          and "in exactly the words the brief states"
+          in la.OUTBOUND_RULES
+          and "can't relay" not in la.OUTBOUND_RULES
+          and "cannot relay" not in la.OUTBOUND_RULES)
+
+
 def main():
     t_gate_matrix()
     t_classification_untouched()
     t_brief_rendering()
     t_dialer()
+    t_prompt_relay_verbatim()
     if FAILED:
         print(f"\n{len(FAILED)} FAILURES: {FAILED}")
         return 1

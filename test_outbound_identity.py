@@ -32,6 +32,15 @@ local pipeline's composed instructions):
     transcript binds each turn to the rule text that now
     governs it, on both paths.
 
+A third prompt defect, from the Benoucheca call
+out-3c6f1ec39d (2026-10-16): asked to pass a message back
+("Tell him that for me"), the agent said "I can't relay
+messages" — yet the call transcript IS delivered to Jim, so
+relaying is real and the agent must say it will relay. On
+the same call it added "Jim says hi and sends his love," a
+sentiment Jim never stated. The relay-wording and
+brief-adherence tests below pin both fixes on both paths.
+
 Harness note: this tree has no live-LLM conversation runner
 (mock_stream_run.py covers spec-feed timing with a fake brain,
 not full conversations), so the scenario test is a prompt-
@@ -223,6 +232,9 @@ def t_scenario_replay():
          ["emergency", "SAY ONLY WHAT YOU DID"]),
         ('"Oh, my full name is Jonathan Kirk." (+ a number)',
          ["unverified claim", "do not adopt it"]),
+        ('"Tell him that for me."',
+         ["I will relay the message to him",
+          "SAY ONLY WHAT YOU DID"]),
     ]
     for label, prompt, keep_frag in (
             ("bridge", bridge_outbound_prompt(),
@@ -243,6 +255,33 @@ def t_scenario_replay():
               "identity digits]",
               "say it digit by digit" not in prompt.lower()
               or "NEVER ask" in prompt)
+
+
+def t_relay_and_verbatim():
+    """Jim's relay-wording + brief-adherence rules (2026-10-16),
+    from the Benoucheca call out-3c6f1ec39d. Both outbound
+    prompts must: agree to relay in words, grounded in the
+    transcript/summary delivery that makes relaying real;
+    carry no can't-relay posture; keep SAY ONLY WHAT YOU DID
+    intact (relay-by-record is not a live alert); and pin the
+    deliver-verbatim / no-added-sentiments rule."""
+    for label, p in (("bridge", bridge_outbound_prompt()),
+                     ("local", local_outbound_prompt())):
+        check(f"{label} [relay: agrees in words]",
+              "I will relay the message to him" in p)
+        check(f"{label} [relay: grounded in transcript delivery]",
+              "transcript and summary are delivered to Jim" in p)
+        check(f"{label} [relay: no can't-relay posture]",
+              "can't relay" not in p and "cannot relay" not in p
+              and "unable to relay" not in p)
+        check(f"{label} [relay: say-only-what-you-did intact]",
+              "SAY ONLY WHAT YOU DID" in p)
+        check(f"{label} [verbatim: brief's exact words]",
+              "in exactly the words the brief states" in p)
+        check(f"{label} [verbatim: no added sentiments]",
+              "Never add sentiments" in p)
+        check(f"{label} [verbatim: defect named]",
+              "sends his love" in p)
 
 
 def t_wiring():
@@ -267,6 +306,7 @@ def main():
     t_bridge_inbound_regression()
     t_local_outbound_prompt()
     t_scenario_replay()
+    t_relay_and_verbatim()
     t_wiring()
     if FAILED:
         print(f"\n{len(FAILED)} FAILURES: {FAILED}")
