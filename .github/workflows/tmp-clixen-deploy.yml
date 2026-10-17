@@ -3,7 +3,7 @@ name: "(temporary) deploy clixen-cloud via agent-calls Fly token"
 # Mirrors intelogroup/clixen-cloud .github/workflows/deploy.yml (the deploy
 # logic Jim approved) step for step. That workflow has never run because the
 # clixen-cloud repo has no Fly token secret. This copy runs from agent-calls
-# and uses agent-calls' FLY_DEPLOY_TOKEN (the "Jett token") instead.
+# and uses agent-calls' CLIXEN_FLY_TOKEN (the "Jett token") instead.
 #
 # Order of operations (a failed migration fails the workflow BEFORE any
 # long-lived machine is touched):
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
 
 env:
-  FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
+  FLY_API_TOKEN: ${{ secrets.CLIXEN_FLY_TOKEN }}
   APP: clixen-cloud
 
 jobs:
@@ -40,6 +40,7 @@ jobs:
         with:
           repository: intelogroup/clixen-cloud
           ref: main
+          token: ${{ secrets.CLIXEN_CHECKOUT_TOKEN }}
 
       - uses: docker/setup-buildx-action@v3
 
