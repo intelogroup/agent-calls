@@ -1,0 +1,100 @@
+name: "(temporary) deploy clixen-cloud via agent-calls Fly token"
+
+# Mirrors intelogroup/clixen-cloud .github/workflows/deploy.yml (the deploy
+# logic Jim approved) step for step. That workflow has never run because the
+# clixen-cloud repo has no Fly token secret. This copy runs from agent-calls
+# and uses agent-calls' FLY_DEPLOY_TOKEN (the "Jett token") instead.
+#
+# Order of operations (a failed migration fails the workflow BEFORE any
+# long-lived machine is touched):
+#   1. build + push the image, tagged with the clixen-cloud commit SHA
+#   2. run `python -m db.migrate` in an ephemeral machine (--rm)
+#   3. update both app machines to the new image, in place
+#      (topology is preserved -- see clixen-cloud fly.toml. Do NOT replace
+#      this with `fly deploy`, which would reconcile from fly.toml)
+#   4. start the api machine and smoke-test /healthz
+#
+# The worker machine gets the new image but stays stopped: it has been
+# crash-looping since 2026-09-22 and is redundant -- both machines run the
+# full API+worker stack because the Docker entrypoint ignores init.cmd.
+#
+# This workflow never prints secret values; the token is passed via env
+# only and docker login reads it from stdin.
+
+on:
+  workflow_dispatch:
+
+env:
+  FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
+  APP: clixen-cloud
+
+jobs:
+  build:
+    name: build and push image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: intelogroup/clixen-cloud
+          ref: main
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Fly registry
+        run: echo "$FLY_API_TOKEN" | docker login registry.fly.io -u x --password-stdin
+
+      - id: tag
+        name: Tag the image with the clixen-cloud commit SHA
+        run: echo "image=registry.fly.io/${APP}:$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        run: docker buildx build --push -t "${{ steps.tag.outputs.image }}" .
+
+  migrate:
+    name: run database migrations
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # --entrypoint bypasses the image's entrypoint script (which would
+      # boot the full API+worker supervisor and ignore our command).
+      # --rm removes the machine when the migration exits. The machine
+      # inherits the app's secrets, so DATABASE_URL is present.
+      - name: Run migrations in an ephemeral machine
+        run: >
+          fly machine run --rm --region sjc --entrypoint python
+          -a "$APP" "${{ needs.build.outputs.image }}" -m db.migrate
+
+  rollout:
+    name: roll out to app machines
+    needs: [build, migrate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Update both machines to the new image
+        run: |
+          IMAGE="${{ needs.build.outputs.image }}"
+          # api machine: update image (wakes it), then make sure it is up
+          fly machine update 287d672ad94218 -i "$IMAGE" -a "$APP" -y
+          fly machine start 287d672ad94218 -a "$APP" || true  # no-op if the update already started it
+          # worker machine: update image, leave stopped (--skip-start)
+          fly machine update 847316f22ee028 -i "$IMAGE" -a "$APP" -y --skip-start
+
+      - name: Smoke-test the API
+        run: |
+          for i in $(seq 1 24); do
+            if curl -sf https://clixen-cloud.fly.dev/healthz; then
+              echo; echo "API is up on the new image"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "API did not become healthy within 4 minutes" >&2
+          exit 1
