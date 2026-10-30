@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Synthesize the spoken message -> message.wav (24 kHz).
 
-Engine chain (Jim's ruling, 2026-10-30):
-  1. Kokoro ONNX (int8 model, voice af_heart) -- the primary, approved voice.
-  2. Pocket TTS (voice alba) -- second option, only if Kokoro ONNX fails.
+Engine chain (Jim's ruling, 2026-10-30, revised after the Kokoro proof
+call):
+  1. Pocket TTS (voice alba) -- primary.
+  2. Kokoro ONNX (int8 model, voice af_heart) -- fallback, only if
+     Pocket fails.
   3. Both fail -> error to stderr, exit 1. The call fails loudly; no
      substitute robot voice is ever rendered.
 
@@ -63,8 +65,8 @@ def main():
 
     audio = sr = engine = None
     errors = []
-    for name, fn in (("kokoro-onnx", synth_kokoro_onnx),
-                     ("pocket", synth_pocket)):
+    for name, fn in (("pocket", synth_pocket),
+                     ("kokoro-onnx", synth_kokoro_onnx)):
         try:
             audio, sr = fn(text)
             engine = name

@@ -59,7 +59,7 @@ jobs:
           command -v baresip && echo "baresip installed"
           fi
 
-      - name: Synthesize voice message (Kokoro TTS)
+      - name: Synthesize voice message (Pocket primary, Kokoro ONNX fallback)
         run: |
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           MSG="$(cat /tmp/message.txt)"
