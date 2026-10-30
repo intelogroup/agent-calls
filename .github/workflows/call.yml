@@ -48,14 +48,14 @@ jobs:
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           if [ -f /opt/actions-runner/.warm ]; then
             echo "warm runner: packages pre-installed, skipping apt"
-            command -v baresip && command -v espeak-ng && command -v ffmpeg && echo "tools OK"
+            command -v baresip && command -v ffmpeg && echo "tools OK"
           else
           export DEBIAN_FRONTEND=noninteractive
           for i in 1 2 3; do
             sudo -E apt-get update -qq && break || { echo "apt update retry $i"; sleep 15; }
           done
-          sudo -E apt-get install -y -qq baresip espeak-ng ffmpeg || \
-            sudo -E apt-get install -y baresip espeak-ng ffmpeg
+          sudo -E apt-get install -y -qq baresip ffmpeg || \
+            sudo -E apt-get install -y baresip ffmpeg
           command -v baresip && echo "baresip installed"
           fi
 
@@ -63,15 +63,21 @@ jobs:
         run: |
           if [ "$DEBUG_CALL" = "1" ]; then set -x; fi
           MSG="$(cat /tmp/message.txt)"
-          if [ -f /opt/actions-runner/.warm ]; then
-            echo "warm runner: espeak-ng only (Kokoro skipped on 1GB box)"
-            espeak-ng -v en-us -s 165 -w message.wav "$MSG"
-          elif python3 -m pip install -q --break-system-packages kokoro soundfile 2>/dev/null && python3 scripts/make_message.py "$MSG"; then
-            echo "TTS engine: kokoro"
-          else
-            echo "Kokoro unavailable, falling back to espeak-ng"
-            espeak-ng -v en-us -s 165 -w message.wav "$MSG"
-          fi
+          # Engine chain lives in scripts/make_message.py: Kokoro ONNX primary,
+          # Pocket TTS second, both dead = exit 1 (the call fails loudly).
+          # Installs are guarded so one engine's install failure degrades to
+          # the other engine instead of aborting the step.
+          python3 -m pip install -q --break-system-packages kokoro-onnx soundfile || echo "::warning::kokoro-onnx install failed"
+          # CPU-only torch first: a bare pocket-tts install drags in the full
+          # multi-GB CUDA wheel set that a CPU render never loads (measured,
+          # see TEST-REPORT.md). If this line fails, the pocket-tts install
+          # below still falls back to the default torch.
+          python3 -m pip install -q --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu || echo "::warning::cpu torch install failed"
+          python3 -m pip install -q --break-system-packages pocket-tts || echo "::warning::pocket-tts install failed"
+          mkdir -p kokoro-onnx
+          curl -fSL -o kokoro-onnx/kokoro-v1.0.int8.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx || echo "::warning::kokoro int8 model download failed"
+          curl -fSL -o kokoro-onnx/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin || echo "::warning::kokoro voices download failed"
+          python3 scripts/make_message.py "$MSG"
           ffmpeg -y -loglevel error -i message.wav -ar 8000 -ac 1 -c:a pcm_s16le message-8k.wav
           echo -n "message duration (s): "
           ffprobe -v error -show_entries format=duration -of csv=p=0 message-8k.wav
@@ -164,6 +170,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: call-logs
+          retention-days: 14
           path: |
             sip-call.log
             message-8k.wav
