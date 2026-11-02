@@ -33,6 +33,17 @@ Env: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
      LIVEKIT_SIP_OUTBOUND_TRUNK_ID, JETT_PHONE_E164 (caller ID).
 --dry-run prints the exact plan (room, dispatch metadata, SIP
 request fields) and makes NO calls — the pre-flight check.
+
+Pre-flight busy check (2026-11-02): when the destination IS our
+own line (JETT_PHONE_E164), place_call first asks the LiveKit
+room service whether the line already holds a call; if it does,
+the dialer refuses — "REFUSED: line busy — <evidence>", exit 3 —
+and places nothing. Dialing our own number into its busy
+announcement (the 19:53Z test call) is a wasted call and a
+poisoned record; a refusal with the evidence attached is the
+correct outcome. Own number only: arbitrary destinations have
+no occupancy source reachable from here. List-and-place is not
+atomic, so this is a guard, not a lock.
 """
 import argparse
 import asyncio
@@ -136,6 +147,57 @@ def build_requests(plan: dict):
     )
 
 
+BUSY_REFUSAL_EXIT = 3
+
+
+class LineBusyError(Exception):
+    """Our own line already holds a call; carries the evidence."""
+
+    def __init__(self, evidence: str):
+        super().__init__(evidence)
+        self.evidence = evidence
+
+
+def _digits(number: str) -> str:
+    return re.sub(r"\D", "", number or "")
+
+
+def _agent_kind() -> int:
+    """ParticipantInfo.Kind value for the agent worker itself,
+    resolved from the installed protocol so an enum renumbering
+    cannot silently turn the worker into a 'call leg'."""
+    try:
+        from livekit.protocol import models
+        return int(models.ParticipantInfo.Kind.Value("AGENT"))
+    except Exception:
+        return 4
+
+
+async def line_busy_evidence(client) -> str | None:
+    """Occupancy evidence for our own line, or None if it looks
+    free. The only signal reachable from the dialer's seat is the
+    LiveKit room service: the worker serves one call at a time and
+    every call it serves lives in a "jett-" room, so a jett- room
+    holding a non-agent participant (a SIP leg, Jim himself) is a
+    call in progress. Rooms are listed before we create ours, so
+    any such room is someone else's call."""
+    from livekit.protocol.room import (
+        ListParticipantsRequest, ListRoomsRequest)
+    agent_kind = _agent_kind()
+    resp = await client.room.list_rooms(ListRoomsRequest())
+    for room in resp.rooms:
+        name = getattr(room, "name", "") or ""
+        if not name.startswith("jett-"):
+            continue
+        parts = await client.room.list_participants(
+            ListParticipantsRequest(room=name))
+        for p in parts.participants:
+            if getattr(p, "kind", None) != agent_kind:
+                return (f"room {name} holds participant "
+                        f"{getattr(p, 'identity', '') or '?'}")
+    return None
+
+
 async def place_call(plan: dict) -> str:
     from livekit import api as lk_api
 
@@ -144,8 +206,14 @@ async def place_call(plan: dict) -> str:
     creds = {"api" + "_key": os.environ["LIVEKIT" + "_API_KEY"],
              "api" + "_secret": os.environ["LIVEKIT" + "_API_SECRET"]}
     client = lk_api.LiveKitAPI(url=url, **creds)
-    room_req, dispatch_req, sip_req = build_requests(plan)
     try:
+        own = os.environ.get("JETT_PHONE_E164", "")
+        if own and _digits(plan["sip"]["sip_call_to"]) \
+                == _digits(own):
+            evidence = await line_busy_evidence(client)
+            if evidence:
+                raise LineBusyError(evidence)
+        room_req, dispatch_req, sip_req = build_requests(plan)
         await client.room.create_room(room_req)
         await client.agent_dispatch.create_dispatch(dispatch_req)
         resp = await client.sip.create_sip_participant(sip_req)
@@ -177,7 +245,12 @@ def main() -> int:
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
         return 0
-    call_id = asyncio.run(place_call(plan))
+    try:
+        call_id = asyncio.run(place_call(plan))
+    except LineBusyError as e:
+        print(f"REFUSED: line busy — {e.evidence}",
+              file=sys.stderr)
+        return BUSY_REFUSAL_EXIT
     print(json.dumps({"placed": True, "room": plan["room"],
                       "agent_name": plan["agent_name"],
                       "sip_call_id": call_id}))

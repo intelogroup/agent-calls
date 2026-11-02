@@ -3482,25 +3482,51 @@ class _RingbackTone:
             self._track = None
 
 
+def _receipt_fallback(line: dict) -> None:
+    """Durable local copy of a bus receipt that could not reach
+    the bus (2026-11-02): appended to bus-fallback.jsonl in the
+    transcript spool dir, so the receipt EXISTS on the worker's
+    disk after a bus failure instead of vanishing with the log
+    line. Best-effort by design — it must never crash a call."""
+    try:
+        os.makedirs(TX_SPOOL_DIR, exist_ok=True)
+        with open(os.path.join(TX_SPOOL_DIR, "bus-fallback.jsonl"),
+                  "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 async def _ring_receipt(call_id: str, event: str,
                         via: str = "ring_first", **fields) -> None:
     """One ring-first / forwarding outcome: structured log line + a
     receipt on the bus (calls/live/<id>/relay.jsonl, the same file
     the call relay's receipts use — Fly logs are too lossy to be
     the record). Best-effort and time-bounded: a slow bus must
-    never hold a call hostage."""
+    never hold a call hostage. A FAILED receipt is loud, though
+    (2026-11-02): log event + a durable fallback copy in the
+    spool dir — the old silent `except: pass` is how a call that
+    reached the agent could leave no record anywhere."""
     log_event(event, call_id=call_id, **fields)
     line = {"ts": _utcnow_z(), "via": via, "event": event,
             "call_id": call_id, **fields}
+    ok = False
     try:
-        await asyncio.wait_for(
+        ok = await asyncio.wait_for(
             _bus_append_lines(
                 f"calls/live/{call_id}/relay.jsonl",
                 [json.dumps(line, ensure_ascii=False)],
                 f"ring-first {call_id}"),
             timeout=8)
     except Exception:
-        pass
+        ok = False
+    if not ok:
+        log_event("bus_receipt_failed", call_id=call_id,
+                  receipt_event=event)
+        log.warning("bus receipt %s for %s did not reach the bus; "
+                    "fallback copy written to tx-spool", event,
+                    call_id)
+        _receipt_fallback(line)
 
 
 async def _ring_first(ctx: JobContext, caller_identity: str,
@@ -3920,6 +3946,11 @@ async def _run_no_brain(ctx: JobContext):
         await ctx.room.disconnect()
         return
     log.warning("no brain key (OPENROUTER_API_KEY/META_API_KEY) — playing no-key notice")
+    # Bus stub (2026-11-02): same silent shape as the busy path —
+    # a call answered by the no-brain notice left no bus record.
+    asyncio.ensure_future(_ring_receipt(
+        ctx.room.name.replace("jett-", "", 1), "brain_missing",
+        via="entrypoint"))
     tts_engine = PocketTTS()
     samples, _ = await asyncio.get_running_loop().run_in_executor(
         None, tts_engine._synth,
@@ -4109,6 +4140,7 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     _route = bridge_route(call_info, job_meta)
     _dg_skip_reason = ""
     import deepgram_bridge as _dgb_gate
+    from announcement_guard import machine_announcement_match
     _self_ll = self_linphone_local_route(
         call_info, _dgb_gate.self_linphone_local_on(BUS_DIR))
     if DEEPGRAM_BRIDGE and _route["serve"] and _self_ll:
@@ -4300,6 +4332,18 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # the transcription-timeout rescue below. Finals clear it.
     held_interim = {"text": "", "rescued": ""}
 
+    # Terminal machine-announcement guard (2026-11-02): on an
+    # outbound call the far end's FIRST final transcript is checked
+    # against announcement_guard — a busy / not-in-service / carrier
+    # intercept recording is not a conversation, so the call ends
+    # promptly with the outcome on the record instead of the agent
+    # replying to a recording (the 19:53Z test call's failure).
+    # One-shot: the first turn decides, then the guard is spent for
+    # the rest of the call. end_holder receives the call's `ended`
+    # event once it exists (it is created after these handlers).
+    announce_guard = {"spent": False}
+    end_holder: dict = {}
+
     session = AgentSession(
         stt=stt_stream,
         vad=silero.VAD.load(min_silence_duration=0.35),
@@ -4397,6 +4441,24 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
             if text:
                 held_interim["text"] = ""
                 relay.note_transcript("jim", text, source="stt")
+                if not announce_guard["spent"]:
+                    announce_guard["spent"] = True
+                    if call_info["direction"] == "outbound":
+                        _ann = machine_announcement_match(text)
+                        if _ann:
+                            log_event(
+                                "machine_announcement",
+                                call_id=_CURRENT_CALL_ID,
+                                pattern=_ann, text=text[:120])
+                            relay._receipt(
+                                "machine_announcement",
+                                far_end="machine_announcement",
+                                pattern=_ann, text=text[:200])
+                            _end_ev = end_holder.get("event")
+                            if _end_ev is not None:
+                                _end_ev.set()
+                            asyncio.get_running_loop().create_task(
+                                _delayed_hangup(1.0))
         except Exception:
             pass
 
@@ -4447,6 +4509,7 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
         pass
 
     ended = asyncio.Event()
+    end_holder["event"] = ended
 
     def _on_participant_left(p: rtc.RemoteParticipant):
         if not ctx.room.remote_participants:
@@ -4573,6 +4636,17 @@ async def entrypoint(ctx: JobContext):
                 return
             log_event("call_rejected_busy", room=ctx.room.name)
             log.info("busy; rejecting second call %s", ctx.room.name)
+            # Bus stub (2026-11-02): a busy-rejected call used to
+            # leave NO record on the local worker — the log line
+            # above was the only trace. Proven live: while the
+            # 19:53Z outbound test call held the line for ten
+            # minutes, Jim's four Linphone attempts (19:55-19:58Z)
+            # were all rejected here and vanished from the record.
+            # Every call that reaches the agent leaves at least
+            # this stub, naming the call that holds the line.
+            asyncio.ensure_future(_ring_receipt(
+                call_id, "call_rejected_busy", via="entrypoint",
+                busy_with=_ACTIVE_CALL, room=ctx.room.name))
             if BRIDGE_ONLY:
                 # No Pocket voice exists on the receptionist: the
                 # spoken busy message is a local-model path, so the

@@ -291,7 +291,7 @@ def t_wiring():
           "build_prompt(brief, mode=mode, outbound=outbound)"
           in dg_src)
     check("wiring [run_bridge passes mode into the session]",
-          "mode=mode)" in dg_src)
+          "mode=mode, outbound=outbound)," in dg_src)
     check("wiring [filed-consult reply is mode-aware]",
           "Tell the person on" in dg_src
           and "you have passed" in dg_src

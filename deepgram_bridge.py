@@ -29,6 +29,8 @@ import numpy as np
 import websockets
 from livekit import rtc
 
+from announcement_guard import machine_announcement_match
+
 DG_URL = "wss://agent.deepgram.com/v1/agent/converse"
 INPUT_SR = 16000
 OUTPUT_SR = 24000
@@ -391,7 +393,8 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
                        log_event, caller_gone: asyncio.Event,
                        stats: dict, file_consult=None,
                        consult_enabled: bool = False,
-                       mode: str = "self") -> None:
+                       mode: str = "self",
+                       outbound: bool = False) -> None:
     source = rtc.AudioSource(OUTPUT_SR, 1, queue_size_ms=4000)
     track = rtc.LocalAudioTrack.create_audio_track("agent-mic", source)
     await room.local_participant.publish_track(track)
@@ -452,6 +455,35 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
                 tx_buffer.append(transcript_line(role, content))
                 if role == "jim":
                     stats["turns"] = stats.get("turns", 0) + 1
+                if outbound and role == "jim" \
+                        and not state.get("announce_checked"):
+                    # Terminal machine-announcement guard
+                    # (2026-11-02): the far end's first turn on an
+                    # outbound call decides — a busy / carrier
+                    # intercept recording ends the session via the
+                    # same end_requested path end_call uses, with
+                    # the outcome on the call record.
+                    state["announce_checked"] = True
+                    _ann = machine_announcement_match(content)
+                    if _ann:
+                        log_event("dg_machine_announcement",
+                                  call_id=call_id, pattern=_ann,
+                                  text=content[:120])
+                        receipt = {
+                            "ts": datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"),
+                            "via": "bridge",
+                            "event": "machine_announcement",
+                            "call_id": call_id,
+                            "far_end": "machine_announcement",
+                            "pattern": _ann,
+                            "text": content[:200]}
+                        await append_lines(
+                            f"calls/live/{call_id}/relay.jsonl",
+                            [json.dumps(receipt, ensure_ascii=False)],
+                            f"relay {call_id}")
+                        await flush_tx()
+                        end_requested.set()
                 if len(tx_buffer) >= 4:
                     await flush_tx()
         elif etype == "UserStartedSpeaking":
@@ -650,7 +682,7 @@ async def run_bridge(ctx, *, call_id: str, brief: str, greeting: str,
                         caller_gone=caller_gone, stats=stats,
                         file_consult=file_consult,
                         consult_enabled=(mode != "notools"),
-                        mode=mode),
+                        mode=mode, outbound=outbound),
                     timeout=max_call_s)
             last_error = None
             break

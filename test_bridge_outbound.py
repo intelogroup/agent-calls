@@ -29,6 +29,12 @@ test:
     local -> jett-proxy (the Mac worker); an AGENT_NAME env
     override still wins for both engines; an AUTO-ROUTED plan
     targets jett-proxy, never jett-bridge.
+  - the dialer's pre-flight busy check (2026-11-02): dialing
+    our OWN number while the line already holds a call (a
+    jett- room with a non-agent participant, per the room
+    service) refuses before placing anything — LineBusyError,
+    REFUSED line, exit 3; a free line, an agent-only room, a
+    foreign room, or any other destination proceeds.
   - the outbound prompts (bridge build_prompt AND the local
     OUTBOUND_RULES) carry Jim's 2026-10-16 relay wording (agree
     to relay — the transcript reaches Jim; no can't-relay
@@ -333,11 +339,172 @@ def t_prompt_relay_verbatim():
           and "cannot relay" not in la.OUTBOUND_RULES)
 
 
+def t_dialer_busy():
+    """Pre-flight busy check (2026-11-02): dialing our OWN number
+    while the line holds a call refuses (exit 3, REFUSED line, no
+    SIP participant); a free line or any other number proceeds.
+    The LiveKit API is stubbed — the signal under test is the
+    room-service occupancy shape, not a live server."""
+    import asyncio
+    import contextlib
+    import io
+    import types as _types
+    from livekit import api as lk_api
+    from livekit.protocol import models as lk_models
+
+    AGENT_KIND = dial._agent_kind()
+    SIP_KIND = int(lk_models.ParticipantInfo.Kind.Value("SIP"))
+    OWN = "+16176556805"
+    OTHER = "+19787156903"
+
+    def part(identity, kind):
+        return _types.SimpleNamespace(identity=identity, kind=kind)
+
+    def room(name, parts):
+        return (name, parts)
+
+    class RoomSvc:
+        def __init__(self, rooms):
+            self._rooms = rooms
+            self.calls = []
+
+        async def list_rooms(self, req):
+            return _types.SimpleNamespace(
+                rooms=[_types.SimpleNamespace(name=n)
+                       for n, _ in self._rooms])
+
+        async def list_participants(self, req):
+            parts = dict(self._rooms)[req.room]
+            return _types.SimpleNamespace(participants=parts)
+
+        async def create_room(self, req):
+            self.calls.append("create_room")
+
+    class DispatchSvc:
+        def __init__(self, calls):
+            self._calls = calls
+
+        async def create_dispatch(self, req):
+            self._calls.append("create_dispatch")
+
+    class SipSvc:
+        def __init__(self, calls):
+            self._calls = calls
+
+        async def create_sip_participant(self, req):
+            self._calls.append("create_sip_participant")
+            return _types.SimpleNamespace(sip_call_id="SCL_stub")
+
+    def stub_client(rooms):
+        room_svc = RoomSvc(rooms)
+        return _types.SimpleNamespace(
+            room=room_svc,
+            agent_dispatch=DispatchSvc(room_svc.calls),
+            sip=SipSvc(room_svc.calls),
+            _room_svc=room_svc,
+            aclose=lambda: asyncio.sleep(0))
+
+    busy_rooms = [room("jett-out-abc123",
+                       [part("agent-worker", AGENT_KIND),
+                        part("sip_+16176556805", SIP_KIND)])]
+    free_rooms = [room("jett-out-old999",
+                       [part("agent-worker", AGENT_KIND)])]
+
+    ev = asyncio.run(dial.line_busy_evidence(stub_client(busy_rooms)))
+    check("dial busy [evidence names room + leg]",
+          ev is not None and "jett-out-abc123" in ev
+          and "sip_+16176556805" in ev, str(ev))
+    check("dial busy [agent-only room is free]",
+          asyncio.run(dial.line_busy_evidence(
+              stub_client(free_rooms))) is None)
+    check("dial busy [no rooms is free]",
+          asyncio.run(dial.line_busy_evidence(
+              stub_client([]))) is None)
+    check("dial busy [foreign room ignored]",
+          asyncio.run(dial.line_busy_evidence(stub_client(
+              [room("other-room",
+                    [part("sip_+16176556805", SIP_KIND)])]))) is None)
+
+    saved_env = {k: os.environ.get(k) for k in
+                 ("LIVEKIT_URL", "LIVEKIT_API_KEY",
+                  "LIVEKIT_API_SECRET", "JETT_PHONE_E164")}
+    saved_api = lk_api.LiveKitAPI
+    try:
+        os.environ.update({
+            "LIVEKIT_URL": "ws://localhost:7880",
+            "LIVEKIT_API_KEY": "k", "LIVEKIT_API_SECRET": "s",
+            "JETT_PHONE_E164": OWN})
+
+        client = stub_client(busy_rooms)
+        lk_api.LiveKitAPI = lambda **kw: client
+        plan = dial.build_plan(OWN, "Line test.")
+        try:
+            asyncio.run(dial.place_call(plan))
+            raised = ""
+        except dial.LineBusyError as e:
+            raised = e.evidence
+        check("dial busy [own number + busy -> LineBusyError]",
+              "jett-out-abc123" in raised, raised)
+        check("dial busy [nothing was placed]",
+              client._room_svc.calls == [],
+              str(client._room_svc.calls))
+
+        client2 = stub_client(free_rooms)
+        lk_api.LiveKitAPI = lambda **kw: client2
+        out = asyncio.run(dial.place_call(dial.build_plan(
+            OWN, "Line test.")))
+        check("dial busy [own number + free -> placed]",
+              out == "SCL_stub"
+              and client2._room_svc.calls == [
+                  "create_room", "create_dispatch",
+                  "create_sip_participant"],
+              f"out={out} calls={client2._room_svc.calls}")
+
+        client3 = stub_client(busy_rooms)
+        lk_api.LiveKitAPI = lambda **kw: client3
+        out3 = asyncio.run(dial.place_call(dial.build_plan(
+            OTHER, "Errand.")))
+        check("dial busy [other number ignores occupancy]",
+              out3 == "SCL_stub"
+              and "create_sip_participant" in client3._room_svc.calls,
+              f"out={out3} calls={client3._room_svc.calls}")
+    finally:
+        lk_api.LiveKitAPI = saved_api
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # main() maps LineBusyError to the REFUSED line + exit 3.
+    saved_argv = sys.argv
+    saved_pc = dial.place_call
+
+    async def _busy(plan):
+        raise dial.LineBusyError("room jett-x holds participant y")
+
+    try:
+        dial.place_call = _busy
+        sys.argv = ["dial.py", "--to", OWN, "--brief", "Line test."]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = dial.main()
+        check("dial busy [main -> REFUSED + exit 3]",
+              rc == dial.BUSY_REFUSAL_EXIT == 3
+              and "REFUSED: line busy" in err.getvalue()
+              and "jett-x" in err.getvalue(),
+              f"rc={rc} err={err.getvalue()[:90]}")
+    finally:
+        dial.place_call = saved_pc
+        sys.argv = saved_argv
+
+
 def main():
     t_gate_matrix()
     t_classification_untouched()
     t_brief_rendering()
     t_dialer()
+    t_dialer_busy()
     t_prompt_relay_verbatim()
     if FAILED:
         print(f"\n{len(FAILED)} FAILURES: {FAILED}")
