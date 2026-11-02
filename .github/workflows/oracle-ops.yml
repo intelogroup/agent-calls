@@ -1,0 +1,55 @@
+name: oracle-ops
+
+# Host administration for the Oracle voice box (self-hosted runner):
+# survey + jett-bridge worker lifecycle. Dispatched manually with
+# an action input; every step is baked into this file (no shell
+# arrives via inputs). Secret discipline mirrors dial.yml: config
+# values are never printed — env presence by NAME only. The one
+# exception is JETT_BRAIN_MODELS, a model list (not a secret),
+# whose resolved value is the deploy's pin evidence.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do on the box"
+        required: true
+        type: choice
+        options:
+          - survey
+        default: survey
+
+permissions:
+  contents: read
+
+jobs:
+  ops:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 30
+    steps:
+      - name: Survey
+        if: inputs.action == 'survey'
+        run: |
+          set -u
+          echo "=== BOX ==="; hostname; uname -m; nproc; free -m | head -2; df -h / | tail -1
+          echo "=== OPT ==="; ls /opt/
+          echo "=== AGENTDIR ==="; ls /opt/agent/ 2>/dev/null | head -30
+          echo "=== UNITS (livekit/jett/runner) ==="
+          systemctl list-units --type=service --no-legend 2>/dev/null | grep -iE "livekit|jett|runner" || true
+          echo "=== TOP RSS ==="; ps aux --sort=-rss | head -7
+          echo "=== ENV NAMES (/opt/agent/agent.env) ==="
+          sudo -n cut -d= -f1 /opt/agent/agent.env 2>/dev/null | sort -u || echo "unreadable"
+          echo "=== BRAIN PIN (model list only) ==="
+          sudo -n grep -E "^JETT_BRAIN_MODELS?=" /opt/agent/agent.env 2>/dev/null || echo "no brain pin line"
+          echo "=== TIMEOUT PIN ==="
+          sudo -n grep -E "^BRAIN_MODEL_TIMEOUT_S=" /opt/agent/agent.env 2>/dev/null || echo "no timeout pin line"
+          echo "=== RUNNER VENV HIGHLIGHTS ==="
+          ls /opt/agent/venv/lib/*/site-packages 2>/dev/null | grep -iE "^(livekit|torch|pocket|fermion|onnxruntime|websockets|openai)" | head -12 || true
+          echo "=== PYTHON ==="; python3 --version; which python3.12 python3.11 python3 || true
+          echo "=== LIVEKIT CONFIG ==="; ls /opt/livekit/ 2>/dev/null || ls /opt/agent/*.yaml 2>/dev/null || true
+          echo "=== BUS / SSH (ubuntu home) ==="
+          ls -d /home/ubuntu/agent-call-bus /opt/agent/bus 2>/dev/null || true
+          ls /home/ubuntu/.ssh/ 2>/dev/null || true
+          echo "=== EXISTING JETT DIRS ==="
+          ls -d /opt/jett-* /home/ubuntu/jett-* 2>/dev/null || echo "none"
+          echo "=== PORTS ==="; ss -tln | head -10
