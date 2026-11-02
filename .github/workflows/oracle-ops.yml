@@ -176,7 +176,10 @@ jobs:
         run: |
           set -u
           echo "active: $(systemctl is-active jett-bridge.service || true)"
-          sudo -n journalctl -u jett-bridge.service --no-pager -n 30 | tail -30
+          echo "=== job/call lines (last 40 min) ==="
+          sudo -n journalctl -u jett-bridge.service --no-pager --since "-40 min" | grep -E "jett-out|received job|job |bridge_route|dg_|call_record|entrypoint|registered worker" | grep -vE "event loop blocked|job executor" | tail -45
+          echo "=== journal tail ==="
+          sudo -n journalctl -u jett-bridge.service --no-pager -n 6 | tail -6
 
       - name: Stop jett-bridge
         if: inputs.action == 'stop_bridge'
