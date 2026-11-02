@@ -56,7 +56,7 @@ jobs:
       - name: Checkout dialer (tmp/bridge-outbound @195e5855)
         uses: actions/checkout@v4
         with:
-          ref: 195e5855af248b0742152da5967f274ba392de74
+          ref: 2ad77e1d61b4090c04281e436da2372edfcd3dd9
 
       - name: LiveKit SDK check (install into venv only if missing)
         run: |
