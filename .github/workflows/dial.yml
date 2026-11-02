@@ -53,10 +53,10 @@ jobs:
     runs-on: [self-hosted, oracle]
     timeout-minutes: 60
     steps:
-      - name: Checkout dialer (tmp/bridge-outbound @152582aa)
+      - name: Checkout dialer (tmp/bridge-outbound @195e5855)
         uses: actions/checkout@v4
         with:
-          ref: 152582aa3fe88a6d18cde6d3d404bbe5275dbc8f
+          ref: 195e5855af248b0742152da5967f274ba392de74
 
       - name: LiveKit SDK check (install into venv only if missing)
         run: |
