@@ -53,10 +53,10 @@ jobs:
     runs-on: [self-hosted, oracle]
     timeout-minutes: 60
     steps:
-      - name: Checkout dialer (tmp/bridge-outbound @802cfa87)
+      - name: Checkout dialer (tmp/bridge-outbound @a2a4252f)
         uses: actions/checkout@v4
         with:
-          ref: 802cfa8775479ccfd09570121f803274e663ecc0
+          ref: a2a4252f626c06bd84b9bf88c831755fcb200010
 
       - name: LiveKit SDK check (install into venv only if missing)
         run: |
@@ -232,6 +232,18 @@ jobs:
             echo "Required env missing; aborting before any dial."
           fi
           exit $rc
+
+      - name: Register assembled credentials with the log masker
+        run: |
+          # The assembled values reached this job via GITHUB_ENV,
+          # so GitHub does not know them as secrets. The assembly
+          # step already prints add-mask lines; this dedicated step
+          # registers them again — after assembly, before the Dial
+          # step whose header prints its env — so no later step
+          # can print either credential in plaintext.
+          if [ -n "${LIVEKIT_API_KEY:-}" ]; then echo "::add-mask::${LIVEKIT_API_KEY}"; fi
+          if [ -n "${LIVEKIT_API_SECRET:-}" ]; then echo "::add-mask::${LIVEKIT_API_SECRET}"; fi
+          echo "LiveKit credential masks registered for this job"
 
       - name: Dial
         env:
