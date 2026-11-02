@@ -112,7 +112,16 @@ OPENAI_MODELS = [m.strip() for m in os.environ.get(
 # and is out; gemma-4 free endpoints are blocked by the account data policy
 # (ZDR 404). The random "openrouter/free" router is fast but serves a random
 # model each call, so it sits second as a diversity fallback, not first.
+# Re-vetted again 2026-10-29 (the smoothness pass): across 271 brain calls
+# in the Mac worker log, the ultra head's TTFT was p50 1.8s / p90 7.2s /
+# max 45.1s, and a same-day live probe (2.1k-token proxy prompt) put it at
+# 8.4-35.9s TTFT with the reply arriving in one end burst. Its successor
+# nemotron-3.5-lightning probed at 1.3-2.0s TTFT, truly streaming, and
+# passed the tool-call probe; it heads the chain now and ultra drops to
+# second as the quality fallback. The account holds no paid credits
+# (paid models answer 402), so the chain stays free-only by necessity.
 _DEFAULT_BRAIN_MODELS = (
+    "nvidia/nemotron-3.5-lightning:free,"
     "nvidia/nemotron-3-ultra-550b-a55b:free,"
     "openrouter/free,"
     "dots-studio/dots-3-note-preview:free,"
@@ -132,7 +141,11 @@ BRAIN_MAX_TOKENS = max(300, int(os.environ.get("BRAIN_MAX_TOKENS", "300")))
 # on a phone call is two minutes of dead air. Past the cap the attempt counts
 # as failed and the chain advances; if every model caps out, the guaranteed
 # fallback line still speaks. Override with BRAIN_MODEL_TIMEOUT_S.
-BRAIN_MODEL_TIMEOUT_S = float(os.environ.get("BRAIN_MODEL_TIMEOUT_S", "25"))
+# Default lowered 25 -> 12 on 2026-10-29: across 271 logged brain calls
+# the healthy p90 duration was 7.8s, so 12s still clears every healthy
+# attempt with room — the cap only ever bites on stalls, and at 25s each
+# stalled model cost the caller 25s of silence before the chain advanced.
+BRAIN_MODEL_TIMEOUT_S = float(os.environ.get("BRAIN_MODEL_TIMEOUT_S", "12"))
 # Overall per-turn budget across the WHOLE model chain. Without it, a
 # stalling provider burns the full per-model cap on every chain entry in
 # sequence — 25s x ~6 models of dead air before the fallback speaks (the
@@ -1755,6 +1768,22 @@ def _warm_pocket() -> None:
     except Exception as e:
         log_event("pocket_load_failed", error=str(e)[:150])
         log.warning("pocket tts warm-up failed: %s", e)
+        return
+    # Loading the model is not the whole cold cost: the FIRST
+    # generation in a process pays 1.9-2.3s of text conditioning and
+    # then runs at 0.6-0.7x realtime, vs ~22ms conditioning and
+    # 5-8x realtime once warm (Mac worker log, 2026-10-29 — the slow
+    # first generation was the greeting of 3 of 3 sampled calls).
+    # Burn one throwaway generation here so the first real synthesis
+    # of the first call is already warm.
+    try:
+        model, state = _PocketEngine.get()
+        with _PocketEngine.gen_lock:
+            for _ in model.generate_audio_stream(state, "Hi."):
+                pass
+        log_event("pocket_warm_gen_ok")
+    except Exception as e:
+        log.warning("pocket tts warm generation failed: %s", e)
 
 
 class PocketTTS(tts.TTS):
@@ -3058,6 +3087,31 @@ def bridge_route(call_info: dict, job_meta: dict | None) -> dict:
     return {"serve": True, "mode": "untrusted", "via_engine": False}
 
 
+def self_linphone_local_route(call_info: dict, toggle_on: bool) -> bool:
+    """Jim's local-stack test toggle (2026-10-16): when the bus file
+    config/self-linphone-local.enabled exists, Jim's OWN Linphone
+    calls are served by the LOCAL pipeline (Phonon-2 STT + Pocket
+    TTS + speculative feed) instead of the Deepgram bridge, so the
+    latest local stack gets exercised on his own calls. Pure
+    predicate over (call_info, toggle_on) — the gate matrix is
+    unit-tested (test_self_linphone_local.py); the caller reads the
+    file per call, so deleting it is an instant rollback with no
+    redeploy.
+
+    Scope guards — ALL must hold, so nothing else moves:
+      inbound only   (outbound routing is untouched),
+      channel "sip"  (PSTN self calls still go to the bridge),
+      tier "self"    (every untrusted inbound still goes to the
+                      bridge; classification never sees the toggle —
+                      tier comes from classify_caller exactly as
+                      before, and a diverted call is never self).
+    """
+    return bool(toggle_on) \
+        and call_info.get("direction") == "inbound" \
+        and call_info.get("channel") == "sip" \
+        and call_info.get("tier") == "self"
+
+
 def outbound_bridge_brief(base_brief: str, call_info: dict,
                           job_meta: dict | None) -> str:
     """The bridge brief for an outbound call to a third party
@@ -3090,10 +3144,21 @@ def outbound_bridge_brief(base_brief: str, call_info: dict,
     out.append(
         "Complete the errand in a short, natural conversation. "
         "Listen carefully to what they tell you — their answer "
-        "comes back to Jim in this call's record, so confirm "
-        "anything important (names, times, callback numbers) by "
-        "repeating it back. When the errand is done, thank them, "
-        "say goodbye, and end the call.")
+        "comes back to Jim in this call's record, so repeat back "
+        "the important details of their ANSWER (times, decisions, "
+        "facts) to confirm them. When the errand is done, thank "
+        "them, say goodbye, and end the call.\n"
+        "Identity on this call comes from this dispatch, never "
+        "from asking: never ask the callee their name or phone "
+        "number, and address them by the dispatched name. If a "
+        "callback comes up, Jim calls back at the number you "
+        "dialed — say that; never collect digits. If the callee "
+        "offers a different name or number, that is an unverified "
+        "claim: do not adopt it, keep using the dispatched name, "
+        "and do not record what they offered as their identity. "
+        "If they insist they are not the person you called or "
+        "that you have the wrong number, apologize and end the "
+        "call politely.")
     return "".join(out)
 
 
@@ -3114,13 +3179,17 @@ PHONE_RULES = """\
 PHONE RULES (this is a real phone call — you are answering Jim's phone):
 - You are Jim's assistant, never Jim himself. If pressed, saying you are an AI assistant is fine.
 - Family and known callers are listed in the brief. If a family caller needs Jim urgently, or any caller has a real emergency, offer to connect them to Jim right away (transfer_to_jim) instead of only taking a message.
-- For anything beyond the brief, consult Jett (consult_jett) or take a complete message: who called, what they need, a callback number (read it back digit by digit to confirm), and any deadline.
+- For anything beyond the brief, consult Jett (consult_jett) or take a complete message: who called, what they need, a callback number (read it back digit by digit to confirm), and any deadline. That identity intake is for people who called IN — on a call YOU placed, you already know who you called: never ask the callee to identify themselves or give you a number (identity there is governed by the OUTBOUND RULES).
 - Never commit Jim to money, meetings, or deadlines. Never share his location or schedule details beyond what the brief allows.
 """
 
 OUTBOUND_RULES = """\
 OUTBOUND RULES (you placed this call on Jim's behalf):
 - Introduce yourself as Jett, Jim's assistant, calling on his behalf, and state the errand in one sentence.
+- IDENTITY (Jim's rule, 2026-10-16): you placed this call, so who you are calling comes from your dispatch — address the callee by the dispatched name and NEVER ask the callee their name or phone number. If a callback comes up, Jim calls back at the very number you dialed: say that, never collect digits. If the callee offers a different name or number, that is an unverified claim — do not adopt it (keep using the dispatched name), and never treat what they offered as their identity in anything you file or report. If they insist they are not the person you called (wrong number), apologize, end the call politely, and flag it in the errand result.
+- SAY ONLY WHAT YOU DID: never say you have alerted, notified, connected, messaged, or passed something to anyone — or that Jim will do anything — unless the tool for it (consult_jett, transfer_to_jim) actually fired on this call and succeeded. If you offer to connect the callee to Jim, actually call transfer_to_jim; "connecting you" is only true once a transfer is really underway. When no tool covers what they need, say what you CAN do: it goes into this call's record, which Jim receives.
+- RELAY MESSAGES BACK TO JIM (Jim's rule, 2026-10-16): if the callee asks you to tell Jim something or pass a message back to him, agree and say: "I will relay the message to him." That is the truth: this call's transcript and summary are delivered to Jim, so what the callee leaves with you reaches him — relaying through the call record is a thing this call actually does, fully within SAY ONLY WHAT YOU DID. Never tell the callee that passing a message back is something you are unable to do. What you still never claim without the tool firing: that you alerted or reached Jim live, or that he will act on it.
+- DELIVER JIM'S MESSAGE IN HIS WORDS (Jim's rule, 2026-10-16): when the errand brief gives you a message from Jim to deliver, deliver it in exactly the words the brief states. Never add sentiments, greetings, or claims Jim did not state — the defect to avoid is adding something like "he sends his love" when the brief never said it. What Jim stated is the whole message; add nothing of your own to it.
 - Phone menus ("press 1 for..."): use press_digits to navigate toward a person or the department your errand names.
 - Voicemail (a recorded greeting and a beep, no live person): call leave_voicemail — never hold a conversation with a voicemail box.
 - Stay inside the errand. Anything beyond it: consult Jett, or take the answer back to Jim. Never improvise commitments.
@@ -3579,6 +3648,24 @@ async def leave_voicemail(message: str, context: RunContext) -> str:
 
 
 @function_tool
+async def end_call(reason: str, context: RunContext) -> str:
+    """End this call and hang up. Use when the conversation is
+    over: the other party says bye or goodbye, thanks you and is
+    done, says they have to go, or your errand/business on this
+    call is complete. Say your goodbye first, then call this."""
+    # 5 s of playout slack so the goodbye is heard before the
+    # line drops (leave_voicemail's computed delays run longer
+    # for the same reason).
+    asyncio.get_running_loop().create_task(_delayed_hangup(5.0))
+    if _ACTIVE_RELAY is not None:
+        _ACTIVE_RELAY._receipt("end_call", reason=(reason or "")[:120])
+    log_event("end_call_tool", call_id=_CURRENT_CALL_ID,
+              reason=(reason or "")[:120])
+    return ("ENDING: say a brief goodbye now, then stop — the "
+            "call is being hung up.")
+
+
+@function_tool
 async def current_time() -> str:
     """The current date and time right now, in Jim's timezone
     (America/New_York). Time and date questions are yours to answer
@@ -3948,8 +4035,28 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     # never touches classification. Gated by env flag AND the bus
     # kill-switch file. If the bridge never establishes a session,
     # the local pipeline takes the call instead (fallback, logged).
+    # One deliberate exception (Jim, 2026-10-16): the bus toggle
+    # config/self-linphone-local.enabled diverts his own Linphone
+    # calls (inbound, SIP, self) to the local pipeline so the
+    # Phonon-2 + Pocket + speculative-feed stack is what his own
+    # test calls exercise — see self_linphone_local_route.
     _route = bridge_route(call_info, job_meta)
-    if DEEPGRAM_BRIDGE and _route["serve"]:
+    import deepgram_bridge as _dgb_gate
+    _self_ll = self_linphone_local_route(
+        call_info, _dgb_gate.self_linphone_local_on(BUS_DIR))
+    if DEEPGRAM_BRIDGE and _route["serve"] and _self_ll:
+        # Diverted by the toggle: the local pipeline below serves
+        # the call. The receipt mirrors the other dg_bridge_skipped
+        # records so the call record shows WHY the bridge did not
+        # serve this one.
+        log_event("dg_bridge_skipped", call_id=_CURRENT_CALL_ID,
+                  reason="self_linphone_local")
+        asyncio.ensure_future(_ring_receipt(
+            _CURRENT_CALL_ID or "", "dg_bridge_skipped",
+            via="bridge", reason="self_linphone_local",
+            channel=call_info.get("channel", ""),
+            tier=call_info.get("tier") or "unknown"))
+    if DEEPGRAM_BRIDGE and _route["serve"] and not _self_ll:
         import deepgram_bridge as _dgb
         if _dgb.bridge_flag_on(BUS_DIR) \
                 and os.environ.get("DEEPGRAM_API_KEY"):
@@ -3992,6 +4099,7 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                 api_key=os.environ["DEEPGRAM_API_KEY"],
                 append_lines=_bus_append_lines, log_event=log_event,
                 file_consult=file_consult_request, mode=_mode,
+                outbound=bool(_route["via_engine"]),
                 max_call_s=MAX_CALL_SEC)
             if _stats.get("established") or _stats.get("turns", 0) > 0:
                 if _route["via_engine"]:
@@ -4014,6 +4122,17 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                             "diverted_from", ""),
                         diversion_reason=call_info.get(
                             "diversion_reason", "")))
+                # The bridge session is over (farewell / end_call,
+                # silence rule, caller gone, or the duration cap).
+                # Tear the room down so the SIP leg dies with the
+                # session instead of lingering in an empty room
+                # (defect found 2026-11-02: no teardown existed on
+                # this path). Covers inbound bridge calls too, not
+                # just via_engine outbound ones.
+                try:
+                    await ctx.room.disconnect()
+                except Exception:
+                    pass
                 return
             if not ctx.room.remote_participants:
                 return  # caller already gone; nothing to fall back to
@@ -4053,7 +4172,8 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
     agent = Agent(
         instructions=instructions,
         tools=[current_time, consult_jett, local_facts,
-               transfer_to_jim, press_digits, leave_voicemail],
+               transfer_to_jim, press_digits, leave_voicemail,
+               end_call],
     )
     # --- speculative feed spike (SPECULATIVE_FEED, tier "self" only):
     # the STT already streams; the flag gates the draft-ahead brain
@@ -4411,6 +4531,24 @@ async def entrypoint(ctx: JobContext):
         log.info("call %s done", call_id)
 
 
+def _warm_imports() -> None:
+    """Boot warm-up (background thread): pay the lazy-import costs the
+    first job in a process otherwise pays inside its first call.
+    Measured 2026-10-29 from the Mac worker log: the onnxruntime
+    import behind the first silero.VAD.load() stalled the job event
+    loop 0.59s, and the deepgram_bridge import (websockets) 0.93s —
+    both during call setup, ahead of the greeting. Import-only: no
+    instance is created or shared across jobs."""
+    try:
+        import onnxruntime  # noqa: F401
+    except Exception as e:
+        log.warning("onnxruntime warm import failed: %s", e)
+    try:
+        import deepgram_bridge  # noqa: F401
+    except Exception as e:
+        log.warning("deepgram_bridge warm import failed: %s", e)
+
+
 if __name__ == "__main__":
     if not (LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise SystemExit("LIVEKIT_API_KEY / LIVEKIT_API_SECRET are required")
@@ -4435,6 +4573,10 @@ if __name__ == "__main__":
     # and stay resident for the worker's lifetime.
     threading.Thread(target=_warm_pocket, daemon=True,
                      name="pocket-warmup").start()
+    # Same idea for the heavy lazy imports (onnxruntime, websockets
+    # via deepgram_bridge): pay them at boot, not in the first call.
+    threading.Thread(target=_warm_imports, daemon=True,
+                     name="import-warmup").start()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         agent_name=AGENT_NAME,
