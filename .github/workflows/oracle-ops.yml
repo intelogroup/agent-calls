@@ -125,7 +125,7 @@ jobs:
           sudo -n install -m 600 -o agent -g agent "$ENV" /opt/jett-bridge/agent.env
           sudo -n chown -R agent:agent /opt/jett-bridge
           sudo -n chmod 600 /opt/jett-bridge/livekit.env
-          echo "env names installed:"; cut -d= -f1 /opt/jett-bridge/agent.env | sort | tr '\n' ' '; echo
+          echo "env names installed:"; sudo -n cut -d= -f1 /opt/jett-bridge/agent.env | sort | tr '\n' ' '; echo
           # --- import proof in bridge-only mode (no server contact) ---
           sudo -n -u agent env BRIDGE_ONLY=1 LIVEKIT_URL=ws://localhost:7880 LIVEKIT_API_KEY=x LIVEKIT_API_SECRET=y /opt/jett-bridge/venv/bin/python -c "
           import sys; sys.path.insert(0, '/opt/jett-bridge/agent')
