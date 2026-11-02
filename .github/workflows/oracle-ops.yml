@@ -17,6 +17,7 @@ on:
         type: choice
         options:
           - survey
+          - hunt
         default: survey
 
 permissions:
@@ -53,3 +54,27 @@ jobs:
           echo "=== EXISTING JETT DIRS ==="
           ls -d /opt/jett-* /home/ubuntu/jett-* 2>/dev/null || echo "none"
           echo "=== PORTS ==="; ss -tln | head -10
+
+      - name: Hunt (deepgram key location, house patterns, bus state)
+        if: inputs.action == 'hunt'
+        run: |
+          set -u
+          echo "=== DEEPGRAM KEY HUNT (names only) ==="
+          for f in /opt/agent/agent.env /opt/agent/livekit.env /opt/agent/agent.env.example /opt/agent/setup.sh /opt/agent/jett-proxy.service /opt/agent/agent.service; do
+            if sudo -n grep -q "^DEEPGRAM_API_KEY=.\+" "$f" 2>/dev/null; then echo "$f: SET"; else echo "$f: absent"; fi
+          done
+          echo "=== livekit.env NAMES ==="
+          sudo -n cut -d= -f1 /opt/agent/livekit.env 2>/dev/null | sort -u || echo unreadable
+          echo "=== jett-proxy.service (house unit pattern) ==="
+          sudo -n cat /opt/agent/jett-proxy.service 2>/dev/null || echo "no file"
+          echo "=== BUS CLONE STATE ==="
+          ls -d /opt/agent/bus/.git 2>/dev/null && echo "bus is a git clone"
+          ls /opt/agent/bus/config/ 2>/dev/null || echo "no bus/config"
+          cat /opt/agent/bus/config/deepgram-bridge.enabled 2>/dev/null && echo "(bridge flag file present)" || echo "no bridge flag file"
+          echo "=== OWNERSHIP ==="
+          stat -c "%U:%G %n" /opt/agent /opt/agent/agent.env /opt/agent/bus 2>/dev/null
+          id agent 2>/dev/null || echo "no agent user"
+          echo "=== LIVEKIT PORT (no keys) ==="
+          sudo -n grep -E "^port:|^bind_addresses:|^rtc:" -A2 /opt/agent/livekit.yaml 2>/dev/null | grep -vE "key|secret" | head -8
+          echo "=== RUNNER USER SUDO ==="
+          sudo -n true && echo "sudo -n OK"
