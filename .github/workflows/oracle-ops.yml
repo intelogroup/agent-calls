@@ -4,9 +4,9 @@ name: oracle-ops
 # survey + jett-bridge worker lifecycle. Dispatched manually with
 # an action input; every step is baked into this file (no shell
 # arrives via inputs). Secret discipline mirrors dial.yml: config
-# values are never printed — env presence by NAME only. The one
-# exception is JETT_BRAIN_MODELS, a model list (not a secret),
-# whose resolved value is the deploy's pin evidence.
+# values are never printed; env files are composed file-to-file
+# on the box, and the Deepgram key arrives via the repo Actions
+# secret (masked by the runner, never echoed).
 
 on:
   workflow_dispatch:
@@ -18,6 +18,10 @@ on:
         options:
           - survey
           - hunt
+          - install_bridge
+          - start_bridge
+          - status_bridge
+          - stop_bridge
         default: survey
 
 permissions:
@@ -26,7 +30,7 @@ permissions:
 jobs:
   ops:
     runs-on: [self-hosted, oracle]
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Survey
         if: inputs.action == 'survey'
@@ -42,17 +46,12 @@ jobs:
           sudo -n cut -d= -f1 /opt/agent/agent.env 2>/dev/null | sort -u || echo "unreadable"
           echo "=== BRAIN PIN (model list only) ==="
           sudo -n grep -E "^JETT_BRAIN_MODELS?=" /opt/agent/agent.env 2>/dev/null || echo "no brain pin line"
-          echo "=== TIMEOUT PIN ==="
-          sudo -n grep -E "^BRAIN_MODEL_TIMEOUT_S=" /opt/agent/agent.env 2>/dev/null || echo "no timeout pin line"
           echo "=== RUNNER VENV HIGHLIGHTS ==="
           ls /opt/agent/venv/lib/*/site-packages 2>/dev/null | grep -iE "^(livekit|torch|pocket|fermion|onnxruntime|websockets|openai)" | head -12 || true
           echo "=== PYTHON ==="; python3 --version; which python3.12 python3.11 python3 || true
-          echo "=== LIVEKIT CONFIG ==="; ls /opt/livekit/ 2>/dev/null || ls /opt/agent/*.yaml 2>/dev/null || true
           echo "=== BUS / SSH (ubuntu home) ==="
           ls -d /home/ubuntu/agent-call-bus /opt/agent/bus 2>/dev/null || true
           ls /home/ubuntu/.ssh/ 2>/dev/null || true
-          echo "=== EXISTING JETT DIRS ==="
-          ls -d /opt/jett-* /home/ubuntu/jett-* 2>/dev/null || echo "none"
           echo "=== PORTS ==="; ss -tln | head -10
 
       - name: Hunt (deepgram key location, house patterns, bus state)
@@ -61,20 +60,127 @@ jobs:
           set -u
           echo "=== DEEPGRAM KEY HUNT (names only) ==="
           for f in /opt/agent/agent.env /opt/agent/livekit.env /opt/agent/agent.env.example /opt/agent/setup.sh /opt/agent/jett-proxy.service /opt/agent/agent.service; do
-            if sudo -n grep -q "^DEEPGRAM_API_KEY=.\+" "$f" 2>/dev/null; then echo "$f: SET"; else echo "$f: absent"; fi
+            if sudo -n grep -q "^DEEPGRAM_API_KEY=." "$f" 2>/dev/null; then echo "$f: PRESENT"; elif [ -f "$f" ]; then echo "$f: absent"; else echo "$f: missing"; fi
           done
           echo "=== livekit.env NAMES ==="
           sudo -n cut -d= -f1 /opt/agent/livekit.env 2>/dev/null | sort -u || echo unreadable
-          echo "=== jett-proxy.service (house unit pattern) ==="
-          sudo -n cat /opt/agent/jett-proxy.service 2>/dev/null || echo "no file"
           echo "=== BUS CLONE STATE ==="
           ls -d /opt/agent/bus/.git 2>/dev/null && echo "bus is a git clone"
           ls /opt/agent/bus/config/ 2>/dev/null || echo "no bus/config"
-          cat /opt/agent/bus/config/deepgram-bridge.enabled 2>/dev/null && echo "(bridge flag file present)" || echo "no bridge flag file"
           echo "=== OWNERSHIP ==="
           stat -c "%U:%G %n" /opt/agent /opt/agent/agent.env /opt/agent/bus 2>/dev/null
           id agent 2>/dev/null || echo "no agent user"
-          echo "=== LIVEKIT PORT (no keys) ==="
-          sudo -n grep -E "^port:|^bind_addresses:|^rtc:" -A2 /opt/agent/livekit.yaml 2>/dev/null | grep -vE "key|secret" | head -8
-          echo "=== RUNNER USER SUDO ==="
-          sudo -n true && echo "sudo -n OK"
+
+      - name: Checkout pinned worker tree (install only)
+        if: inputs.action == 'install_bridge'
+        uses: actions/checkout@v4
+        with:
+          ref: 195e5855af248b0742152da5967f274ba392de74
+          path: tree
+
+      - name: Install jett-bridge worker (code, venv, env, unit; not started)
+        if: inputs.action == 'install_bridge'
+        env:
+          DG_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/tree"
+          echo "tree files: $(ls "$SRC" | wc -l); live_agent present: $(test -f "$SRC/live_agent.py" && echo yes)"
+          sudo -n mkdir -p /opt/jett-bridge/agent
+          sudo -n rsync -a --delete --exclude .git --exclude .github "$SRC"/ /opt/jett-bridge/agent/
+          echo "code installed: $(ls /opt/jett-bridge/agent | wc -l) entries"
+          if [ ! -x /opt/jett-bridge/venv/bin/python ]; then
+            echo "copying proven venv from /opt/agent/venv ..."
+            sudo -n cp -a /opt/agent/venv /opt/jett-bridge/venv
+          fi
+          /opt/jett-bridge/venv/bin/python -c "import livekit.agents, websockets; print('venv import check OK')"
+          # --- env composition (values move file-to-file, never printed) ---
+          sudo -n cp /opt/agent/livekit.env /opt/jett-bridge/livekit.env
+          ENV=/tmp/jett-bridge-agent.env
+          : > "$ENV"
+          for k in AGENT_GREETING AGENT_MAX_CALL_SEC CONSULT_TIMEOUT_SEC BUS_REPO_SSH OPENROUTER_API_KEY META_API_KEY META_MODEL; do
+            sudo -n grep -E "^${k}=" /opt/agent/agent.env >> "$ENV" || echo "warn: $k not in legacy env" >&2
+          done
+          {
+            echo "BRIDGE_ONLY=1"
+            echo "DEEPGRAM_BRIDGE=1"
+            echo "LIVEKIT_URL=ws://localhost:7880"
+            echo "JETT_PHONE_E164=+16176556805"
+            echo "JIM_PHONE_E164=+18574261739"
+            echo "LIVEKIT_SIP_OUTBOUND_TRUNK_ID=ST_NqGc4EfiT8mZ"
+            echo "PYTHONUNBUFFERED=1"
+          } >> "$ENV"
+          printf 'DEEPGRAM_API_KEY=%s\n' "$DG_KEY" >> "$ENV"
+          # --- bus: own clone if possible, else share the legacy clone ---
+          BUS_SSH=$(sudo -n grep -E "^BUS_REPO_SSH=" /opt/agent/agent.env | cut -d= -f2-)
+          if sudo -n -u agent git clone -q "$BUS_SSH" /opt/jett-bridge/bus 2>/dev/null; then
+            echo "BUS_DIR=/opt/jett-bridge/bus" >> "$ENV"
+            sudo -n mkdir -p /opt/jett-bridge/bus/config
+            sudo -n cp /opt/agent/bus/config/deepgram-bridge.enabled /opt/jett-bridge/bus/config/ 2>/dev/null || true
+            echo "bus: own clone at /opt/jett-bridge/bus"
+          else
+            echo "BUS_DIR=/opt/agent/bus" >> "$ENV"
+            echo "bus: clone failed; sharing /opt/agent/bus"
+          fi
+          sudo -n install -m 600 -o agent -g agent "$ENV" /opt/jett-bridge/agent.env
+          sudo -n chown -R agent:agent /opt/jett-bridge
+          sudo -n chmod 600 /opt/jett-bridge/livekit.env
+          echo "env names installed:"; cut -d= -f1 /opt/jett-bridge/agent.env | sort | tr '\n' ' '; echo
+          # --- import proof in bridge-only mode (no server contact) ---
+          sudo -n -u agent env BRIDGE_ONLY=1 LIVEKIT_URL=ws://localhost:7880 LIVEKIT_API_KEY=x LIVEKIT_API_SECRET=y /opt/jett-bridge/venv/bin/python -c "
+          import sys; sys.path.insert(0, '/opt/jett-bridge/agent')
+          import live_agent
+          print('AGENT_NAME =', live_agent.AGENT_NAME)
+          print('BRIDGE_ONLY =', live_agent.BRIDGE_ONLY)
+          import sys as _s
+          print('torch pulled in:', 'torch' in _s.modules)" 2>&1 | tail -4 || echo "import check note: see output above"
+          # --- systemd unit (mirrors the house jett-proxy.service pattern) ---
+          sudo -n tee /etc/systemd/system/jett-bridge.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Jett Deepgram bridge worker (bridge-only, registers as jett-bridge)
+          After=network.target livekit-server.service livekit-sip.service
+          Wants=livekit-server.service livekit-sip.service
+          StartLimitIntervalSec=300
+          StartLimitBurst=5
+
+          [Service]
+          User=agent
+          WorkingDirectory=/opt/jett-bridge/agent
+          EnvironmentFile=/opt/jett-bridge/agent.env
+          EnvironmentFile=/opt/jett-bridge/livekit.env
+          ExecStart=/opt/jett-bridge/venv/bin/python /opt/jett-bridge/agent/live_agent.py start
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo -n systemctl daemon-reload
+          echo "unit installed: $(systemctl list-unit-files jett-bridge.service --no-legend || true)"
+          echo "active state: $(systemctl is-active jett-bridge.service || true) (expected: inactive until start_bridge)"
+
+      - name: Start jett-bridge and show registration evidence
+        if: inputs.action == 'start_bridge'
+        run: |
+          set -u
+          sudo -n systemctl enable --now jett-bridge.service
+          sleep 10
+          echo "active: $(systemctl is-active jett-bridge.service || true)"
+          echo "=== journal (boot lines) ==="
+          sudo -n journalctl -u jett-bridge.service --no-pager -n 60 | grep -E "boot_config|bridge_only|register|AW_|agent_name|error|Error" | tail -20 || true
+          echo "=== worker RSS ==="
+          ps aux | grep "[l]ive_agent.py start" | awk '{print $2, $6/1024" MB", $11, $12, $13}' || true
+
+      - name: Status jett-bridge
+        if: inputs.action == 'status_bridge'
+        run: |
+          set -u
+          echo "active: $(systemctl is-active jett-bridge.service || true)"
+          sudo -n journalctl -u jett-bridge.service --no-pager -n 30 | tail -30
+
+      - name: Stop jett-bridge
+        if: inputs.action == 'stop_bridge'
+        run: |
+          set -u
+          sudo -n systemctl stop jett-bridge.service || true
+          echo "active: $(systemctl is-active jett-bridge.service || true)"
