@@ -16,8 +16,10 @@ the call. "deepgram" rides in the dispatch metadata; the worker
 honors it ONLY for outbound calls (bridge_route in live_agent.py)
 and serves the call on the Deepgram bridge in its guarded
 third-party mode. The bridge has NO tools — a brief that plainly
-needs leave_voicemail / press_digits / transfer is REFUSED with
---engine deepgram (loudly, exit 2) instead of silently downgraded.
+needs leave_voicemail / press_digits / transfer is AUTO-ROUTED
+to --engine local (loudly, one log line): the standing route
+rule already assigns tool-needing briefs to the local pipeline,
+so the dialer enforces the route instead of failing the run.
 --name: the callee's name, carried as metadata callee_name so the
 agent can greet and address them properly.
 
@@ -141,17 +143,15 @@ def main() -> int:
                     help="callee's name (metadata callee_name)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    if args.engine == "deepgram":
+    engine = args.engine
+    if engine == "deepgram":
         needs = brief_tool_needs(args.brief)
         if needs:
-            print("REFUSED: --engine deepgram cannot run this brief "
-                  "— the Deepgram bridge has no tools for: "
-                  + "; ".join(needs)
-                  + ". Re-run with --engine local (the local "
-                  "pipeline has those tools), or rewrite the brief "
-                  "so it needs none.", file=sys.stderr)
-            return 2
-    plan = build_plan(args.to, args.brief, engine=args.engine,
+            print("AUTO-ROUTED: brief needs tools the Deepgram "
+                  "bridge lacks (" + "; ".join(needs) + "); "
+                  "running with --engine local", file=sys.stderr)
+            engine = "local"
+    plan = build_plan(args.to, args.brief, engine=engine,
                       callee_name=args.name)
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))

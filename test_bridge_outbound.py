@@ -20,8 +20,10 @@ test:
     "to Jim" text; the self append string survives byte-for-byte
     in the source;
   - the dialer: plan metadata carries engine (+callee_name), and
-    a brief that plainly needs bridge-missing tools is refused
-    for --engine deepgram (exit 2) but fine for --engine local.
+    a brief that plainly needs bridge-missing tools is
+    AUTO-ROUTED to local when dispatched --engine deepgram
+    (plan metadata engine=local, AUTO-ROUTED line logged), and
+    runs as dispatched for --engine local.
 
 Run: <venv>/python test_bridge_outbound.py
 """
@@ -227,14 +229,17 @@ def t_dialer():
         got = dial.brief_tool_needs(brief)
         check(f"dial [tool-needs {brief[:38]!r}...]",
               bool(got) == trips, str(got))
-    # End-to-end refusal: --engine deepgram + tool brief exits 2.
+    # End-to-end auto-route: --engine deepgram + tool brief runs
+    # as local (route rule enforced, run not failed).
     rc = subprocess.run(
         [sys.executable, "dial.py", "--to", BECK,
          "--brief", "Leave a voicemail if he doesn't answer.",
          "--engine", "deepgram", "--dry-run"],
         capture_output=True, text=True)
-    check("dial [deepgram + voicemail brief REFUSED]",
-          rc.returncode == 2 and "REFUSED" in rc.stderr,
+    plan_auto = json.loads(rc.stdout) if rc.returncode == 0 else {}
+    check("dial [deepgram + voicemail brief AUTO-ROUTED to local]",
+          rc.returncode == 0 and "AUTO-ROUTED" in rc.stderr
+          and plan_auto.get("metadata", {}).get("engine") == "local",
           f"rc={rc.returncode} err={rc.stderr[:90]}")
     rc2 = subprocess.run(
         [sys.executable, "dial.py", "--to", BECK,
