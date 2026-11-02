@@ -194,6 +194,14 @@ jobs:
               except OSError:
                   pass
 
+          # Register the assembled credential values with the log
+          # masker BEFORE anything else can print them (dial.py logs
+          # its effective config). The runner redacts these lines
+          # themselves; every later occurrence prints as ***.
+          for name in ("LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
+              if found.get(name):
+                  print("::add-mask::" + found[name])
+
           for name in NAMES + ("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "JETT_PHONE_E164"):
               present = bool(found.get(name) or os.environ.get(name))
               suffix = (" (from " + sources[name] + ")") if (present and name in sources) else ""
@@ -233,6 +241,8 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
+          if [ -n "${LIVEKIT_API_KEY:-}" ]; then echo "::add-mask::${LIVEKIT_API_KEY}"; fi
+          if [ -n "${LIVEKIT_API_SECRET:-}" ]; then echo "::add-mask::${LIVEKIT_API_SECRET}"; fi
           for v in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_SIP_OUTBOUND_TRUNK_ID JETT_PHONE_E164; do
             if [ -n "${!v:-}" ]; then echo "$v: SET"; else echo "$v: MISSING"; fi
           done
