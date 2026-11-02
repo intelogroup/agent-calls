@@ -2,7 +2,7 @@
 """Outbound dialer for Jett's line (plan Phase 4).
 
 Places a call through the LiveKit SIP outbound trunk: creates a
-room, dispatches the jett-proxy agent with the errand as job
+room, dispatches the engine's agent with the errand as job
 metadata, and adds the callee as a SIP participant. The agent code
 (live_agent.py) reads the metadata in its entrypoint and runs the
 call under OUTBOUND_RULES.
@@ -12,10 +12,16 @@ Usage:
   python3 dial.py --to +19787156903 --engine deepgram --name Beckendy --brief "Check in: ask if he is feeling well after his flu shot" [--dry-run]
 
 --engine local|deepgram (default local): which voice engine serves
-the call. "deepgram" rides in the dispatch metadata; the worker
-honors it ONLY for outbound calls (bridge_route in live_agent.py)
-and serves the call on the Deepgram bridge in its guarded
-third-party mode. The bridge has NO tools — a brief that plainly
+the call. Each engine dispatches a DIFFERENT registered worker
+(the split, Jim 2026-11-02): "deepgram" targets "jett-bridge",
+the bridge-only worker on the Oracle box, so the Deepgram path
+never depends on the Mac; "local" targets "jett-proxy", the Mac
+worker that runs the local pipeline. AGENT_NAME in the
+environment overrides the target for both engines. "deepgram"
+rides in the dispatch metadata; the worker honors it ONLY for
+outbound calls (bridge_route in live_agent.py) and serves the
+call on the Deepgram bridge in its guarded third-party mode.
+The bridge has NO tools — a brief that plainly
 needs leave_voicemail / press_digits / transfer is AUTO-ROUTED
 to --engine local (loudly, one log line): the standing route
 rule already assigns tool-needing briefs to the local pipeline,
@@ -64,6 +70,21 @@ def brief_tool_needs(brief: str) -> list:
                    if re.search(pat, text)})
 
 
+def agent_name_for(engine: str) -> str:
+    """Registered worker a dispatch targets, chosen by engine
+    (the split, Jim 2026-11-02): deepgram -> "jett-bridge" (the
+    bridge-only worker on the Oracle box — the Deepgram path must
+    not depend on the Mac), local -> "jett-proxy" (the Mac
+    worker, the local line). An AGENT_NAME environment override
+    still wins for both engines, exactly as it did when it was
+    the only mechanism. main() resolves the auto-route BEFORE
+    build_plan, so a rerouted call targets jett-proxy."""
+    override = os.environ.get("AGENT_NAME")
+    if override:
+        return override
+    return "jett-bridge" if engine == "deepgram" else "jett-proxy"
+
+
 def build_plan(to: str, brief: str, engine: str = "local",
                callee_name: str = "") -> dict:
     room = f"jett-out-{uuid.uuid4().hex[:10]}"
@@ -73,7 +94,7 @@ def build_plan(to: str, brief: str, engine: str = "local",
         metadata["callee_name"] = callee_name
     return {
         "room": room,
-        "agent_name": os.environ.get("AGENT_NAME", "jett-proxy"),
+        "agent_name": agent_name_for(engine),
         "metadata": metadata,
         "sip": {
             "sip_trunk_id": os.environ.get(
@@ -158,6 +179,7 @@ def main() -> int:
         return 0
     call_id = asyncio.run(place_call(plan))
     print(json.dumps({"placed": True, "room": plan["room"],
+                      "agent_name": plan["agent_name"],
                       "sip_call_id": call_id}))
     return 0
 

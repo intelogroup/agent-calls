@@ -24,6 +24,11 @@ test:
     AUTO-ROUTED to local when dispatched --engine deepgram
     (plan metadata engine=local, AUTO-ROUTED line logged), and
     runs as dispatched for --engine local.
+  - the dialer dispatches by engine (2026-11-02 split):
+    deepgram -> jett-bridge (the Oracle bridge-only worker),
+    local -> jett-proxy (the Mac worker); an AGENT_NAME env
+    override still wins for both engines; an AUTO-ROUTED plan
+    targets jett-proxy, never jett-bridge.
   - the outbound prompts (bridge build_prompt AND the local
     OUTBOUND_RULES) carry Jim's 2026-10-16 relay wording (agree
     to relay — the transcript reaches Jim; no can't-relay
@@ -218,6 +223,29 @@ def t_dialer():
     check("dial [default engine is local]",
           plan2["metadata"].get("engine") == "local"
           and "callee_name" not in plan2["metadata"])
+    # Agent-name selection by engine (2026-11-02 split), with
+    # the AGENT_NAME env override preserved. Scrub/set the env
+    # explicitly so the checks are deterministic in any shell.
+    _saved_name = os.environ.pop("AGENT_NAME", None)
+    try:
+        check("dial [agent name: deepgram -> jett-bridge]",
+              dial.build_plan(BECK, "Ask how he is.",
+                              engine="deepgram")["agent_name"]
+              == "jett-bridge")
+        check("dial [agent name: local -> jett-proxy]",
+              dial.build_plan(BECK, "Ask how he is.",
+                              engine="local")["agent_name"]
+              == "jett-proxy")
+        os.environ["AGENT_NAME"] = "custom-name"
+        check("dial [agent name: env override wins]",
+              dial.build_plan(BECK, "Ask how he is.",
+                              engine="deepgram")["agent_name"]
+              == "custom-name")
+    finally:
+        if _saved_name is None:
+            os.environ.pop("AGENT_NAME", None)
+        else:
+            os.environ["AGENT_NAME"] = _saved_name
     # Tool-needs detection: plainly-tool briefs trip it, plain
     # conversation briefs (incl. the proof brief) do not.
     needs_cases = [
@@ -246,6 +274,9 @@ def t_dialer():
           rc.returncode == 0 and "AUTO-ROUTED" in rc.stderr
           and plan_auto.get("metadata", {}).get("engine") == "local",
           f"rc={rc.returncode} err={rc.stderr[:90]}")
+    check("dial [auto-routed plan targets jett-proxy]",
+          plan_auto.get("agent_name") == "jett-proxy",
+          str(plan_auto.get("agent_name")))
     rc2 = subprocess.run(
         [sys.executable, "dial.py", "--to", BECK,
          "--brief", "Leave a voicemail if he doesn't answer.",
@@ -266,6 +297,9 @@ def t_dialer():
           and plan3.get("metadata", {}).get("engine") == "deepgram"
           and plan3.get("metadata", {}).get("callee_name")
           == "Beckendy", f"rc={rc3.returncode}")
+    check("dial [deepgram plan targets jett-bridge]",
+          plan3.get("agent_name") == "jett-bridge",
+          str(plan3.get("agent_name")))
 
 
 def t_prompt_relay_verbatim():
