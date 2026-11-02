@@ -1,0 +1,33 @@
+# Bridge-only PSTN receptionist (Jim, 2026-10-16: "deepgram is
+# primary and livekit secondary"). A small always-on sibling of
+# jett-voice running the SAME image with BRIDGE_ONLY=1: it
+# registers as agent "jett-bridge", loads no local models
+# (measured: ~150 MB RSS at import vs ~2.4 GB warmed), and answers
+# direct PSTN calls on the Deepgram bridge around the clock while
+# the big worker sleeps until announced. PSTN dispatch rule
+# SDR_bRnSbdXQhxQ4 points at jett-bridge; the Linphone rule still
+# points at jett-proxy on jett-voice.
+app = "jett-bridge"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AGENT_DIR = "/opt/agent"
+  BRIDGE_ONLY = "1"
+  DEEPGRAM_BRIDGE = "1"
+  # No local pipeline ever runs on this worker, so the self-tier
+  # speculative feed (a local-pipeline feature) is off, honestly.
+  SPECULATIVE_FEED = "0"
+  # Ring-me-first applies to PSTN inbound exactly as on the big
+  # worker: Jim's cell rings before the agent answers.
+  RING_FIRST = "1"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024mb"
+
+# It IS the answering path: never scale it to zero.
+auto_stop_machines = false
+auto_start_machines = true
