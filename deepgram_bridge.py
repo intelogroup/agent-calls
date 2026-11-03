@@ -110,6 +110,19 @@ CONSULT_FUNCTION = {
 }
 
 
+END_CALL_FUNCTION = {
+    "name": "end_call",
+    "description": (
+        "End the call and hang up. Use when the conversation is "
+        "over: the other person says bye or goodbye, thanks you "
+        "and is done, says they have to go, or your business on "
+        "this call is complete. Say your goodbye first, then call "
+        "this."),
+    "parameters": {"type": "object", "properties": {}},
+    "defer_until_eot": True,
+}
+
+
 def build_prompt(brief: str, *, mode: str = "self",
                  outbound: bool = False) -> str:
     # `outbound` (2026-10-16, Jim's identity rule): on an outbound
@@ -286,6 +299,12 @@ def build_prompt(brief: str, *, mode: str = "self",
             "briefly, like a good assistant on the phone: one or "
             "two short sentences at a time, no lists, no "
             "formality.\n\n")
+    rules += (
+        "- ENDING THE CALL: when the conversation is over — the "
+        "other person says bye or goodbye, thanks you and is "
+        "done, says they have to go, or your business is complete "
+        "— say a brief goodbye, then call end_call to hang up. "
+        "Do not keep the line open after a goodbye.\n")
     return (
         intro
         + "YOUR BRIEF (everything you know):\n"
@@ -317,8 +336,10 @@ def build_settings(prompt: str, greeting: str, listen_model: str,
                                    "model": VOICE_MODEL}},
         },
     }
+    functions = [END_CALL_FUNCTION]
     if with_consult:
-        settings["agent"]["think"]["functions"] = [CONSULT_FUNCTION]
+        functions.append(CONSULT_FUNCTION)
+    settings["agent"]["think"]["functions"] = functions
     if greeting:
         settings["agent"]["greeting"] = greeting
     return settings
@@ -376,7 +397,9 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
     await room.local_participant.publish_track(track)
     tx_rel = f"calls/live/{call_id}/transcript.jsonl"
     tx_buffer: list[str] = []
-    state = {"applied": False, "last_out": time.monotonic()}
+    state = {"applied": False, "last_out": time.monotonic(),
+             "last_activity": time.monotonic()}
+    end_requested = asyncio.Event()
 
     async def flush_tx(final: bool = False) -> None:
         if not tx_buffer:
@@ -412,6 +435,7 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
                     return
 
     async def handle_event(msg: dict) -> None:
+        state["last_activity"] = time.monotonic()
         etype = msg.get("type", "")
         if etype == "SettingsApplied":
             state["applied"] = True
@@ -442,6 +466,9 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
             for fn in msg.get("functions", []):
                 content = ("That is not available on this call. "
                            "Take a message instead.")
+                if fn.get("name") == "end_call":
+                    content = "Ending the call now. Goodbye."
+                    end_requested.set()
                 if fn.get("name") == "consult_jett" and file_consult:
                     args = fn.get("arguments") or {}
                     if isinstance(args, str):
@@ -542,18 +569,31 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
     await ws.send(json.dumps(build_settings(
         prompt, greeting, listen_model, think_model,
         with_consult=consult_enabled)))
+
+    async def silence_watchdog() -> None:
+        limit = float(os.environ.get("EOC_SILENCE_WINDOW_S", "45"))
+        while not caller_gone.is_set() and not end_requested.is_set():
+            await asyncio.sleep(0.5)
+            if time.monotonic() - state["last_activity"] > limit:
+                log_event("dg_silence_end", call_id=call_id)
+                end_requested.set()
+                return
+
     tasks = [asyncio.ensure_future(pump_in()),
              asyncio.ensure_future(pump_out()),
-             asyncio.ensure_future(keepalive())]
+             asyncio.ensure_future(keepalive()),
+             asyncio.ensure_future(silence_watchdog())]
     gone_wait = asyncio.ensure_future(caller_gone.wait())
+    end_wait = asyncio.ensure_future(end_requested.wait())
     try:
         done, _ = await asyncio.wait(
-            tasks + [gone_wait], return_when=asyncio.FIRST_COMPLETED)
+            tasks + [gone_wait, end_wait],
+            return_when=asyncio.FIRST_COMPLETED)
         for t in tasks:
             if t in done and t.exception() is not None:
                 raise t.exception()
     finally:
-        for t in tasks + [gone_wait]:
+        for t in tasks + [gone_wait, end_wait]:
             t.cancel()
         await flush_tx(final=True)
         try:

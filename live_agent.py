@@ -181,6 +181,11 @@ CONSULT_TIMEOUT_SEC = int(os.environ.get("CONSULT_TIMEOUT_SEC", "180"))
 RELAY_POLL_SEC = float(os.environ.get("RELAY_POLL_SEC", "5"))
 JIM_TZ = ZoneInfo("America/New_York")
 MAX_CALL_SEC = int(os.environ.get("AGENT_MAX_CALL_SEC", "600"))
+# Dead-man grace: the room-level backstop (see _deadman) fires this
+# long after MAX_CALL_SEC, so a session that is merely slow to wrap
+# up is never cut mid-goodbye — only a room whose session machinery
+# failed to end it at all is killed.
+DEADMAN_GRACE_SEC = int(os.environ.get("AGENT_DEADMAN_GRACE_SEC", "120"))
 # Synced facts snapshot (published by Track B into the bus repo).
 FACTS_STALE_SEC = int(os.environ.get("FACTS_STALE_SEC", "3600"))
 # Pocket TTS voice. Hard-pinned to "alba": the Pocket weights and
@@ -2726,6 +2731,19 @@ def _digits10(num: str) -> str:
     return d if len(d) == 10 else ""
 
 
+def is_self_inbound(caller_number: str, own_number: str) -> bool:
+    """True when a call's other party IS this line's own number:
+    the line has looped into its own trunk (a self-dial, however
+    it was placed — dialer, workflow, or a foreign dispatch). The
+    agent must never serve such a call: with the agent on both
+    ends there is no human and no hang-up signal, and both legs
+    bill until the carrier's allotted timeout (2026-11-02: one
+    self-call ran 11h54m and cost $5.86). An unset own number
+    disables the guard rather than guessing."""
+    own = _digits10(own_number)
+    return bool(own) and _digits10(caller_number) == own
+
+
 def parse_known_callers(brief: str) -> dict:
     """Known-callers table from the brief. Format per line:
     ``- Name — +1 617-555-0134 (family)`` — the tier tag is optional
@@ -4142,6 +4160,17 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
                             "diverted_from", ""),
                         diversion_reason=call_info.get(
                             "diversion_reason", "")))
+                # The bridge session is over (farewell / end_call,
+                # silence rule, caller gone, or the duration cap).
+                # Tear the room down so the SIP leg dies with the
+                # session instead of lingering in an empty room
+                # (defect found 2026-11-02: no teardown existed on
+                # this path). Covers inbound bridge calls too, not
+                # just via_engine outbound ones.
+                try:
+                    await ctx.room.disconnect()
+                except Exception:
+                    pass
                 return
             if not ctx.room.remote_participants:
                 return  # caller already gone; nothing to fall back to
@@ -4468,6 +4497,41 @@ async def _run_call(ctx: JobContext, brains: list, stats: dict,
             pass
 
 
+async def _deadman(ctx: JobContext, call_id: str):
+    """Room-level backstop, armed for every served call: whatever
+    route serves it (bridge, local, no-brain) and whatever the
+    session code does or fails to do, the room dies at
+    MAX_CALL_SEC + DEADMAN_GRACE_SEC. Sessions enforce their own
+    caps first; this fires only when every one of them missed.
+    The 2026-11-02 self-call billed ~12h because the session ended
+    but the room — and its two SIP legs — lived on; disconnecting
+    the agent alone does not drop a SIP participant, so the room
+    itself is deleted server-side. If the worker process itself
+    dies, this dies with it — that residual is what the Telnyx
+    balance/usage watch exists to catch."""
+    try:
+        await asyncio.sleep(MAX_CALL_SEC + DEADMAN_GRACE_SEC)
+    except asyncio.CancelledError:
+        return
+    log_event("deadman_fired", call_id=call_id, room=ctx.room.name)
+    log.warning("dead-man cap reached for %s; killing room %s",
+                call_id, ctx.room.name)
+    try:
+        await ctx.room.disconnect()
+    except Exception:
+        pass
+    try:
+        from livekit.protocol.room import DeleteRoomRequest
+        client = _lk_api()
+        try:
+            await client.room.delete_room(
+                DeleteRoomRequest(room=ctx.room.name))
+        finally:
+            await client.aclose()
+    except Exception:
+        pass
+
+
 async def _end_if_loop_leg(ctx: JobContext, new_call_id: str) -> bool:
     """Busy-path probe: is this 'second call' actually Jim's cell
     forwarding our own ring-first leg back to the agent line? Then
@@ -4535,6 +4599,7 @@ async def entrypoint(ctx: JobContext):
             return
         _ACTIVE_CALL = call_id
     _CURRENT_CALL_ID = call_id
+    deadman = asyncio.create_task(_deadman(ctx, call_id))
 
     stats = {"t0": time.monotonic(), "turns": 0, "errors": []}
     try:
@@ -4556,6 +4621,38 @@ async def entrypoint(ctx: JobContext):
                 job_meta = json.loads(raw_meta)
         except Exception:
             job_meta = {}
+        # Self-call loop guard: never serve a call that loops the
+        # line into itself, however it was placed. Outbound: the
+        # dispatch target is our own number. Inbound: the caller
+        # IS our own number. (dial.py refuses self-dials at the
+        # source; this is the worker-side net for every other
+        # path, including a self-call placed by hand or by a
+        # foreign dispatch. The production dialer refuses a
+        # self-dial only when the line is busy; this is the net
+        # for the idle-line case that billed 12h on 2026-11-02.)
+        _self_leg = ""
+        if job_meta.get("direction") == "outbound":
+            if is_self_inbound(str(job_meta.get("to", "")),
+                               JETT_PHONE_E164):
+                _self_leg = "outbound"
+        else:
+            for p in ctx.room.remote_participants.values():
+                _attrs = dict(getattr(p, "attributes", {}) or {})
+                if is_self_inbound(
+                        _attrs.get("sip.phoneNumber", ""),
+                        JETT_PHONE_E164):
+                    _self_leg = "inbound"
+                break
+        if _self_leg:
+            log_event("self_call_blocked", call_id=call_id,
+                      room=ctx.room.name, leg=_self_leg)
+            log.warning("self-call loop blocked (%s leg) in %s",
+                        _self_leg, ctx.room.name)
+            asyncio.ensure_future(_ring_receipt(
+                call_id, "self_call_blocked", via="entrypoint",
+                leg=_self_leg))
+            await ctx.room.disconnect()
+            return
         brains = resolve_brains()
         if brains:
             log_event("brain_resolved",
@@ -4580,6 +4677,7 @@ async def entrypoint(ctx: JobContext):
         with _CALL_LOCK:
             _ACTIVE_CALL = None
         _CURRENT_CALL_ID = None
+        deadman.cancel()
         log_event("call_end", call_id=call_id,
                   duration_s=round(time.monotonic() - stats["t0"], 1),
                   turns=stats["turns"], errors=stats["errors"])
