@@ -22,6 +22,7 @@ used for model improvement on Deepgram's side.
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -124,6 +125,81 @@ END_CALL_FUNCTION = {
     "defer_until_eot": True,
 }
 
+
+
+FAREWELL_LINE = "Thanks for calling. Goodbye."
+
+_FAREWELL_WORDS = {"bye", "goodbye", "goodnight"}
+_FAREWELL_PHRASES = (("see", "you"), ("see", "ya"),
+                     ("that", "s", "all"), ("that", "is", "all"),
+                     ("that", "ll", "be", "all"), ("nothing", "else"),
+                     ("good", "night"), ("take", "care"))
+_FAREWELL_FILLER = {
+    "thank", "thanks", "you", "okay", "ok", "no", "that", "s", "it",
+    "is", "all", "the", "a", "an", "and", "now", "for", "calling",
+    "else",
+    "so", "much", "very", "really", "have", "good", "great", "nice",
+    "day", "night", "one", "take", "care", "see", "ya", "later",
+    "nothing", "ll",
+    "i", "m", "will", "be", "well", "to", "talk", "again", "soon"}
+
+
+def _sentence_tokens(sentence: str) -> list[str]:
+    out = []
+    for tok in re.findall(r"[a-z']+", sentence.lower()):
+        out.extend(tok.strip("'").split("'"))
+    return [t for t in out if t]
+
+
+def farewell_match(text: str) -> str | None:
+    """The farewell pattern when a turn ENDS in a sentence that is
+    only a farewell ("Bye bye.", "That's all, thanks."), else None.
+    Conservative by construction: every token of the closing
+    sentence must be farewell/filler vocabulary, so reported speech
+    ("tell him I said bye"), "by the way" and future arrangements
+    ("see you Friday") never match. Pure function; pinned by
+    test_farewell_guard.py."""
+    sentences = [s for s in re.split(r"[.!?;\n]+", text or "")
+                 if s.strip()]
+    if not sentences:
+        return None
+    toks = _sentence_tokens(sentences[-1])
+    if not toks or len(toks) > 10:
+        return None
+    allowed = _FAREWELL_FILLER | _FAREWELL_WORDS
+    if any(t not in allowed for t in toks):
+        return None
+    for t in toks:
+        if t in _FAREWELL_WORDS:
+            return t
+    for phrase in _FAREWELL_PHRASES:
+        n = len(phrase)
+        for i in range(len(toks) - n + 1):
+            if tuple(toks[i:i + n]) == phrase:
+                return " ".join(phrase)
+    return None
+
+
+async def _farewell_close(ws, end_requested, caller_gone, tx_buffer,
+                          *, speak: bool, delay: float) -> None:
+    """Speak the sign-off (caller-farewell path), give it time to
+    play, then end the call on the same end_requested path end_call
+    uses. If the caller hangs up first, caller_gone ends the wait
+    and this returns without touching anything."""
+    if speak:
+        try:
+            await ws.send(json.dumps({
+                "type": "InjectAgentMessage",
+                "message": FAREWELL_LINE}))
+            tx_buffer.append(transcript_line("proxy", FAREWELL_LINE))
+        except Exception:
+            pass
+    try:
+        await asyncio.wait_for(caller_gone.wait(), timeout=delay)
+        return
+    except asyncio.TimeoutError:
+        pass
+    end_requested.set()
 
 def build_prompt(brief: str, *, mode: str = "self",
                  outbound: bool = False) -> str:
@@ -484,6 +560,41 @@ async def _run_session(ws, room, caller_track, *, call_id, prompt,
                             f"relay {call_id}")
                         await flush_tx()
                         end_requested.set()
+                # Code-side farewell guard (2026-11-03): hanging
+                # up cannot rest on the model remembering end_call.
+                # On the 2026-11-03 proof call the caller said "No.
+                # That's okay. Thank you. Bye bye." - the model
+                # produced no reply and no end_call, and the caller
+                # waited out 12 s of silence and hung up himself. A
+                # caller turn ending in a pure farewell ends the
+                # call from code (spoken sign-off, then the same
+                # end_requested path end_call uses); an agent turn
+                # that is only a farewell arms the same end on a
+                # short fuse, cancelled if the caller speaks again.
+                _fw = farewell_match(content)
+                _pending = state.get("farewell_task")
+                if _fw and role == "jim":
+                    if _pending is None or _pending.done():
+                        log_event("dg_farewell_end", call_id=call_id,
+                                  via="caller", pattern=_fw,
+                                  text=content[:120])
+                        state["farewell_task"] = asyncio.ensure_future(
+                            _farewell_close(
+                                ws, end_requested, caller_gone,
+                                tx_buffer, speak=True, delay=2.6))
+                elif _fw and role == "proxy":
+                    if _pending is None or _pending.done():
+                        log_event("dg_farewell_armed",
+                                  call_id=call_id, pattern=_fw,
+                                  text=content[:120])
+                        state["farewell_task"] = asyncio.ensure_future(
+                            _farewell_close(
+                                ws, end_requested, caller_gone,
+                                tx_buffer, speak=False, delay=5.0))
+                elif role == "jim":
+                    if _pending is not None and not _pending.done():
+                        _pending.cancel()
+                        state["farewell_task"] = None
                 if len(tx_buffer) >= 4:
                     await flush_tx()
         elif etype == "UserStartedSpeaking":
