@@ -56,7 +56,8 @@ jobs:
           async def main():
               client = lk_api.LiveKitAPI(
                   url=f"http://127.0.0.1:{port}",
-                  api_key=<redacted>
+                  api_key=key,
+                  api_secret=secret)
               try:
                   async def fetch():
                       resp = await client.sip.list_dispatch_rule(
