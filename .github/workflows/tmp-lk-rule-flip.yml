@@ -74,10 +74,7 @@ jobs:
                       print(f"NO-OP: rule already targets {TARGET}")
                       return
                   rule.room_config.agents[0].agent_name = TARGET
-                  out = await client.sip.update_dispatch_rule(
-                      S.UpdateSIPDispatchRuleRequest(
-                          sip_dispatch_rule_id=RULE,
-                          replace=rule))
+                  out = await client.sip.update_dispatch_rule(RULE, rule)
                   after = shape(out)
                   print("AFTER:", json.dumps(after, indent=1))
                   assert after["agents"] == [TARGET], after
