@@ -8,7 +8,7 @@
 # SDR_bRnSbdXQhxQ4 points at jett-bridge; the Linphone rule still
 # points at jett-proxy on jett-voice.
 app = "jett-bridge"
-primary_region = "iad"
+primary_region = "sjc"  # Jim's rule (2026-11-02): never iad; app recreated 2026-11-03 after the original vanished from the account
 
 [build]
   dockerfile = "Dockerfile"
