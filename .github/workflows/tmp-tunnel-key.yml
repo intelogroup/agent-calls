@@ -1,0 +1,42 @@
+name: "(temporary) add fly tunnel key to oracle"
+
+# One-purpose helper (2026-11-03): the recreated jett-bridge app's
+# Fly->Oracle tunnel uses a freshly minted ed25519 key; its public
+# half must land in ubuntu's authorized_keys on the Oracle box.
+# The runner has passwordless sudo (proven by dial.yml's env
+# assembly fallback). Idempotent: re-dispatching is a no-op.
+# Takes the PUBLIC key line only - public keys are not secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey:
+        description: "ed25519 public key line for the Fly tunnel"
+        required: true
+        type: string
+
+jobs:
+  addkey:
+    runs-on: [self-hosted, oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Append key to ubuntu authorized_keys (idempotent)
+        env:
+          PUBKEY: ${{ inputs.pubkey }}
+        run: |
+          set -euo pipefail
+          case "$PUBKEY" in
+            ssh-ed25519\ *) ;;
+            *) echo "input is not an ed25519 key line"; exit 1 ;;
+          esac
+          sudo -n install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
+          sudo -n touch /home/ubuntu/.ssh/authorized_keys
+          if sudo -n grep -qxF "$PUBKEY" /home/ubuntu/.ssh/authorized_keys; then
+            echo "key already present - no change"
+          else
+            printf '%s\n' "$PUBKEY" | sudo -n tee -a /home/ubuntu/.ssh/authorized_keys >/dev/null
+            echo "key appended"
+          fi
+          sudo -n chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+          sudo -n chmod 600 /home/ubuntu/.ssh/authorized_keys
+          echo "authorized_keys lines now: $(sudo -n wc -l < /home/ubuntu/.ssh/authorized_keys)"
