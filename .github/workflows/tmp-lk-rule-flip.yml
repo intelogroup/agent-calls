@@ -61,7 +61,7 @@ jobs:
               try:
                   async def fetch():
                       resp = await client.sip.list_dispatch_rule(
-                          S.ListSIPDispatchRuleRequest(rule_ids=[RULE]))
+                          S.ListSIPDispatchRuleRequest(dispatch_rule_ids=[RULE]))
                       assert len(resp.items) == 1, resp.items
                       return resp.items[0]
 
@@ -77,7 +77,7 @@ jobs:
                   out = await client.sip.update_dispatch_rule(
                       S.UpdateSIPDispatchRuleRequest(
                           sip_dispatch_rule_id=RULE,
-                          dispatch_rule=rule))
+                          replace=rule))
                   after = shape(out)
                   print("AFTER:", json.dumps(after, indent=1))
                   assert after["agents"] == [TARGET], after
